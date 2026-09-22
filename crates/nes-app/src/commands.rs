@@ -14,10 +14,15 @@ pub enum EmuCommand {
     Resume,
     SaveState,
     LoadState,
+    /// 開關 Debugger 面板要看的 `DebugSnapshot` 產生（見 `emu.rs` 的
+    /// `debug_input`）。只在面板真的打開時才產生快照，避免面板關閉時
+    /// 白白浪費每幀一次的複製成本。
+    SetDebugEnabled(bool),
     Quit,
 }
 
 /// Emu 執行緒回報給 UI 執行緒的事件。
+#[derive(Debug)]
 pub enum EmuEvent {
     RomLoaded(RomInfo),
     Error(String),

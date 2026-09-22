@@ -4,10 +4,12 @@
 「應用軟體設計」課程的期末專案，涵蓋作業系統（多執行緒／timing）、視窗環境
 （egui GUI）、網路環境（UDP rollback netplay）、以及整合設計四大主題。
 
-> **目前狀態：Phase 0（專案骨架）。** CPU / PPU / APU 尚未實作，`nes-app`
-> 顯示的是一張依幀數捲動的測試畫面，不是真正的遊戲畫面。詳見
-> [`docs/architecture.md`](docs/architecture.md) 與各 crate 原始碼中的
-> `TODO Phase 1` 註解。
+> **目前狀態：Phase 1（6502 CPU）。** CPU 已實作完成並通過 nestest（8991
+> 行逐指令比對全數通過，含官方與非官方 opcode）與 SingleStepTests（官方
+> opcode 100%、任務要求的非官方 opcode 100%）。PPU 還是 stub，`nes-app`
+> 顯示的仍是一張依幀數捲動的測試畫面，不是真正的遊戲畫面（PPU 渲染排進
+> Phase 2）。詳見 [`docs/architecture.md`](docs/architecture.md) 與各 crate
+> 原始碼中的 `TODO Phase 2` 註解。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見

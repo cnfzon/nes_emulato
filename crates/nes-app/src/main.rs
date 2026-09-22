@@ -18,7 +18,7 @@ use std::thread;
 
 use app::NesApp;
 use commands::EmuCommand;
-use nes_core::FrameBuffer;
+use nes_core::{DebugSnapshot, FrameBuffer};
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -26,10 +26,11 @@ fn main() -> eframe::Result {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<commands::EmuEvent>();
     let (frame_input, frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
+    let (debug_input, debug_output) = triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
 
     let emu_handle = thread::Builder::new()
         .name("nes-emu".to_string())
-        .spawn(move || emu::run(cmd_rx, event_tx, frame_input))
+        .spawn(move || emu::run(cmd_rx, event_tx, frame_input, debug_input))
         .expect("failed to spawn emu thread");
 
     let native_options = eframe::NativeOptions {
@@ -47,6 +48,7 @@ fn main() -> eframe::Result {
                 cmd_tx,
                 event_rx,
                 frame_output,
+                debug_output,
                 emu_handle,
             )))
         }),

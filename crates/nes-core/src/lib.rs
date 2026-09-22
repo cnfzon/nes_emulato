@@ -22,7 +22,7 @@ pub mod state;
 
 pub use bus::Bus;
 pub use cartridge::{Cartridge, Mapper, Mirroring, RomInfo};
-pub use cpu::Cpu;
+pub use cpu::{Cpu, StatusFlags};
 pub use debug::DebugSnapshot;
 pub use error::{RomError, StateError};
 pub use frame::FrameBuffer;
@@ -46,9 +46,8 @@ impl Nes {
     pub fn from_rom(rom: &[u8]) -> Result<Self, RomError> {
         let cartridge = Cartridge::from_ines(rom)?;
         let bus = Bus::new(cartridge);
-        let cpu = Cpu::new(bus);
-        // TODO Phase 1: Bus::read 實作完成後，從 $FFFC/$FFFD 讀取 reset
-        // vector 來設定 cpu.pc，取代現在寫死的 0。
+        let mut cpu = Cpu::new(bus);
+        cpu.reset();
         Ok(Self {
             cpu,
             frame_buffer: FrameBuffer::blank(),
@@ -56,14 +55,29 @@ impl Nes {
         })
     }
 
+    /// NTSC 下一幀（1/60.0988 秒）大約對應的 CPU cycle 數
+    /// （`21_477_272.7 Hz 主時脈 / 12 / 60.0988 Hz ≈ 29780.5`，取整數 29781）。
+    const CPU_CYCLES_PER_FRAME: u64 = 29781;
+
     /// 推進一幀模擬，回傳這一幀畫好的畫面。
     ///
     /// 由外部（GUI / netplay 迴圈）每幀呼叫一次並傳入雙人輸入，而不是靠
     /// `Nes` 自己起執行緒或呼叫 callback —— 這樣 rollback 才能在任意一幀
     /// 暫停、讀檔、用不同輸入重跑，行為完全可預期。
+    ///
+    /// 因為 CPU 是 instruction-level 精度（見 `cpu` 模組文件），無法精準停在
+    /// 剛好 `CPU_CYCLES_PER_FRAME` 那個 cycle：這裡的作法是「跑到累積 cycle
+    /// 數達到或超過預算為止」，最多多跑一條指令的 cycle 數（最壞情況 8
+    /// cycles，相對一整幀 29781 cycles 是可忽略的誤差）。PPU 還沒實作
+    /// （Phase 2），畫面仍然使用 `render_test_pattern` 佔位。
     pub fn run_frame(&mut self, input: [Buttons; 2]) -> &FrameBuffer {
         self.cpu.bus_mut().joypads[0].state = input[0];
         self.cpu.bus_mut().joypads[1].state = input[1];
+
+        let target = self.cpu.bus().total_cycles() + Self::CPU_CYCLES_PER_FRAME;
+        while self.cpu.bus().total_cycles() < target {
+            self.cpu.step();
+        }
 
         self.frame_count += 1;
         self.frame_buffer
@@ -164,8 +178,10 @@ impl Nes {
             cpu_x: self.cpu.x,
             cpu_y: self.cpu.y,
             cpu_sp: self.cpu.sp,
-            cpu_status: self.cpu.status,
-            cpu_cycles: self.cpu.cycles,
+            cpu_status: self.cpu.status.bits(),
+            cpu_cycles: bus.total_cycles(),
+            cpu_disassembly: self.cpu.current_disassembly(),
+            cpu_jammed: self.cpu.jammed,
             ppu_scanline: bus.ppu.scanline,
             ppu_cycle: bus.ppu.cycle,
             ppu_frame: bus.ppu.frame,
@@ -176,6 +192,44 @@ impl Nes {
     /// 目前載入的 ROM 中繼資料。
     pub fn rom_info(&self) -> &RomInfo {
         &self.cpu.bus().cartridge.info
+    }
+
+    /// 執行「一條」CPU 指令（不是一整幀），回傳這條指令花的 cycle 數。
+    ///
+    /// 給 `nes-test` 這類需要「一條一條指令跑、每條都要比對」的工具用
+    /// （例如 nestest log 逐行比對）；一般遊戲邏輯應該用 [`Nes::run_frame`]。
+    ///
+    /// 只有啟用 `testing` cargo feature 才會編譯進去——這是測試/除錯工具
+    /// 專用的旁路 API，不是給一般遊戲邏輯（`nes-app`）用的，用 feature 把它
+    /// 從正式建置的公開介面上移除，避免使用者不小心繞過 `run_frame` 直接
+    /// 操作 CPU。`nes-test` 在自己的 `Cargo.toml` 啟用這個 feature。
+    #[cfg(feature = "testing")]
+    pub fn step_cpu_instruction(&mut self) -> u8 {
+        self.cpu.step()
+    }
+
+    /// 目前這條（尚未執行的）指令的 nestest.log 格式 trace 行。只在
+    /// `testing` feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
+    #[cfg(feature = "testing")]
+    pub fn trace(&self) -> String {
+        self.cpu.trace()
+    }
+
+    /// 覆寫 PC。給 nestest 的「automation mode」用：先正常 `from_rom`
+    /// （內部已經跑過一次真正的 reset），再手動把 PC 蓋成 `$C000`，跳過
+    /// nestest.nes 裡需要人工按鍵互動的視覺測試選單。只在 `testing`
+    /// feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
+    #[cfg(feature = "testing")]
+    pub fn override_pc(&mut self, pc: u16) {
+        self.cpu.pc = pc;
+    }
+
+    /// side-effect-free 的記憶體讀取，給測試工具檢查特定位址用（例如
+    /// nestest 執行完後檢查錯誤碼 `$02`/`$03` 是否為 0）。只在 `testing`
+    /// feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
+    #[cfg(feature = "testing")]
+    pub fn peek(&self, addr: u16) -> u8 {
+        self.cpu.bus().peek(addr)
     }
 
     pub fn frame_count(&self) -> u64 {
@@ -332,5 +386,59 @@ mod tests {
         let result = target.load_state(&state_from_other_rom);
 
         assert!(matches!(result, Err(StateError::RomMismatch { .. })));
+    }
+
+    /// 診斷 Debugger 面板顯示全 0 的 bug：確認 `from_rom`（內部呼叫
+    /// `Cpu::reset`）之後 PC/SP/P 是硬體規定的重置值，而不是
+    /// `Cpu::new` 給的「開機前」預設值（PC=0、SP=0xFD 剛好和重置值重疊、
+    /// P=0x00）。
+    #[test]
+    fn from_rom_reset_state_matches_hardware_reset_vector() {
+        let nes = Nes::from_rom(&test_rom()).unwrap();
+        let bus = nes.cpu.bus();
+
+        let lo = bus.peek(cpu::RESET_VECTOR);
+        let hi = bus.peek(cpu::RESET_VECTOR.wrapping_add(1));
+        let expected_pc = u16::from_le_bytes([lo, hi]);
+
+        assert_eq!(nes.cpu.pc, expected_pc);
+        assert_eq!(nes.cpu.sp, 0xFD);
+        assert_eq!(nes.cpu.status.bits(), 0x24);
+    }
+
+    /// 確認 `run_frame` 真的有驅動 CPU 執行指令，而不是只推進 PPU／畫面。
+    #[test]
+    fn run_frame_advances_cpu_cycles_and_pc() {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        let pc_before = nes.cpu.pc;
+        let cycles_before = nes.cpu.bus().total_cycles();
+
+        nes.run_frame([Buttons::empty(); 2]);
+
+        assert!(nes.cpu.bus().total_cycles() > cycles_before);
+        assert_ne!(nes.cpu.pc, pc_before);
+    }
+
+    /// 確認 `debug_snapshot()` 回傳的欄位跟 `Nes` 內部實際狀態一致，
+    /// 且在跑過幾幀之後不等於 `DebugSnapshot::default()`——這正是
+    /// Debugger 面板顯示全 0 那個 bug 想要防止再發生的性質。
+    #[test]
+    fn debug_snapshot_reflects_real_state_after_running_frames() {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        for input in inputs_for(5) {
+            nes.run_frame(input);
+        }
+
+        let snap = nes.debug_snapshot();
+
+        assert_eq!(snap.cpu_pc, nes.cpu.pc);
+        assert_eq!(snap.cpu_a, nes.cpu.a);
+        assert_eq!(snap.cpu_x, nes.cpu.x);
+        assert_eq!(snap.cpu_y, nes.cpu.y);
+        assert_eq!(snap.cpu_sp, nes.cpu.sp);
+        assert_eq!(snap.cpu_status, nes.cpu.status.bits());
+        assert_eq!(snap.cpu_cycles, nes.cpu.bus().total_cycles());
+        assert_eq!(snap.ppu_frame, nes.cpu.bus().ppu.frame);
+        assert_ne!(snap, DebugSnapshot::default());
     }
 }

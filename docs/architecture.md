@@ -46,20 +46,37 @@ graph TB
     App -- "EmuCommand\n(crossbeam-channel)" --> Loop
     Loop -- "EmuEvent\n(crossbeam-channel)" --> App
     Loop -- "FrameBuffer\n(triple_buffer, 無鎖)" --> App
+    Loop -- "Option&lt;DebugSnapshot&gt;\n(triple_buffer, 無鎖)" --> App
     Loop --> Nes
 ```
+
+emu 執行緒與 UI 執行緒之間目前有 4 條獨立通道，方向、型別、用途、背壓策略
+各不相同：
+
+| 通道 | 型別 | 方向 | 用途 | 背壓策略 |
+|---|---|---|---|---|
+| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
+| 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`，低頻率、每則都要送達 | unbounded：頻率低（`FpsReport` 每秒 1 則），不會累積成問題 |
+| 畫面 | `triple_buffer::Input/Output<FrameBuffer>` | Emu → UI | 每幀畫好的 `FrameBuffer` | `triple_buffer`：只在乎「最新一張」，UI 沒讀不會擋住 emu 寫入，也不會無限堆積 |
+| Debug 快照 | `triple_buffer::Input/Output<Option<DebugSnapshot>>` | Emu → UI | Debugger 面板顯示的 CPU/PPU/APU 狀態；`None` 代表「尚未收到任何快照」，跟真實模擬狀態（即使欄位剛好是 0）明確區分 | `triple_buffer`：同 FrameBuffer；另外用 `EmuCommand::SetDebugEnabled` 讓 emu 執行緒只在面板開啟時才產生快照，面板關閉時零成本 |
 
 - **為什麼 emu 執行緒跟 UI 執行緒分開？** GUI 重繪（尤其是開啟 debugger 面板、
   拖動視窗）耗時不固定，如果模擬迴圈跟 UI 畫在同一個執行緒，模擬的 timing
   會被 UI 卡頓拖慢；反過來，模擬迴圈裡的 `sleep` 也不能拖慢 UI 的重繪。
-- **為什麼畫面用 `triple_buffer` 而不是 channel？** Emu 執行緒每 1/60 秒就
-  產生一張新畫面，如果透過一般 channel 傳遞，UI 執行緒處理不及就會塞住 emu
-  執行緒（channel 滿了會 block，或者用 unbounded 會無限堆積記憶體）。
-  `triple_buffer` 讓「寫最新一張、讀最新一張」永遠是 O(1) 且無鎖，讀寫互不
-  阻塞，天然符合「畫面只在乎最新一張」的需求。
+- **為什麼畫面／Debug 快照用 `triple_buffer` 而不是 channel？** 這兩者都是
+  「每幀更新一次、UI 只在乎最新一份」的資料，如果透過一般 channel 傳遞，
+  UI 執行緒處理不及就會塞住 emu 執行緒（channel 滿了會 block，或者用
+  unbounded 會無限堆積記憶體）。`triple_buffer` 讓「寫最新一份、讀最新
+  一份」永遠是 O(1) 且無鎖，讀寫互不阻塞。
 - **為什麼指令/事件用 `crossbeam-channel`？** 指令（LoadRom、SetInput……）跟
   畫面不同，每一則都有意義、不能丟，用 unbounded channel 剛好；`crossbeam`
   比 `std::sync::mpsc` 效能更好、API 更完整（`try_iter` 等）。
+- **為什麼 Debug 快照用 `Option<DebugSnapshot>` 而不是直接用
+  `DebugSnapshot`？** 曾經發生過的 bug：UI 端在拿不到真實資料時，直接用
+  `DebugSnapshot::default()` 頂替，結果 Debugger 面板長期顯示一份看起來
+  正常、實際上完全是假資料的畫面（SP/Status 顯示 0，但 reset 後不可能是
+  0）。用 `Option` 讓「尚未收到資料」在型別上就跟「收到了、且欄位剛好是
+  某個值」區分開來，UI 端沒有任何藉口再用一份假資料頂替。
 
 ## 4. `nes-core` 公開 API：為什麼不用 callback
 
@@ -294,3 +311,50 @@ flowchart TD
   `StateError::Corrupt`。
 - `load_state_rejects_mismatched_rom`：拿「另一份 ROM」存的檔去讀目前載入
   的 ROM，驗證回傳 `StateError::RomMismatch`。
+
+## 9. CPU 精度層級：instruction-level（Phase 1）
+
+`crates/nes-core/src/cpu/mod.rs` 實作的 6502（2A03）CPU 是 **instruction-level**
+（指令級）精度，不是 **cycle-level**（cycle 級）精度。差異：
+
+- **cycle-level** 模擬器把每條指令拆成一個個 cycle 的微碼狀態機，`step()`
+  每次只推進一個 cycle；匯流排存取（包含指令執行「途中」的每一次讀寫）都
+  照真實硬體的時序精確發生。
+- 本專案的 **instruction-level** 模擬器裡，`Cpu::step()` 一次把一條指令從
+  取指到寫回全部做完，只在最後告訴呼叫端「這條指令總共花了幾個 cycle」
+  （查 `OPCODES` 表 + 跨頁/分支的動態加成），再一次呼叫 `Bus::tick` 補上
+  時間，而不是每個 cycle 都真的去摸一次匯流排。
+
+### 為什麼選這個層級
+
+Phase 1 的目標是「CPU 正確性」——最終暫存器狀態、指令消耗的 cycle 總數、
+分支/跨頁的邊界行為要跟真實硬體一致（用 nestest 驗證）。這些性質全部只跟
+「一條指令執行前」與「執行後」的狀態有關，跟「執行途中每個 cycle 匯流排上
+發生了什麼」無關。既然目標不需要後者，选 instruction-level 可以大幅簡化
+實作：`OPCODES` 表直接查表決定 cycle 數，每條指令只要寫「做什麼」，不用另外
+寫「這個 cycle 該做什麼、下個 cycle 該做什麼」的狀態機。
+
+### 影響／代價
+
+1. **通過 nestest，但不是 SingleStepTests 的 `cycles` 欄位**。SingleStepTests
+   每筆測試資料除了「最終暫存器/RAM」，還有一份「這條指令逐 cycle 的匯流排
+   讀寫紀錄」；照任務規格我們只比對前者，不比對後者（見
+   `crates/nes-core/src/cpu/singlestep.rs` 的模組文件）。實測結果：**官方
+   opcode 256 萬分之 151 萬筆全數通過（100%）**；非官方 opcode 中，任務要求
+   的那些（LAX/SAX/DCP/ISB/SLO/RLA/SRE/RRA/\*SBC/各種 NOP/JAM/ANC/ALR/ARR/
+   AXS）也全數 100% 通過，只有 8 個任務範圍外、真實硬體行為本身就不穩定
+   （analog/undefined，依賴個別晶片的類比殘留電荷，不是單純的邏輯 bug）的
+   opcode（`$8B` `$93` `$9B` `$9C` `$9E` `$9F` `$AB` `$BB`）維持 NOP 占位，
+   細節見 Phase 1 報告。
+2. **PPU/mapper 還無法在指令「執行途中」插手**。例如某些少見的技巧（在
+   PPU 正在畫某條掃描線的當下，靠一條指令的第 3、第 4 個 cycle 精準寫某個
+   PPU 暫存器）需要 cycle-level 才能重現；Phase 1 的 PPU 還是 stub，用不到
+   這個精度，之後如果真的要做這類精細時序（例如 sprite-0 hit 的邊界情況），
+   才需要重新評估要不要把 CPU 也改成 cycle-level。
+3. **`Bus::tick` 一次補一整條指令的 cycle 數**，而不是逐 cycle 呼叫；PPU
+   的 `(scanline, cycle)` 是從累積的 `total_cycles * 3` 換算回去的（見
+   `Bus::ppu_dot`），在「一條指令之內」沒有更細的解析度，但這條指令執行完
+   之後下一次 `trace()`/`debug_snapshot()` 讀到的值是精確的。
+
+這個決定不影響 §7 的決定性規則：instruction-level 一樣是完全決定性的（同樣
+輸入序列永遠得到同樣結果），只是不模擬「指令執行到一半」這個中間狀態。

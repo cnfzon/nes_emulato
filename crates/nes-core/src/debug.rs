@@ -5,9 +5,11 @@
 
 /// CPU / PPU / APU 目前狀態的唯讀摘要。
 ///
-/// Phase 0 大部分欄位都還是預設值，因為 CPU/PPU/APU 尚未實作；等 Phase 1
-/// 把 6502 與 PPU 掃描線邏輯接上後，這些欄位就會反映真實狀態。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// 所有欄位都反映 [`crate::Nes::debug_snapshot`] 呼叫當下的真實狀態；
+/// `DebugSnapshot::default()` 只用來當作「尚未收到任何快照」的哨兵值
+/// （例如 GUI 端在收到第一份快照之前的暫時狀態），不代表模擬器真的處於
+/// 全 0 狀態——reset 後 SP/P 就不會是 0。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DebugSnapshot {
     pub cpu_pc: u16,
     pub cpu_a: u8,
@@ -16,6 +18,11 @@ pub struct DebugSnapshot {
     pub cpu_sp: u8,
     pub cpu_status: u8,
     pub cpu_cycles: u64,
+    /// 目前 PC 這條指令的反組譯文字（不含暫存器/CYC 資訊，純粹是
+    /// `MNEMONIC OPERAND`），方便 Debugger 面板直接顯示。
+    pub cpu_disassembly: String,
+    /// CPU 是否卡在 JAM/KIL 狀態。
+    pub cpu_jammed: bool,
 
     pub ppu_scanline: u16,
     pub ppu_cycle: u16,

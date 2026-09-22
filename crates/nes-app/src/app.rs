@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
-use nes_core::{Buttons, RomInfo};
+use nes_core::{Buttons, DebugSnapshot, RomInfo};
 
 use crate::commands::{EmuCommand, EmuEvent};
 
@@ -15,6 +15,7 @@ pub struct NesApp {
     cmd_tx: Sender<EmuCommand>,
     event_rx: Receiver<EmuEvent>,
     frame_output: triple_buffer::Output<nes_core::FrameBuffer>,
+    debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
     emu_handle: Option<JoinHandle<()>>,
 
     texture: Option<egui::TextureHandle>,
@@ -33,12 +34,14 @@ impl NesApp {
         cmd_tx: Sender<EmuCommand>,
         event_rx: Receiver<EmuEvent>,
         frame_output: triple_buffer::Output<nes_core::FrameBuffer>,
+        debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
         emu_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             cmd_tx,
             event_rx,
             frame_output,
+            debug_output,
             emu_handle: Some(emu_handle),
             texture: None,
             rom_info: None,
@@ -157,7 +160,12 @@ impl eframe::App for NesApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_debugger, "Debugger");
+                    let response = ui.checkbox(&mut self.show_debugger, "Debugger");
+                    if response.changed() {
+                        let _ = self
+                            .cmd_tx
+                            .send(EmuCommand::SetDebugEnabled(self.show_debugger));
+                    }
                 });
                 ui.menu_button("Emulation", |ui| {
                     let pause_label = if self.paused { "Resume" } else { "Pause" };
@@ -213,26 +221,35 @@ impl eframe::App for NesApp {
         if self.show_debugger {
             egui::Panel::right("debugger").show(ui, |ui| {
                 ui.heading("Debugger");
-                let snap = nes_core::DebugSnapshot::default();
-                ui.label(format!("PC: {:#06X}", snap.cpu_pc));
-                ui.label(format!(
-                    "A: {:#04X}  X: {:#04X}  Y: {:#04X}",
-                    snap.cpu_a, snap.cpu_x, snap.cpu_y
-                ));
-                ui.label(format!(
-                    "SP: {:#04X}  Status: {:#04X}",
-                    snap.cpu_sp, snap.cpu_status
-                ));
-                ui.label(format!("CPU cycles: {}", snap.cpu_cycles));
-                ui.separator();
-                ui.label(format!(
-                    "PPU scanline: {}  cycle: {}",
-                    snap.ppu_scanline, snap.ppu_cycle
-                ));
-                ui.label(format!("PPU frame: {}", snap.ppu_frame));
-                ui.separator();
-                ui.label(format!("APU frame counter: {}", snap.apu_frame_counter));
-                ui.small("Phase 0：CPU/PPU/APU 尚未實作，欄位固定為預設值。");
+                match self.debug_output.read() {
+                    Some(snap) => {
+                        ui.label(format!("PC: {:#06X}", snap.cpu_pc));
+                        ui.label(format!(
+                            "A: {:#04X}  X: {:#04X}  Y: {:#04X}",
+                            snap.cpu_a, snap.cpu_x, snap.cpu_y
+                        ));
+                        ui.label(format!(
+                            "SP: {:#04X}  Status: {:#04X}",
+                            snap.cpu_sp, snap.cpu_status
+                        ));
+                        ui.label(format!("CPU cycles: {}", snap.cpu_cycles));
+                        ui.label(format!("下一條指令: {}", snap.cpu_disassembly));
+                        if snap.cpu_jammed {
+                            ui.colored_label(egui::Color32::RED, "CPU JAMMED");
+                        }
+                        ui.separator();
+                        ui.label(format!(
+                            "PPU scanline: {}  cycle: {}",
+                            snap.ppu_scanline, snap.ppu_cycle
+                        ));
+                        ui.label(format!("PPU frame: {}", snap.ppu_frame));
+                        ui.separator();
+                        ui.label(format!("APU frame counter: {}", snap.apu_frame_counter));
+                    }
+                    None => {
+                        ui.label("尚未取得資料");
+                    }
+                }
             });
         }
 
