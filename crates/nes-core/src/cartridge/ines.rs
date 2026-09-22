@@ -15,7 +15,8 @@
 //! [`RomError::Nes20Unsupported`] 而不是嘗試用 iNES 1.0 規則誤解析。
 
 use super::{
-    CHR_BANK_SIZE, CHR_RAM_SIZE, Cartridge, Mapper, Mirroring, Nrom, PRG_BANK_SIZE, RomInfo,
+    CHR_BANK_SIZE, CHR_RAM_SIZE, Cartridge, Mapper, Mirroring, Nrom, PRG_BANK_SIZE, PRG_RAM_SIZE,
+    RomInfo,
 };
 use crate::error::RomError;
 
@@ -77,6 +78,12 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
     } else {
         Vec::new()
     };
+    let prg_ram = vec![0u8; PRG_RAM_SIZE];
+
+    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
+    hasher.update(&prg_rom);
+    hasher.update(&chr_rom);
+    let rom_hash = hasher.digest();
 
     let mapper = match mapper_id {
         0 => Mapper::Nrom(Nrom::new(prg_rom_banks)),
@@ -97,7 +104,9 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
         prg_rom,
         chr_rom,
         chr_ram,
+        prg_ram,
         mapper,
+        rom_hash,
     })
 }
 

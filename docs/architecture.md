@@ -191,13 +191,14 @@ Rollback 與 desync 偵測完全依賴「同樣的初始狀態 + 同樣的輸入
 5. **所有進入 save state 的型別都 `derive(Serialize, Deserialize)`**，且整個
    `Nes` 型別樹只用 plain owned data（沒有 `Rc`/`RefCell`/`Arc`/`Mutex`），
    確保 `Nes` 可以被完整 `Clone`／序列化／還原，這是 rollback 的存檔/讀檔
-   機制能運作的前提。
+   機制能運作的前提。（靜態 ROM bytes 是例外，刻意 `#[serde(skip)]`，理由與
+   讀檔時如何確保接回同一份 ROM、如何拒絕損毀資料，見 §8。）
 6. **畫面渲染是純函式**：Phase 0 的 `FrameBuffer::render_test_pattern(frame_count,
    input)` 只由這兩個參數決定輸出，不讀取任何全域/外部狀態；未來真正的 PPU
    渲染器也必須維持這個性質（只由 `Ppu`/`Bus` 內部狀態決定，不能讀系統時間
    或其他非決定性來源）。
 
-這三個測試（`crates/nes-core/src/lib.rs` 的 `tests` module）直接驗證了規則
+以下三個測試（`crates/nes-core/src/lib.rs` 的 `tests` module）直接驗證了規則
 5、6 帶來的性質：
 
 - `save_then_load_preserves_state_hash`：存檔後立刻讀檔，`state_hash` 不變。
@@ -206,3 +207,90 @@ Rollback 與 desync 偵測完全依賴「同樣的初始狀態 + 同樣的輸入
 - `rollback_replay_matches_uninterrupted_run`：在第 k 幀存檔、跑到 k+m、
   讀回存檔、用「相同」的輸入重新跑到 k+m，結果與「完全沒有讀檔」的一次
   性執行一模一樣——這正是 rollback 依賴的核心性質。
+
+## 8. Save state 格式：排除 ROM bytes、用雜湊比對、拒絕損毀資料
+
+Rollback 需要高頻率地存檔/讀檔（理論上每幀都可能存一次），所以 save state
+的設計有兩個額外目標：**不要浪費空間重複存不會變的資料**、**讀到壞資料時要
+明確拒絕，不能 panic 或悄悄跑出錯的模擬**。
+
+### 8.1 ROM bytes 不進 save state
+
+`Cartridge` 的 `prg_rom`/`chr_rom` 兩個欄位標了 `#[serde(skip)]`：
+
+```rust
+#[serde(skip)]
+pub prg_rom: Vec<u8>,
+#[serde(skip)]
+pub chr_rom: Vec<u8>,
+```
+
+理由：同一場對局裡，PRG-ROM/CHR-ROM 的內容從頭到尾不會變（它們是唯讀
+的卡帶資料），rollback 每次存讀檔都把整份 ROM（可能幾百 KB）重複序列化一次
+既浪費頻寬/記憶體、也拖慢「每幀都可能要存一次檔」的效能需求。真正會變的
+只有 **CHR-RAM**、**PRG-RAM**、CPU/PPU/APU 暫存器等執行期狀態，這些欄位照
+常序列化。連帶地，[`Nes::state_hash`] 因為是對 `save_state()` 的輸出做
+xxh3-64，也自動不包含 ROM bytes，只反映「真正會變的狀態」。
+
+### 8.2 `rom_hash`：確保讀檔時接回「同一份」ROM
+
+因為 `prg_rom`/`chr_rom` 被跳過，`load_state` 讀回資料後必須從目前記憶體裡
+已經載入的 ROM 把這兩個欄位接回去——但如果存檔其實是另一款遊戲存的
+（例如使用者不小心把《薩爾達》的存檔拿去讀《瑪利歐》），接回去的 PRG/CHR
+資料跟存檔裡的 CPU/PPU 狀態完全對不上，會直接跑出垃圾畫面或亂七八糟的
+行為，而且不會有任何錯誤訊息。
+
+`Cartridge` 因此多存一個 `rom_hash: u64` 欄位（`xxh3_64(prg_rom ++
+chr_rom)`，在 `ines::parse` 解析時算好），`Nes::load_state` 讀檔時比對存檔
+裡的 `rom_hash` 跟目前已載入 ROM 的 `rom_hash`：
+
+```rust
+let expected_hash = self.cpu.bus().cartridge.rom_hash;
+let found_hash = decoded.cpu.bus().cartridge.rom_hash;
+if expected_hash != found_hash {
+    return Err(StateError::RomMismatch { expected: expected_hash, found: found_hash });
+}
+```
+
+不符合就回傳 `StateError::RomMismatch`，拒絕讀檔，而不是接上錯的 ROM 繼續跑。
+
+### 8.3 結構驗證：拒絕長度被竄改的資料
+
+postcard 對 `Vec<u8>` 的編碼是「長度前綴 + 內容」，理論上存檔資料可能因為
+儲存媒介損毀、或被惡意竄改，導致解碼出一個「型別對、但長度不符合硬體規格」
+的 `Nes`（例如 RAM 變成 2049 bytes）。`Nes::load_state` 在比對 `rom_hash`
+之前，會先呼叫內部的 `validate_structure()` 逐一檢查：
+
+- `Bus::ram` 必須是 `0x0800`（2KB）
+- `Ppu::vram` 必須是 `2048`
+- `Ppu::oam` 必須是 `256`
+- `Cartridge::chr_ram` 必須符合 `info.chr_rom_banks`（有 CHR-ROM 就該是 0，
+  沒有就該是 `CHR_RAM_SIZE`）
+- `Cartridge::prg_ram` 必須是 `PRG_RAM_SIZE`
+
+任何一項不符合就回傳 `StateError::Corrupt`，絕不 panic、也不會讓後續（尤其
+是 Phase 1 之後會實作的 `Bus::read`/`write`）因為陣列長度不對而 out-of-bounds
+panic。
+
+### 8.4 `load_state` 完整流程
+
+```mermaid
+flowchart TD
+    A["postcard::from_bytes(bytes)"] -->|Err| E1["StateError::Decode"]
+    A -->|Ok decoded: Nes| B["validate_structure()"]
+    B -->|不符合| E2["StateError::Corrupt"]
+    B -->|符合| C{"rom_hash 相符?"}
+    C -->|否| E3["StateError::RomMismatch"]
+    C -->|是| D["從 self 現有的 Cartridge\n接回 prg_rom / chr_rom"]
+    D --> F["*self = decoded"]
+```
+
+對應的三個「拒絕壞資料」測試（`crates/nes-core/src/lib.rs`）：
+
+- `load_state_rejects_truncated_bytes`：把存檔位元組砍半再讀，驗證回傳
+  `StateError::Decode`。
+- `load_state_rejects_tampered_length`：手動把一份有效存檔的 RAM 長度改壞
+  （`push` 多一個 byte）再讀，驗證 `validate_structure` 攔下來、回傳
+  `StateError::Corrupt`。
+- `load_state_rejects_mismatched_rom`：拿「另一份 ROM」存的檔去讀目前載入
+  的 ROM，驗證回傳 `StateError::RomMismatch`。

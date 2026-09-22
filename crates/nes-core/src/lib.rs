@@ -83,8 +83,70 @@ impl Nes {
     }
 
     /// 從一份存檔還原狀態，取代 `self` 目前的內容。
+    ///
+    /// 步驟：
+    /// 1. postcard 解碼——資料截斷/格式錯誤會在這裡回傳
+    ///    [`StateError::Decode`]。
+    /// 2. 檢查解碼出來的內部欄位長度是否符合硬體規格（RAM/VRAM/OAM/
+    ///    CHR-RAM/PRG-RAM）；不符合代表存檔損毀或被竄改，回傳
+    ///    [`StateError::Corrupt`]。
+    /// 3. 比對 `rom_hash` 是否跟目前已載入的 ROM 相符；不符合代表這份存檔
+    ///    屬於另一個遊戲，回傳 [`StateError::RomMismatch`]。
+    /// 4. 因為 `prg_rom`/`chr_rom` 不進存檔（`#[serde(skip)]`），從 `self`
+    ///    目前持有的 ROM 資料接回解碼出來的 `Nes`，再整個取代 `self`。
     pub fn load_state(&mut self, bytes: &[u8]) -> Result<(), StateError> {
-        *self = state::decode(bytes)?;
+        let mut decoded: Nes = state::decode(bytes)?;
+        decoded.validate_structure()?;
+
+        let expected_hash = self.cpu.bus().cartridge.rom_hash;
+        let found_hash = decoded.cpu.bus().cartridge.rom_hash;
+        if expected_hash != found_hash {
+            return Err(StateError::RomMismatch {
+                expected: expected_hash,
+                found: found_hash,
+            });
+        }
+
+        let prg_rom = self.cpu.bus().cartridge.prg_rom.clone();
+        let chr_rom = self.cpu.bus().cartridge.chr_rom.clone();
+        let decoded_bus = decoded.cpu.bus_mut();
+        decoded_bus.cartridge.prg_rom = prg_rom;
+        decoded_bus.cartridge.chr_rom = chr_rom;
+
+        *self = decoded;
+        Ok(())
+    }
+
+    /// 檢查所有「應該有固定長度」的 `Vec` 欄位是否真的符合硬體規格。
+    ///
+    /// postcard 對 `Vec<u8>` 是「長度前綴 + 內容」的編碼，理論上可以被竄改成
+    /// 任意長度；這裡逐一驗證，避免之後的記憶體存取邏輯（Phase 1 的
+    /// `Bus::read`/`write`）因為長度不對而 panic 或算出垃圾結果。
+    fn validate_structure(&self) -> Result<(), StateError> {
+        let bus = self.cpu.bus();
+
+        if bus.ram.len() != 0x0800 {
+            return Err(StateError::Corrupt);
+        }
+        if bus.ppu.vram.len() != 2048 {
+            return Err(StateError::Corrupt);
+        }
+        if bus.ppu.oam.len() != 256 {
+            return Err(StateError::Corrupt);
+        }
+
+        let expected_chr_ram_len = if bus.cartridge.info.chr_rom_banks == 0 {
+            cartridge::CHR_RAM_SIZE
+        } else {
+            0
+        };
+        if bus.cartridge.chr_ram.len() != expected_chr_ram_len {
+            return Err(StateError::Corrupt);
+        }
+        if bus.cartridge.prg_ram.len() != cartridge::PRG_RAM_SIZE {
+            return Err(StateError::Corrupt);
+        }
+
         Ok(())
     }
 
@@ -137,6 +199,18 @@ mod tests {
         bytes[5] = 1; // CHR banks
         bytes.extend(vec![0xAAu8; PRG_BANK_SIZE]);
         bytes.extend(vec![0xBBu8; CHR_BANK_SIZE]);
+        bytes
+    }
+
+    /// 跟 `test_rom` header 相同、但內容不同的第二份 ROM，用來測試
+    /// `load_state` 的 `rom_hash` 檢查。
+    fn other_test_rom() -> Vec<u8> {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..4].copy_from_slice(b"NES\x1A");
+        bytes[4] = 1; // PRG banks
+        bytes[5] = 1; // CHR banks
+        bytes.extend(vec![0xCCu8; PRG_BANK_SIZE]);
+        bytes.extend(vec![0xDDu8; CHR_BANK_SIZE]);
         bytes
     }
 
@@ -219,5 +293,44 @@ mod tests {
         }
 
         assert_eq!(replay.state_hash(), baseline_hash);
+    }
+
+    #[test]
+    fn load_state_rejects_truncated_bytes() {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        let bytes = nes.save_state();
+        let truncated = &bytes[..bytes.len() / 2];
+
+        let result = nes.load_state(truncated);
+
+        assert!(matches!(result, Err(StateError::Decode(_))));
+    }
+
+    #[test]
+    fn load_state_rejects_tampered_length() {
+        let rom = test_rom();
+
+        // 手動破壞一份「有效」存檔的內部不變量（RAM 長度不再是 0x0800），
+        // 藉此驗證 load_state 會在讀回這種資料時偵測到並拒絕，而不是照樣
+        // 接受後讓後續的記憶體存取邏輯壞掉。
+        let mut source = Nes::from_rom(&rom).unwrap();
+        source.cpu.bus_mut().ram.push(0);
+        let corrupted = source.save_state();
+
+        let mut target = Nes::from_rom(&rom).unwrap();
+        let result = target.load_state(&corrupted);
+
+        assert!(matches!(result, Err(StateError::Corrupt)));
+    }
+
+    #[test]
+    fn load_state_rejects_mismatched_rom() {
+        let source = Nes::from_rom(&other_test_rom()).unwrap();
+        let state_from_other_rom = source.save_state();
+
+        let mut target = Nes::from_rom(&test_rom()).unwrap();
+        let result = target.load_state(&state_from_other_rom);
+
+        assert!(matches!(result, Err(StateError::RomMismatch { .. })));
     }
 }
