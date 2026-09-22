@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nes-core",
+    "crates/nes-net",
+    "crates/nes-app",
+    "crates/nes-test",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["cnfzon"]
+license = "TODO"
+repository = "TODO"
+publish = false
+
+[workspace.dependencies]
+nes-core = { path = "crates/nes-core" }
+nes-net = { path = "crates/nes-net" }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 1

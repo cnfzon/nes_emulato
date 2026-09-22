@@ -1,0 +1,27 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug nes-app",
+            "cargo": {
+                "args": ["build", "--bin=nes-app", "--package=nes-app"],
+                "filter": { "name": "nes-app", "kind": "bin" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug nes-core unit tests",
+            "cargo": {
+                "args": ["test", "--no-run", "--lib", "--package=nes-core"],
+                "filter": { "name": "nes-core", "kind": "lib" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

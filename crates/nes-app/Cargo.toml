@@ -1,0 +1,19 @@
+[package]
+name = "nes-app"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-channel = "0.5.17"
+eframe = "0.36"
+egui = "0.36"
+env_logger = "0.11.11"
+log = "0.4.34"
+nes-core = { version = "0.1.0", path = "../nes-core" }
+nes-net = { version = "0.1.0", path = "../nes-net" }
+rfd = "0.17.2"
+triple_buffer = "9"
