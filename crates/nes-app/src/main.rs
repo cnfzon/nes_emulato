@@ -18,7 +18,31 @@ use std::thread;
 
 use app::NesApp;
 use commands::EmuCommand;
+use eframe::egui;
 use nes_core::{DebugSnapshot, FrameBuffer};
+
+/// Noto Sans CJK TC（OFL-1.1，見 `assets/fonts/OFL.txt`），作為中文字元的
+/// fallback 字型，避免選單/Debugger 面板的中文顯示成方框。
+const NOTO_SANS_CJK_TC: &[u8] = include_bytes!("../assets/fonts/NotoSansCJKtc-Regular.otf");
+
+/// 把 CJK 字型加進 egui 的 proportional/monospace family，當作 fallback：
+/// 拉丁字母/數字仍優先用 egui 預設字型，只有找不到對應字符（如中文）時才
+/// 會落到這套字型。
+fn install_cjk_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto_sans_cjk_tc".to_owned(),
+        egui::FontData::from_static(NOTO_SANS_CJK_TC).into(),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("noto_sans_cjk_tc".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
 
 fn main() -> eframe::Result {
     env_logger::init();
@@ -43,7 +67,8 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "NES Netplay",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            install_cjk_fonts(&cc.egui_ctx);
             Ok(Box::new(NesApp::new(
                 cmd_tx,
                 event_rx,

@@ -49,3 +49,27 @@ TODO：本專案的授權條款尚未決定，由專案負責人（課程學生�
 
 所有第三方 crate 依賴列在各 `Cargo.toml` 中，版本與授權條款以
 [crates.io](https://crates.io) 上各自套件頁面為準。
+
+## 內嵌字型
+
+`nes-app` 的 egui GUI（選單、Debugger 面板）需要顯示繁體中文，但 egui 內建
+預設字型不含 CJK 字符，因此內嵌了一套開源 CJK 字型作為 fallback：
+
+- **字型**：Noto Sans CJK TC（思源黑體 繁體中文，Regular 字重）
+- **來源**：<https://github.com/notofonts/noto-cjk>，檔案取自
+  `Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf`
+  （由 Google 與 Adobe 共同開發；與 Google Fonts 上的 "Noto Sans TC" 屬同一
+  字族）
+- **授權**：SIL Open Font License 1.1（OFL-1.1），全文見
+  [`crates/nes-app/assets/fonts/OFL.txt`](crates/nes-app/assets/fonts/OFL.txt)
+  （取自該 repo 的 `Sans/LICENSE`）。OFL-1.1 允許免費使用、修改、subset、
+  嵌入軟體並重新散布（含商業用途），唯不可單獨販售字型本身。
+- **存放位置**：
+  [`crates/nes-app/assets/fonts/NotoSansCJKtc-Regular.otf`](crates/nes-app/assets/fonts/NotoSansCJKtc-Regular.otf)，
+  透過 `include_bytes!` 內嵌進執行檔（見
+  [`crates/nes-app/src/main.rs`](crates/nes-app/src/main.rs) 的
+  `install_cjk_fonts`），在 `eframe::run_native` 啟動時以
+  `egui::Context::set_fonts` 加入 proportional/monospace family 的
+  fallback 清單尾端 —— 拉丁字母/數字仍優先用 egui 預設字型，只有中文等
+  字符才會落到這套字型。
+- 目前內嵌的是完整字重（未做字符 subset），檔案約 16MB。
