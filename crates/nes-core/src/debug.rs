@@ -23,6 +23,9 @@ pub struct DebugSnapshot {
     pub cpu_disassembly: String,
     /// CPU 是否卡在 JAM/KIL 狀態。
     pub cpu_jammed: bool,
+    /// 已完成的整幀數（[`crate::Nes::frame_count`]）。跟 `cpu_cycles` 出自
+    /// 同一次快照，讓 GUI 可以顯示彼此一致的幀數與 cycle 數。
+    pub frame_count: u64,
 
     pub ppu_scanline: u16,
     pub ppu_cycle: u16,

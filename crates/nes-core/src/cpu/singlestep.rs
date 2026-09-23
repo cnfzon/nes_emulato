@@ -86,7 +86,10 @@ fn dummy_cartridge() -> Cartridge {
 }
 
 /// 執行單一筆測試，回傳第一個不一致的欄位描述；`Ok(())` 代表通過。
-fn run_one(tc: &TestCase) -> Result<(), String> {
+///
+/// `check_cycles` 為 `false` 時不比對 cycle 數（JAM 類別用，見 [`Category::Jam`]），
+/// 其餘暫存器與 RAM 一律比對。
+fn run_one(tc: &TestCase, check_cycles: bool) -> Result<(), String> {
     let bus = Bus::new_flat_ram_for_testing(dummy_cartridge());
     let mut cpu = Cpu::new(bus);
 
@@ -101,7 +104,7 @@ fn run_one(tc: &TestCase) -> Result<(), String> {
     }
 
     let cycles = cpu.step();
-    if cycles as usize != tc.cycles.len() {
+    if check_cycles && cycles as usize != tc.cycles.len() {
         return Err(format!("cycle 數: 期望 {}，實際 {cycles}", tc.cycles.len()));
     }
 
@@ -145,6 +148,67 @@ fn run_one(tc: &TestCase) -> Result<(), String> {
     Ok(())
 }
 
+/// 12 個 JAM/KIL opcode。真實硬體會卡死；測試資料把「卡死」展開成 11 個
+/// cycle 的匯流排活動，而本核心是 instruction-level 精度，用 `jammed` 旗標
+/// 表示卡死、`step()` 回傳 2 cycle。所以暫存器與 RAM 必須相符，cycle 數的
+/// 差異屬於預期（見 `docs/architecture.md`「SingleStepTests 分類」）。
+const JAM_OPCODES: [u8; 12] = [
+    0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2,
+];
+
+/// 8 個不穩定 opcode：真實行為取決於類比因素（bus 上的殘留電容、DMA 時機、
+/// 晶片批次），SingleStepTests 的期望值只是其中一種取樣，本專案不追求相符。
+/// 預期失敗，只列出、不計入閘門。
+const UNSTABLE_OPCODES: [u8; 8] = [0x8B, 0x93, 0x9B, 0x9C, 0x9E, 0x9F, 0xAB, 0xBB];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Category {
+    /// 官方 opcode：含 cycle 數，必須 100%。
+    Official,
+    /// 非官方且穩定：含 cycle 數，必須 100%。
+    UnofficialStable,
+    /// JAM：暫存器與 RAM 必須 100%，不比對 cycle 數。
+    Jam,
+    /// 不穩定：預期失敗，僅列出。
+    Unstable,
+}
+
+impl Category {
+    fn of(opcode: u8) -> Self {
+        if UNSTABLE_OPCODES.contains(&opcode) {
+            Category::Unstable
+        } else if JAM_OPCODES.contains(&opcode) {
+            Category::Jam
+        } else if OPCODES[opcode as usize].official {
+            Category::Official
+        } else {
+            Category::UnofficialStable
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Category::Official => "官方",
+            Category::UnofficialStable => "非官方（穩定）",
+            Category::Jam => "JAM（不比對 cycle 數）",
+            Category::Unstable => "不穩定（預期失敗）",
+        }
+    }
+}
+
+/// 一個類別的累計結果。
+#[derive(Default, Clone, Copy)]
+struct Tally {
+    pass: u64,
+    total: u64,
+}
+
+/// 只看暫存器與 RAM（不看 cycle 數）能否通過，用來單獨列出 JAM 的 cycle 數差異
+/// 是否「只有」cycle 數不同。
+fn cycles_only_mismatch(tc: &TestCase) -> bool {
+    run_one(tc, true).is_err() && run_one(tc, false).is_ok()
+}
+
 #[test]
 #[ignore = "資料量大（256 個檔案，共 256 萬筆），預設不跑；見模組文件的手動執行指令"]
 fn singlestep_tests_all_opcodes() {
@@ -158,12 +222,11 @@ fn singlestep_tests_all_opcodes() {
         return;
     }
 
-    let mut official_pass = 0u64;
-    let mut official_total = 0u64;
-    let mut unofficial_pass = 0u64;
-    let mut unofficial_total = 0u64;
-    let mut per_opcode: BTreeMap<u8, (u64, u64)> = BTreeMap::new();
-    let mut first_failures: Vec<String> = Vec::new();
+    let mut tallies: BTreeMap<Category, Tally> = BTreeMap::new();
+    let mut per_opcode: BTreeMap<u8, (Category, u64, u64)> = BTreeMap::new();
+    let mut jam_cycle_only_diffs = 0u64;
+    let mut jam_cycle_diff_examples: Vec<String> = Vec::new();
+    let mut first_gate_failures: Vec<String> = Vec::new();
 
     for opcode in 0..=255u16 {
         let opcode = opcode as u8;
@@ -177,61 +240,118 @@ fn singlestep_tests_all_opcodes() {
         };
 
         let info = &OPCODES[opcode as usize];
+        let category = Category::of(opcode);
+        let check_cycles = category != Category::Jam;
         let mut pass = 0u64;
         let total = cases.len() as u64;
 
         for tc in &cases {
-            match run_one(tc) {
-                Ok(()) => pass += 1,
+            match run_one(tc, check_cycles) {
+                Ok(()) => {
+                    pass += 1;
+                    if category == Category::Jam && cycles_only_mismatch(tc) {
+                        jam_cycle_only_diffs += 1;
+                        if jam_cycle_diff_examples.is_empty()
+                            || !jam_cycle_diff_examples
+                                .iter()
+                                .any(|e| e.starts_with(&format!("{opcode:02X} ")))
+                        {
+                            let actual = {
+                                let mut cpu =
+                                    Cpu::new(Bus::new_flat_ram_for_testing(dummy_cartridge()));
+                                cpu.pc = tc.initial.pc;
+                                cpu.bus_mut().flat_ram_mut()[tc.initial.pc as usize] = opcode;
+                                cpu.step()
+                            };
+                            jam_cycle_diff_examples.push(format!(
+                                "{opcode:02X} (JAM): 期望 {} cycles，實際 {actual}",
+                                tc.cycles.len()
+                            ));
+                        }
+                    }
+                }
                 Err(reason) => {
-                    if first_failures.len() < 20 {
-                        first_failures.push(format!(
-                            "{opcode:02X} ({}): {} — {reason}",
-                            info.mnemonic, tc.name
+                    if category != Category::Unstable && first_gate_failures.len() < 20 {
+                        first_gate_failures.push(format!(
+                            "[{}] {opcode:02X} ({}): {} — {reason}",
+                            category.label(),
+                            info.mnemonic,
+                            tc.name
                         ));
                     }
                 }
             }
         }
 
-        if info.official {
-            official_pass += pass;
-            official_total += total;
-        } else {
-            unofficial_pass += pass;
-            unofficial_total += total;
-        }
-        per_opcode.insert(opcode, (pass, total));
+        let tally = tallies.entry(category).or_default();
+        tally.pass += pass;
+        tally.total += total;
+        per_opcode.insert(opcode, (category, pass, total));
     }
 
-    println!("---- SingleStepTests 每個 opcode 的通過率 ----");
-    for (opcode, (pass, total)) in &per_opcode {
-        let info = &OPCODES[*opcode as usize];
-        let tag = if info.official { " " } else { "*" };
+    println!("---- SingleStepTests 每個 opcode 的通過率（僅列出未 100% 者）----");
+    for (opcode, (category, pass, total)) in &per_opcode {
+        if pass != total {
+            let info = &OPCODES[*opcode as usize];
+            println!(
+                "{opcode:02X} {:<5} {pass:>5}/{total:<5} [{}]",
+                info.mnemonic,
+                category.label()
+            );
+        }
+    }
+
+    println!("---- 各類別彙總 ----");
+    for (category, t) in &tallies {
         println!(
-            "{opcode:02X} {tag}{:<5} {pass:>5}/{total:<5}",
-            info.mnemonic
+            "{:<24} {}/{}（{:.2}%）",
+            category.label(),
+            t.pass,
+            t.total,
+            percentage(t.pass, t.total)
         );
     }
 
-    println!("---- 前 20 個失敗案例 ----");
-    for f in &first_failures {
-        println!("{f}");
+    println!(
+        "---- JAM：暫存器/RAM 相符但 cycle 數不同的案例數：{jam_cycle_only_diffs}（預期，不算失敗）----"
+    );
+    for e in &jam_cycle_diff_examples {
+        println!("{e}");
     }
 
+    let unstable_ops: Vec<String> = per_opcode
+        .iter()
+        .filter(|(_, (c, _, _))| *c == Category::Unstable)
+        .map(|(op, (_, pass, total))| format!("{op:02X}({pass}/{total})"))
+        .collect();
     println!(
-        "官方 opcode：{official_pass}/{official_total}（{:.2}%）",
-        percentage(official_pass, official_total)
-    );
-    println!(
-        "非官方 opcode：{unofficial_pass}/{unofficial_total}（{:.2}%）",
-        percentage(unofficial_pass, unofficial_total)
+        "---- 不穩定 opcode（預期失敗，僅列出）：{} ----",
+        unstable_ops.join(" ")
     );
 
-    assert_eq!(
-        official_pass, official_total,
-        "官方 opcode 應該 100% 通過 SingleStepTests"
-    );
+    if !first_gate_failures.is_empty() {
+        println!("---- 閘門失敗案例（最多 20 筆）----");
+        for f in &first_gate_failures {
+            println!("{f}");
+        }
+    }
+
+    for category in [
+        Category::Official,
+        Category::UnofficialStable,
+        Category::Jam,
+    ] {
+        let t = tallies.get(&category).copied().unwrap_or_default();
+        assert!(t.total > 0, "類別 {} 沒有任何測試資料", category.label());
+        assert_eq!(
+            t.pass,
+            t.total,
+            "類別 {} 應 100% 通過，實際 {}/{}",
+            category.label(),
+            t.pass,
+            t.total
+        );
+    }
 }
 
 fn percentage(pass: u64, total: u64) -> f64 {

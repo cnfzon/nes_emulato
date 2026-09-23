@@ -119,7 +119,7 @@ enum NestestFailure {
 
 /// 逐行比對：每比對一行之前呼叫 `nes.trace()` 取得「即將執行的這條指令」
 /// 的 trace，跟 `log_content` 對應行的欄位比對；通過就呼叫
-/// `nes.step_cpu_instruction()` 真的執行那條指令，再比對下一行。
+/// `nes.step_instruction()` 真的執行那條指令，再比對下一行。
 ///
 /// 成功回傳比對過的總行數；失敗回傳第一個問題（詳見 [`NestestFailure`]）。
 fn compare_nestest_log(
@@ -174,7 +174,7 @@ fn compare_nestest_log(
             history.pop_front();
         }
 
-        nes.step_cpu_instruction();
+        nes.step_instruction();
     }
 
     Ok(line_count)
@@ -307,9 +307,9 @@ mod tests {
 
         let mut reference = nes_core::Nes::from_rom(&rom).unwrap();
         let line1 = reference.trace();
-        reference.step_cpu_instruction();
+        reference.step_instruction();
         let line2 = reference.trace();
-        reference.step_cpu_instruction();
+        reference.step_instruction();
         let line3 = reference.trace();
 
         let good_log = format!("{line1}\n{line2}\n{line3}\n");
@@ -327,9 +327,9 @@ mod tests {
 
         let mut reference = nes_core::Nes::from_rom(&rom).unwrap();
         let line1 = reference.trace();
-        reference.step_cpu_instruction();
+        reference.step_instruction();
         let line2 = reference.trace();
-        reference.step_cpu_instruction();
+        reference.step_instruction();
         let line3 = reference.trace();
 
         // 刻意弄壞第 2 行：把 A 暫存器的值改掉。

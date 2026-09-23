@@ -182,6 +182,7 @@ impl Nes {
             cpu_cycles: bus.total_cycles(),
             cpu_disassembly: self.cpu.current_disassembly(),
             cpu_jammed: self.cpu.jammed,
+            frame_count: self.frame_count,
             ppu_scanline: bus.ppu.scanline,
             ppu_cycle: bus.ppu.cycle,
             ppu_frame: bus.ppu.frame,
@@ -196,40 +197,40 @@ impl Nes {
 
     /// 執行「一條」CPU 指令（不是一整幀），回傳這條指令花的 cycle 數。
     ///
-    /// 給 `nes-test` 這類需要「一條一條指令跑、每條都要比對」的工具用
-    /// （例如 nestest log 逐行比對）；一般遊戲邏輯應該用 [`Nes::run_frame`]。
+    /// Debugger 的正式功能（單步除錯、trace 輸出），也給 `nes-test` 逐行比對
+    /// nestest log 用。一般遊戲邏輯應該用 [`Nes::run_frame`]。
     ///
-    /// 只有啟用 `testing` cargo feature 才會編譯進去——這是測試/除錯工具
-    /// 專用的旁路 API，不是給一般遊戲邏輯（`nes-app`）用的，用 feature 把它
-    /// 從正式建置的公開介面上移除，避免使用者不小心繞過 `run_frame` 直接
-    /// 操作 CPU。`nes-test` 在自己的 `Cargo.toml` 啟用這個 feature。
-    #[cfg(feature = "testing")]
-    pub fn step_cpu_instruction(&mut self) -> u8 {
+    /// # 只能在暫停狀態下使用
+    ///
+    /// 這個方法會打破「以幀為單位」的決定性：`run_frame` 保證每幀恰好推進到
+    /// 固定的 cycle 預算，而這裡讓 CPU 停在幀的中間。之後再呼叫 `run_frame`
+    /// 會從那個位置繼續、並且多/少跑一段，所以兩台機器只要有一台單步過，
+    /// 兩邊的狀態就不再對得上。**netplay 進行中不得呼叫。**
+    /// 呼叫端（例如 `nes-app` 的 emu 執行緒）必須先確保模擬已暫停。
+    pub fn step_instruction(&mut self) -> u8 {
         self.cpu.step()
     }
 
-    /// 目前這條（尚未執行的）指令的 nestest.log 格式 trace 行。只在
-    /// `testing` feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
-    #[cfg(feature = "testing")]
+    /// 目前這條（尚未執行的）指令的 nestest.log 格式 trace 行。
+    ///
+    /// 唯讀、沒有副作用（內部只用 `peek` 讀記憶體），任何時候都可以呼叫。
     pub fn trace(&self) -> String {
         self.cpu.trace()
     }
 
+    /// side-effect-free 的記憶體讀取：不會觸發 PPU/APU 暫存器的讀取副作用
+    /// （例如清除 vblank 旗標），任何時候都可以呼叫。
+    pub fn peek(&self, addr: u16) -> u8 {
+        self.cpu.bus().peek(addr)
+    }
+
     /// 覆寫 PC。給 nestest 的「automation mode」用：先正常 `from_rom`
     /// （內部已經跑過一次真正的 reset），再手動把 PC 蓋成 `$C000`，跳過
-    /// nestest.nes 裡需要人工按鍵互動的視覺測試選單。只在 `testing`
-    /// feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
+    /// nestest.nes 裡需要人工按鍵互動的視覺測試選單。這是純測試用途的
+    /// 旁路，只在 `testing` feature 下可用。
     #[cfg(feature = "testing")]
     pub fn override_pc(&mut self, pc: u16) {
         self.cpu.pc = pc;
-    }
-
-    /// side-effect-free 的記憶體讀取，給測試工具檢查特定位址用（例如
-    /// nestest 執行完後檢查錯誤碼 `$02`/`$03` 是否為 0）。只在 `testing`
-    /// feature 下可用，理由同 [`Nes::step_cpu_instruction`]。
-    #[cfg(feature = "testing")]
-    pub fn peek(&self, addr: u16) -> u8 {
-        self.cpu.bus().peek(addr)
     }
 
     pub fn frame_count(&self) -> u64 {
@@ -439,6 +440,28 @@ mod tests {
         assert_eq!(snap.cpu_status, nes.cpu.status.bits());
         assert_eq!(snap.cpu_cycles, nes.cpu.bus().total_cycles());
         assert_eq!(snap.ppu_frame, nes.cpu.bus().ppu.frame);
+        assert_eq!(snap.frame_count, 5);
         assert_ne!(snap, DebugSnapshot::default());
+    }
+
+    /// `step_instruction` 推進 PC 與 cycle 數；`trace` 是唯讀的（呼叫前後
+    /// 狀態雜湊不變）且反映「下一條要執行」的指令；`peek` 沒有副作用。
+    #[test]
+    fn debugger_api_step_trace_peek() {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        let hash_before = nes.state_hash();
+        let line = nes.trace();
+        assert_eq!(nes.state_hash(), hash_before, "trace 不得改變狀態");
+        assert!(line.starts_with(&format!("{:04X}", nes.cpu.pc)));
+
+        let cycles_before = nes.cpu.bus().total_cycles();
+        let pc_before = nes.cpu.pc;
+        let spent = nes.step_instruction();
+        assert!(spent > 0);
+        assert_eq!(nes.cpu.bus().total_cycles(), cycles_before + spent as u64);
+        assert_ne!(nes.cpu.pc, pc_before);
+
+        assert_eq!(nes.peek(0x8000), 0xAA);
+        assert_eq!(nes.state_hash(), nes.state_hash());
     }
 }

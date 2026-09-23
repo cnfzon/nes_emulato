@@ -55,8 +55,8 @@ emu 執行緒與 UI 執行緒之間目前有 4 條獨立通道，方向、型別
 
 | 通道 | 型別 | 方向 | 用途 | 背壓策略 |
 |---|---|---|---|---|
-| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
-| 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`，低頻率、每則都要送達 | unbounded：頻率低（`FpsReport` 每秒 1 則），不會累積成問題 |
+| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`StepInstruction`／`StepFrame`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
+| 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`／`FrameAdvanced`／`TraceWritten`，每則都要送達 | unbounded：`FpsReport` 每秒 1 則、`FrameAdvanced` 每幀 1 則（UI 每次重繪都會 `try_iter()` 清空），不會累積成問題 |
 | 畫面 | `triple_buffer::Input/Output<FrameBuffer>` | Emu → UI | 每幀畫好的 `FrameBuffer` | `triple_buffer`：只在乎「最新一張」，UI 沒讀不會擋住 emu 寫入，也不會無限堆積 |
 | Debug 快照 | `triple_buffer::Input/Output<Option<DebugSnapshot>>` | Emu → UI | Debugger 面板顯示的 CPU/PPU/APU 狀態；`None` 代表「尚未收到任何快照」，跟真實模擬狀態（即使欄位剛好是 0）明確區分 | `triple_buffer`：同 FrameBuffer；另外用 `EmuCommand::SetDebugEnabled` 讓 emu 執行緒只在面板開啟時才產生快照，面板關閉時零成本 |
 
@@ -342,7 +342,7 @@ Phase 1 的目標是「CPU 正確性」——最終暫存器狀態、指令消�
    `crates/nes-core/src/cpu/singlestep.rs` 的模組文件）。實測結果：**官方
    opcode 256 萬分之 151 萬筆全數通過（100%）**；非官方 opcode 中，任務要求
    的那些（LAX/SAX/DCP/ISB/SLO/RLA/SRE/RRA/\*SBC/各種 NOP/JAM/ANC/ALR/ARR/
-   AXS）也全數 100% 通過，只有 8 個任務範圍外、真實硬體行為本身就不穩定
+   AXS）也全數通過（JAM 只比對暫存器/RAM，cycle 數的差異見 §10），只有 8 個任務範圍外、真實硬體行為本身就不穩定
    （analog/undefined，依賴個別晶片的類比殘留電荷，不是單純的邏輯 bug）的
    opcode（`$8B` `$93` `$9B` `$9C` `$9E` `$9F` `$AB` `$BB`）維持 NOP 占位，
    細節見 Phase 1 報告。
@@ -358,3 +358,55 @@ Phase 1 的目標是「CPU 正確性」——最終暫存器狀態、指令消�
 
 這個決定不影響 §7 的決定性規則：instruction-level 一樣是完全決定性的（同樣
 輸入序列永遠得到同樣結果），只是不模擬「指令執行到一半」這個中間狀態。
+
+## 10. SingleStepTests 回歸閘門與分類
+
+`cargo test --release -p nes-core --lib cpu::singlestep -- --ignored --nocapture`
+會把 256 個 opcode（各 10,000 筆，共 256 萬筆）依下表分類，**前三類任一類別
+未 100% 通過就讓測試失敗**。第四類只列出、不影響結果。
+
+| 類別 | opcode | 筆數 | 比對內容 | 閘門 |
+|---|---|---|---|---|
+| 官方 | 151 個官方 opcode | 1,510,000 | 暫存器 + RAM + **cycle 數** | 必須 100% |
+| 非官方（穩定） | 其餘非官方（LAX/SAX/DCP/ISB/SLO/RLA/SRE/RRA/`*SBC`/各種 NOP/ANC/ALR/ARR/AXS…） | 850,000 | 暫存器 + RAM + **cycle 數** | 必須 100% |
+| JAM | `02 12 22 32 42 52 62 72 92 B2 D2 F2`（12 個） | 120,000 | 暫存器 + RAM，**不比對 cycle 數** | 必須 100% |
+| 不穩定 | `8B 93 9B 9C 9E 9F AB BB`（8 個） | 80,000 | 全部（預期失敗） | 僅列出 |
+
+理由：
+
+- **JAM**：真實硬體執行 JAM 後 CPU 卡死。測試資料把「卡死」展開成 11 個 cycle
+  的匯流排活動；本核心是 instruction-level，用 `Cpu::jammed` 旗標表示卡死，
+  `step()` 回傳 2 cycle。「卡死後暫存器與 RAM 不再變動」是有意義且可驗證的
+  性質，所以必須相符；11 vs 2 的 cycle 差異是模型差異，不是 bug，測試會把
+  「暫存器/RAM 相符但 cycle 數不同」的案例數與範例單獨印出。
+- **不穩定的 8 個**：真實行為取決於匯流排殘留電容、DMA 時機、晶片批次等
+  類比因素，SingleStepTests 的期望值只是其中一種取樣。本專案維持 NOP 占位，
+  預期 0% 通過，不計入閘門；若日後有人實作而通過，也不會讓測試失敗。
+
+實測（本次）：官方 1,510,000/1,510,000、非官方穩定 850,000/850,000、JAM
+120,000/120,000（其中 120,000 筆 cycle 數為預期差異）、不穩定 0/80,000。
+
+## 11. Debugger API 與單步的決定性代價
+
+`Nes` 上的 `trace()`、`peek()`、`step_instruction()` 是 Debugger 的正式公開
+API，不在 `testing` feature 之後。`testing` 只剩純測試用途的 `override_pc`。
+
+- `trace()`、`peek()`：唯讀、無副作用（不觸發 PPU/APU 暫存器的讀取副作用），
+  任何時候都可以呼叫。
+- `step_instruction()`：**會打破「以幀為單位」的決定性**。`run_frame` 保證
+  每幀推進固定的 cycle 預算；單步讓 CPU 停在幀中間，之後的 `run_frame` 從
+  那個位置繼續，兩台機器只要有一台單步過，狀態就對不上。因此只能在暫停狀態
+  下使用，**netplay 進行中不得呼叫**。`nes-app` 的 emu 執行緒在
+  `StepInstruction`／`StepFrame`／`TraceToFile` 指令上檢查暫停旗標，未暫停時
+  回報 `EmuEvent::Error` 而不執行。
+
+### 狀態列幀數 vs. Debugger cycle 數的取樣落差
+
+原因：狀態列的幀數原本取自 `EmuEvent::FpsReport`，emu 執行緒每 1 秒才送一次
+（約每 60 幀一次），UI 顯示的幀數平均落後真實幀數約 30 幀（最多近 60 幀）；
+Debugger 快照卻是每幀更新，兩者就出現了約 35 幀的落差。
+
+修正：`FpsReport` 只帶 FPS；新增每幀一則的 `EmuEvent::FrameAdvanced(frame)`
+（單步、讀檔、載入 ROM 後也會送），並在 `DebugSnapshot` 加入 `frame_count`。
+Debugger 開著時，狀態列直接用同一份快照的 `frame_count`，因此與面板的 cycle
+數必然一致；面板關閉時用 `FrameAdvanced`。

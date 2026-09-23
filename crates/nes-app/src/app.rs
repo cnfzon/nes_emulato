@@ -22,11 +22,14 @@ pub struct NesApp {
     rom_info: Option<RomInfo>,
     show_debugger: bool,
     last_error: Option<String>,
+    last_info: Option<String>,
     fps: f64,
     frame_count: u64,
     last_input: Buttons,
     quit_requested: bool,
     paused: bool,
+    /// Debugger 面板「trace 到檔案」要記錄的指令數。
+    trace_count: u32,
 }
 
 impl NesApp {
@@ -47,11 +50,13 @@ impl NesApp {
             rom_info: None,
             show_debugger: false,
             last_error: None,
+            last_info: None,
             fps: 0.0,
             frame_count: 0,
             last_input: Buttons::empty(),
             quit_requested: false,
             paused: false,
+            trace_count: 1000,
         }
     }
 
@@ -71,11 +76,13 @@ impl NesApp {
                 EmuEvent::RomLoaded(info) => {
                     self.rom_info = Some(info);
                     self.last_error = None;
+                    self.last_info = None;
                 }
                 EmuEvent::Error(msg) => self.last_error = Some(msg),
-                EmuEvent::FpsReport { fps, frame } => {
-                    self.fps = fps;
-                    self.frame_count = frame;
+                EmuEvent::FpsReport { fps } => self.fps = fps,
+                EmuEvent::FrameAdvanced(frame) => self.frame_count = frame,
+                EmuEvent::TraceWritten { path, lines } => {
+                    self.last_info = Some(format!("已寫入 {lines} 行 trace 到 {}", path.display()));
                 }
             }
         }
@@ -121,6 +128,54 @@ impl NesApp {
         }
     }
 
+    /// 選檔案並要求 emu 執行緒把接下來 `trace_count` 條指令的 trace 寫進去。
+    fn trace_to_file_dialog(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("trace 文字檔", &["log", "txt"])
+            .set_file_name("trace.log")
+            .save_file()
+        {
+            let _ = self.cmd_tx.send(EmuCommand::TraceToFile {
+                count: self.trace_count,
+                path,
+            });
+        }
+    }
+
+    fn debugger_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let pause_label = if self.paused { "繼續" } else { "暫停" };
+            if ui.button(pause_label).clicked() {
+                self.toggle_pause();
+            }
+        });
+        // 單步與 trace 會讓 CPU 停在幀中間，只允許在暫停時使用。
+        ui.add_enabled_ui(self.paused, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("單步指令").clicked() {
+                    let _ = self.cmd_tx.send(EmuCommand::StepInstruction);
+                }
+                if ui.button("單步一幀").clicked() {
+                    let _ = self.cmd_tx.send(EmuCommand::StepFrame);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.trace_count)
+                        .range(1..=1_000_000)
+                        .speed(10),
+                );
+                ui.label("條指令");
+                if ui.button("Trace 到檔案…").clicked() {
+                    self.trace_to_file_dialog();
+                }
+            });
+        });
+        if !self.paused {
+            ui.weak("暫停後才能單步 / trace");
+        }
+    }
+
     fn ensure_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
         let fb = self.frame_output.read();
         let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -146,6 +201,14 @@ impl eframe::App for NesApp {
 
         self.drain_events();
         self.poll_keyboard_input(&ctx);
+
+        // Debugger 開著時，整個畫面只讀這一份快照：狀態列的幀數與面板的 cycle
+        // 數出自同一次快照，才會一致。
+        let snapshot: Option<DebugSnapshot> = if self.show_debugger {
+            self.debug_output.read().clone()
+        } else {
+            None
+        };
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -210,10 +273,17 @@ impl eframe::App for NesApp {
                 ui.separator();
                 ui.label(format!("FPS: {:.1}", self.fps));
                 ui.separator();
-                ui.label(format!("Frame: {}", self.frame_count));
+                let frame = snapshot
+                    .as_ref()
+                    .map_or(self.frame_count, |s| s.frame_count);
+                ui.label(format!("Frame: {frame}"));
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
+                }
+                if let Some(info) = &self.last_info {
+                    ui.separator();
+                    ui.label(info);
                 }
             });
         });
@@ -221,7 +291,9 @@ impl eframe::App for NesApp {
         if self.show_debugger {
             egui::Panel::right("debugger").show(ui, |ui| {
                 ui.heading("Debugger");
-                match self.debug_output.read() {
+                self.debugger_controls(ui);
+                ui.separator();
+                match &snapshot {
                     Some(snap) => {
                         ui.label(format!("PC: {:#06X}", snap.cpu_pc));
                         ui.label(format!(

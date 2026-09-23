@@ -18,7 +18,7 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 serde_json = "1.0.151"
 
 [features]
-# 只給測試/除錯工具（例如 nes-test）用的 Nes API（override_pc、
-# step_cpu_instruction、trace、peek），繞過一般的 run_frame 介面直接操作
-# CPU。一般遊戲邏輯（nes-app）不啟用這個 feature。
+# 純測試用途的旁路 API（目前只有 `Nes::override_pc`）。Debugger 用的
+# step_instruction / trace / peek 是正式公開 API，不在這個 feature 之後。
+# 一般遊戲邏輯（nes-app）不啟用；注意 Cargo 的 feature 統一機制，見 README。
 testing = []

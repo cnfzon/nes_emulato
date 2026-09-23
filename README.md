@@ -50,6 +50,22 @@ cargo run -p nes-app
 cargo run -p nes-test -- info path/to/rom.nes
 ```
 
+## 交付與效能量測
+
+交付或量測效能時，請用：
+
+```bash
+cargo build --release -p nes-app
+```
+
+而不是 `cargo build --release --workspace`。原因是 Cargo 的 feature 統一機制
+（feature unification）：`nes-test` 依賴 `nes-core` 時啟用了 `testing`
+feature，如果在同一次 cargo 呼叫中一起建置整個 workspace，`nes-core` 只會被
+編譯一次、而且是「所有人要求的 feature 的聯集」，`nes-app` 用到的 `nes-core`
+就會被帶進 `testing` feature（例如 `Nes::override_pc` 這類純測試用旁路 API），
+交付的執行檔因此跟只建置 `nes-app` 的結果不同。只指定 `-p nes-app` 時
+`nes-test` 不在這次建置內，`testing` 就不會被啟用。
+
 ## 注意事項
 
 - **不要把 `.nes` ROM 檔案放進這個 repository**：這是 public repo，ROM 檔案
