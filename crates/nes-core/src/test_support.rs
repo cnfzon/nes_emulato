@@ -35,6 +35,14 @@ impl Asm {
         self.emit(&[opcode, addr as u8, (addr >> 8) as u8])
     }
 
+    pub fn cmp_imm(&mut self, v: u8) -> &mut Self {
+        self.emit(&[0xC9, v])
+    }
+    /// `BEQ`，往前跳過接下來的 `skip` 個位元組。
+    pub fn beq_skip(&mut self, skip: u8) -> &mut Self {
+        self.emit(&[0xF0, skip])
+    }
+
     pub fn sei(&mut self) -> &mut Self {
         self.emit(&[0x78])
     }
@@ -163,6 +171,185 @@ pub fn build_nrom(
     rom.extend(prg);
     rom.extend(chr_rom);
     rom
+}
+
+/// `build_mapper_rom` 在每個 16KB PRG bank 偏移 `$0100` 放的標記：`PRG_MARK + bank 編號`
+/// （CPU 位址 `$8100` 或 `$C100` 讀得到目前對應到的是哪個 bank）。
+pub const PRG_MARK: u8 = 0xA0;
+/// `build_mapper_rom` 在每個 4KB CHR 區塊的第一個 byte 放的標記：`CHR_MARK + 4KB 編號`。
+pub const CHR_MARK: u8 = 0xC0;
+
+/// 組出 mapper 測試用 ROM：`prg_banks` 個 16KB PRG bank（每個有 [`PRG_MARK`] 標記）、
+/// `chr_banks_8k` 個 8KB CHR-ROM bank（每個 4KB 有 [`CHR_MARK`] 標記；0 代表 CHR-RAM）。
+///
+/// - `code` 必須落在 `$C000..$FFFA`（最後一個 bank；UxROM / MMC1 模式 3 / CNROM 下
+///   都固定可見），RESET / NMI / IRQ 向量都指向 `code` 的起點。
+/// - `data`：額外資料，位址 `< $C000` 放進 bank 0、否則放進最後一個 bank。
+pub fn build_mapper_rom(
+    mapper: u8,
+    prg_banks: usize,
+    chr_banks_8k: usize,
+    code: &Asm,
+    data: &[DataBlock],
+) -> Vec<u8> {
+    assert!(code.org >= 0xC000, "code 必須放在最後一個 bank");
+    let mut prg = vec![0u8; prg_banks * PRG_BANK_SIZE];
+    for bank in 0..prg_banks {
+        prg[bank * PRG_BANK_SIZE + 0x100] = PRG_MARK + bank as u8;
+    }
+    let last = (prg_banks - 1) * PRG_BANK_SIZE;
+    let put = |prg: &mut Vec<u8>, addr: u16, bytes: &[u8]| {
+        let base = if addr < 0xC000 { 0 } else { last };
+        let start = base + (addr as usize & 0x3FFF);
+        prg[start..start + bytes.len()].copy_from_slice(bytes);
+    };
+    put(&mut prg, code.org, &code.bytes);
+    for (addr, bytes) in data {
+        put(&mut prg, *addr, bytes);
+    }
+    let entry = code.org;
+    for vector in [0xFFFAu16, 0xFFFC, 0xFFFE] {
+        put(&mut prg, vector, &[entry as u8, (entry >> 8) as u8]);
+    }
+
+    let mut chr = vec![0u8; chr_banks_8k * CHR_BANK_SIZE];
+    for block in 0..chr_banks_8k * 2 {
+        chr[block * 0x1000] = CHR_MARK + block as u8;
+    }
+
+    let mut rom = vec![0u8; 16];
+    rom[0..4].copy_from_slice(b"NES\x1A");
+    rom[4] = prg_banks as u8;
+    rom[5] = chr_banks_8k as u8;
+    rom[6] = mapper << 4;
+    rom[7] = mapper & 0xF0;
+    rom.extend(prg);
+    rom.extend(chr);
+    rom
+}
+
+// ---- mapper 合成測試 ROM（blargg `$6000` 協定）----------------------------------
+
+/// 失敗／通過處理常式的位址（都在最後一個 bank，永遠可見）。
+const REPORT_FAIL: u16 = 0xF000;
+const REPORT_PASS: u16 = 0xF100;
+
+fn store_text(a: &mut Asm, text: &[u8]) {
+    for (i, byte) in text.iter().enumerate() {
+        a.lda_imm(*byte).sta_abs(0x6004 + i as u16);
+    }
+}
+
+/// 測試程式的骨架：先寫「執行中」狀態與簽章 `DE B0 61`，`check` 逐項加入檢查，
+/// 全部通過就跳到 PASS。每項檢查失敗時以「第幾項」（1 起算）當結果碼。
+struct Checker {
+    asm: Asm,
+    count: u8,
+}
+
+impl Checker {
+    fn new() -> Self {
+        let mut asm = Asm::new(0xE000);
+        asm.sei().cld().ldx_imm(0xFF).txs();
+        asm.lda_imm(0x80).sta_abs(0x6000);
+        for (i, b) in [0xDE, 0xB0, 0x61].into_iter().enumerate() {
+            asm.lda_imm(b).sta_abs(0x6001 + i as u16);
+        }
+        Self { asm, count: 0 }
+    }
+
+    /// 比對累加器；不符就以目前的項目編號失敗。呼叫前累加器必須已載入要檢查的值。
+    fn expect(&mut self, expected: u8) {
+        self.count += 1;
+        self.asm.cmp_imm(expected).beq_skip(8);
+        // 失敗樁（8 bytes）：結果碼存進 $00，跳去共用的失敗處理。
+        self.asm
+            .lda_imm(self.count)
+            .sta_abs(0x0000)
+            .jmp(REPORT_FAIL);
+    }
+
+    fn finish(mut self, mapper: u8, prg_banks: usize, chr_banks_8k: usize, name: &str) -> Vec<u8> {
+        self.asm.jmp(REPORT_PASS);
+
+        let mut fail = Asm::new(REPORT_FAIL);
+        store_text(&mut fail, format!("{name}: Failed\0").as_bytes());
+        fail.lda_abs(0x0000).sta_abs(0x6000);
+        let forever = fail.pc();
+        fail.jmp(forever);
+
+        let mut pass = Asm::new(REPORT_PASS);
+        store_text(&mut pass, format!("{name}: Passed\0").as_bytes());
+        pass.lda_imm(0x00).sta_abs(0x6000);
+        let forever = pass.pc();
+        pass.jmp(forever);
+
+        build_mapper_rom(
+            mapper,
+            prg_banks,
+            chr_banks_8k,
+            &self.asm,
+            &[(REPORT_FAIL, &fail.bytes), (REPORT_PASS, &pass.bytes)],
+        )
+    }
+}
+
+/// UxROM（mapper 2）測試 ROM：8 個 16KB PRG bank。依序切換每個 bank，讀 `$8100` 的
+/// 識別碼（[`PRG_MARK`] + bank 編號）比對；每次切換後也確認 `$C000-$FFFF` 仍是最後
+/// 一個 bank（`$C100` 的識別碼，以及正在執行的程式碼本身 `$E000` 的第一個 byte）。
+/// 結果用 blargg 的 `$6000` 協定回報。
+pub fn uxrom_test_rom() -> Vec<u8> {
+    const BANKS: usize = 8;
+    let mut c = Checker::new();
+    for bank in (0..BANKS).chain((0..BANKS).rev()) {
+        c.asm.lda_imm(bank as u8).sta_abs(0x8000);
+        c.asm.lda_abs(0x8100);
+        c.expect(PRG_MARK + bank as u8);
+        c.asm.lda_abs(0xC100);
+        c.expect(PRG_MARK + BANKS as u8 - 1);
+        c.asm.lda_abs(0xE000);
+        c.expect(0x78); // 程式自己的第一個 byte（SEI）
+    }
+    c.finish(2, BANKS, 0, "UxROM")
+}
+
+/// CNROM（mapper 3）測試 ROM：4 個 8KB CHR bank。依序切換每個 bank，經 `$2006/$2007`
+/// 讀 pattern table `$0000` 與 `$1000` 的識別碼（[`CHR_MARK`] + 4KB 區塊編號）比對。
+/// `$2007` 讀取有一個 byte 的緩衝，所以設好位址後先讀一次丟掉，第二次才是資料。
+/// 同時確認 PRG 固定（`$8100`／`$C100` 不隨切換改變）。
+pub fn cnrom_test_rom() -> Vec<u8> {
+    const CHR_BANKS: usize = 4;
+    let mut c = Checker::new();
+    for bank in (0..CHR_BANKS).chain((0..CHR_BANKS).rev()) {
+        c.asm.lda_imm(bank as u8).sta_abs(0x8000);
+        for half in 0..2u16 {
+            c.asm.set_ppu_addr(half * 0x1000);
+            c.asm.lda_abs(0x2007); // 緩衝的舊值，丟掉
+            c.asm.lda_abs(0x2007);
+            c.expect(CHR_MARK + (bank as u16 * 2 + half) as u8);
+        }
+        c.asm.lda_abs(0x8100);
+        c.expect(PRG_MARK);
+        c.asm.lda_abs(0xC100);
+        c.expect(PRG_MARK + 1);
+    }
+    c.finish(3, 2, CHR_BANKS, "CNROM")
+}
+
+/// 會不斷執行「碰到 `$2007` 的索引定址」的合成 ROM（給行為指紋用）：X = `$0F` 時
+/// `STA $2000,X`（store：一律 dummy read）與 `LDA $20F8,X`（跨頁的讀取：dummy read
+/// `$2007`）都會讓 PPU 位址多前進一次；`INC $2005` 是對 PPU 暫存器的 RMW（寫兩次）。
+pub fn dummy_read_probe_rom() -> Vec<u8> {
+    let mut a = Asm::new(0x8000);
+    a.sei().cld().ldx_imm(0xFF).txs();
+    a.set_ppu_addr(0x2000).ldx_imm(0x0F).lda_imm(0x55);
+    let l = a.pc();
+    a.sta_abs_x(0x2000)
+        .lda_abs_x(0x20F8)
+        .inc_abs(0x2005)
+        .inc_abs(0x0000)
+        .jmp(l);
+    build_nrom(&a, 0x8000, None, &[], &test_chr(), false)
 }
 
 /// 一個 8×8 tile 的 CHR 資料：`plane0`/`plane1` 各 8 byte。

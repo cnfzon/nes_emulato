@@ -356,12 +356,15 @@ impl Ppu {
 
     // ---- PPU 位址空間 --------------------------------------------------
 
-    /// nametable 位址（`$2000-$3EFF`）換成 2KB VRAM 內的偏移，依卡帶的 mirroring。
+    /// nametable 位址（`$2000-$3EFF`）換成 2KB VRAM 內的偏移，依卡帶**目前**的
+    /// mirroring（MMC1 會在執行期改變，所以每次存取都要重新查）。
     fn nametable_offset(addr: u16, mirroring: Mirroring) -> usize {
         let index = (addr.wrapping_sub(0x2000) & 0x0FFF) as usize;
         let table = index / 0x400;
         let within = index % 0x400;
         let physical = match mirroring {
+            Mirroring::SingleScreenLower => 0,
+            Mirroring::SingleScreenUpper => 1,
             Mirroring::Horizontal => table >> 1,
             // FourScreen 由 `Nes::from_rom` 拒絕；這裡不 panic，退回 vertical。
             Mirroring::Vertical | Mirroring::FourScreen => table & 1,
@@ -393,7 +396,7 @@ impl Ppu {
         let addr = addr & 0x3FFF;
         match addr {
             0x0000..=0x1FFF => cart.read_chr(addr),
-            0x2000..=0x3EFF => self.vram[Self::nametable_offset(addr, cart.info.mirroring)],
+            0x2000..=0x3EFF => self.vram[Self::nametable_offset(addr, cart.mirroring())],
             _ => self.read_palette(addr),
         }
     }
@@ -403,7 +406,7 @@ impl Ppu {
         match addr {
             0x0000..=0x1FFF => cart.write_chr(addr, value),
             0x2000..=0x3EFF => {
-                let offset = Self::nametable_offset(addr, cart.info.mirroring);
+                let offset = Self::nametable_offset(addr, cart.mirroring());
                 self.vram[offset] = value;
             }
             _ => self.palette[Self::palette_index(addr)] = value & 0x3F,

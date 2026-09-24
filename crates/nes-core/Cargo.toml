@@ -32,3 +32,7 @@ required-features = ["testing"]
 [[example]]
 name = "write_rendering_rom"
 required-features = ["testing"]
+
+[[example]]
+name = "write_mapper_test_roms"
+required-features = ["testing"]

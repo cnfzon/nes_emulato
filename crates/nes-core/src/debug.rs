@@ -45,6 +45,12 @@ pub struct DebugSnapshot {
     pub oam: Vec<u8>,
 
     pub apu_frame_counter: u8,
+
+    /// iNES mapper 編號與名稱（例如 1 / "MMC1"）。
+    pub mapper_id: u8,
+    pub mapper_name: String,
+    /// mapper 的 bank 暫存器與它們目前造成的實際對應，`(名稱, 內容)` 列，照顯示順序。
+    pub mapper_regs: Vec<(String, String)>,
 }
 
 /// 一張 RGBA8 影像（Debugger 顯示用）。

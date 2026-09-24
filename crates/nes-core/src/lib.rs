@@ -30,6 +30,7 @@ pub use debug::{DebugSnapshot, PpuImage, PpuViews};
 pub use error::{RomError, StateError};
 pub use frame::FrameBuffer;
 pub use joypad::{Buttons, Joypad};
+pub use state::{CORE_BEHAVIOR_VERSION, STATE_FORMAT_VERSION, STATE_MAGIC, StateHeader};
 
 /// 一台完整的 NES 主機。
 ///
@@ -173,6 +174,12 @@ impl Nes {
         if bus.cartridge.prg_ram.len() != cartridge::PRG_RAM_SIZE {
             return Err(StateError::Corrupt);
         }
+        // mapper 的種類必須與 header 一致、暫存器必須在硬體範圍內。
+        if bus.cartridge.mapper.id() != bus.cartridge.info.mapper_id
+            || !bus.cartridge.mapper.is_structurally_valid()
+        {
+            return Err(StateError::Corrupt);
+        }
 
         Ok(())
     }
@@ -210,6 +217,9 @@ impl Nes {
             palette_ram: bus.ppu.palette,
             oam: bus.ppu.oam.clone(),
             apu_frame_counter: bus.apu.frame_counter,
+            mapper_id: bus.cartridge.mapper.id(),
+            mapper_name: bus.cartridge.mapper.name().to_string(),
+            mapper_regs: bus.cartridge.mapper_debug_rows(),
         }
     }
 
@@ -900,5 +910,448 @@ mod tests {
         for y in [41, 42, 100, 120] {
             assert_eq!(px(4, y), color1, "第 {y} 條線應該用捲動 8");
         }
+    }
+
+    // ---- Phase 3：存檔版本、mapper、行為指紋 -------------------------------------
+
+    use crate::state::{CORE_BEHAVIOR_VERSION, HEADER_LEN, STATE_FORMAT_VERSION, STATE_MAGIC};
+    use crate::test_support::{CHR_MARK, PRG_MARK, build_mapper_rom};
+
+    /// 一份什麼都不做的 mapper 測試 ROM（程式碼只有一個無窮迴圈）。
+    fn idle_mapper_rom(mapper: u8, prg_banks: usize, chr_banks_8k: usize) -> Vec<u8> {
+        let mut code = Asm::new(0xE000);
+        let forever = code.pc();
+        code.jmp(forever);
+        build_mapper_rom(mapper, prg_banks, chr_banks_8k, &code, &[])
+    }
+
+    /// 經 CPU 匯流排送 5 次寫入，把 `value` 的低 5 bit（bit 0 先）寫進 MMC1 的暫存器。
+    fn mmc1_write(nes: &mut Nes, addr: u16, value: u8) {
+        for i in 0..5 {
+            nes.cpu.bus_mut().write(addr, (value >> i) & 1);
+        }
+    }
+
+    fn mapper_row(nes: &Nes, key: &str) -> String {
+        nes.debug_snapshot()
+            .mapper_regs
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .unwrap_or_else(|| panic!("找不到 mapper 資訊列 {key}"))
+            .1
+    }
+
+    #[test]
+    fn save_state_starts_with_magic_and_both_version_numbers() {
+        let bytes = Nes::from_rom(&test_rom()).unwrap().save_state();
+        assert!(bytes.len() > HEADER_LEN);
+        assert_eq!(bytes[0..4], STATE_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            STATE_FORMAT_VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            CORE_BEHAVIOR_VERSION
+        );
+    }
+
+    /// 竄改 header 的某個位置後讀檔，必須被 `VersionMismatch` 拒絕；且 `expected`
+    /// 是目前版本、`found` 是被竄改後的內容。
+    fn assert_header_tamper_rejected(tamper: impl Fn(&mut Vec<u8>)) -> StateError {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        let mut bytes = nes.save_state();
+        tamper(&mut bytes);
+        let before = nes.state_hash();
+        let err = nes
+            .load_state(&bytes)
+            .expect_err("竄改過的 header 必須被拒絕");
+        assert_eq!(nes.state_hash(), before, "被拒絕的讀檔不得改動狀態");
+        err
+    }
+
+    #[test]
+    fn load_state_rejects_tampered_magic() {
+        let err = assert_header_tamper_rejected(|b| b[0] ^= 0xFF);
+        let StateError::VersionMismatch { expected, found } = err else {
+            panic!("應為 VersionMismatch，實際 {err:?}");
+        };
+        assert_eq!(expected, crate::StateHeader::CURRENT);
+        assert_ne!(found.magic, STATE_MAGIC);
+        assert_eq!(found.format_version, STATE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn load_state_rejects_tampered_format_version() {
+        let err = assert_header_tamper_rejected(|b| {
+            let v = STATE_FORMAT_VERSION + 1;
+            b[4..6].copy_from_slice(&v.to_le_bytes());
+        });
+        let StateError::VersionMismatch { expected, found } = err else {
+            panic!("應為 VersionMismatch，實際 {err:?}");
+        };
+        assert_eq!(expected.format_version, STATE_FORMAT_VERSION);
+        assert_eq!(found.format_version, STATE_FORMAT_VERSION + 1);
+        assert_eq!(found.core_version, CORE_BEHAVIOR_VERSION);
+    }
+
+    #[test]
+    fn load_state_rejects_tampered_core_behavior_version() {
+        let err = assert_header_tamper_rejected(|b| {
+            let v = CORE_BEHAVIOR_VERSION + 1;
+            b[6..8].copy_from_slice(&v.to_le_bytes());
+        });
+        let StateError::VersionMismatch { expected, found } = err else {
+            panic!("應為 VersionMismatch，實際 {err:?}");
+        };
+        assert_eq!(expected.core_version, CORE_BEHAVIOR_VERSION);
+        assert_eq!(found.core_version, CORE_BEHAVIOR_VERSION + 1);
+        assert_eq!(found.format_version, STATE_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn load_state_rejects_input_shorter_than_the_header() {
+        let mut nes = Nes::from_rom(&test_rom()).unwrap();
+        assert!(matches!(nes.load_state(b"NES"), Err(StateError::Decode(_))));
+        assert!(matches!(nes.load_state(&[]), Err(StateError::Decode(_))));
+    }
+
+    /// 行為指紋：把 `CORE_BEHAVIOR_VERSION` 與「合成 ROM 在固定輸入下的狀態雜湊」綁在一起。
+    /// 這個測試失敗代表模擬結果（狀態或存檔格式）變了：確認變動是預期的之後，
+    /// **必須同時**遞增 `CORE_BEHAVIOR_VERSION`（或 `STATE_FORMAT_VERSION`）並更新這裡的
+    /// 兩個常數。判定規則見 `docs/architecture.md` §15。
+    #[test]
+    fn behavior_fingerprint_is_pinned_to_the_version_numbers() {
+        const PINNED_CORE_BEHAVIOR_VERSION: u16 = 2;
+        const PINNED_STATE_FORMAT_VERSION: u16 = 1;
+        const FINGERPRINT_NROM: u64 = 0x1c686ba19318685f;
+        const FINGERPRINT_MMC1: u64 = 0xd38a4123209ca9ca;
+        const FINGERPRINT_DUMMY_READ: u64 = 0xf15c811d05950484;
+
+        let mut nrom = Nes::from_rom(&rendering_rom()).unwrap();
+        for input in inputs_for(60) {
+            nrom.run_frame(input);
+        }
+        let mut mmc1 = Nes::from_rom(&mmc1_churn_rom()).unwrap();
+        for input in inputs_for(60) {
+            mmc1.run_frame(input);
+        }
+        let mut probe = Nes::from_rom(&crate::test_support::dummy_read_probe_rom()).unwrap();
+        for input in inputs_for(60) {
+            probe.run_frame(input);
+        }
+        let actual = (
+            CORE_BEHAVIOR_VERSION,
+            STATE_FORMAT_VERSION,
+            nrom.state_hash(),
+            mmc1.state_hash(),
+            probe.state_hash(),
+        );
+        assert_eq!(
+            actual,
+            (
+                PINNED_CORE_BEHAVIOR_VERSION,
+                PINNED_STATE_FORMAT_VERSION,
+                FINGERPRINT_NROM,
+                FINGERPRINT_MMC1,
+                FINGERPRINT_DUMMY_READ
+            ),
+            "模擬行為改變：請確認是預期的，遞增版本號並更新指紋（見測試文件）"
+        );
+    }
+
+    /// 一個會不斷改寫 mapper 暫存器的 MMC1 程式：無窮迴圈 `INC $00; LDA $00; STA $E000`，
+    /// 讓 5 次寫入一輪地載入 PRG bank 暫存器，bank 值隨計數器變化。
+    fn mmc1_churn_rom() -> Vec<u8> {
+        let mut code = Asm::new(0xE000);
+        let l = code.pc();
+        code.inc_abs(0x0000).lda_abs(0x0000).sta_abs(0xE000).jmp(l);
+        build_mapper_rom(1, 8, 2, &code, &[])
+    }
+
+    #[test]
+    fn mmc1_prg_bank_switching_through_the_bus() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(1, 8, 2)).unwrap();
+        // 開機：模式 3，$8000 = bank 0、$C000 = 最後一個 bank。
+        assert_eq!(nes.peek(0x8100), PRG_MARK);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 7);
+
+        mmc1_write(&mut nes, 0xE000, 3);
+        assert_eq!(nes.peek(0x8100), PRG_MARK + 3);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 7, "$C000 固定最後一個 bank");
+
+        // 模式 2：$8000 固定第一個、$C000 切換。
+        mmc1_write(&mut nes, 0x8000, 0b01010);
+        mmc1_write(&mut nes, 0xE000, 5);
+        assert_eq!(nes.peek(0x8100), PRG_MARK);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 5);
+
+        // 模式 0：32KB，bank 5 → 4、5。
+        mmc1_write(&mut nes, 0x8000, 0b00010);
+        assert_eq!(nes.peek(0x8100), PRG_MARK + 4);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 5);
+    }
+
+    #[test]
+    fn mmc1_chr_bank_switching_is_visible_to_the_ppu() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(1, 2, 2)).unwrap(); // 4 個 4KB CHR
+        // 4KB 模式：兩個獨立的 4KB。
+        mmc1_write(&mut nes, 0x8000, 0b11110);
+        mmc1_write(&mut nes, 0xA000, 3);
+        mmc1_write(&mut nes, 0xC000, 1);
+        assert_eq!(nes.peek_ppu(0x0000), CHR_MARK + 3);
+        assert_eq!(nes.peek_ppu(0x1000), CHR_MARK + 1);
+        // 8KB 模式：CHR bank 0 = 3 → 忽略最低位 → 4KB bank 2、3。
+        mmc1_write(&mut nes, 0x8000, 0b01110);
+        assert_eq!(nes.peek_ppu(0x0000), CHR_MARK + 2);
+        assert_eq!(nes.peek_ppu(0x1000), CHR_MARK + 3);
+    }
+
+    /// PPU 每次存取 nametable 都要查 mapper「目前」的 mirroring：同一份 VRAM 內容，
+    /// 隨 MMC1 control 改變而讀到不同的邏輯配置。
+    #[test]
+    fn mmc1_mirroring_is_looked_up_on_every_nametable_access() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(1, 2, 1)).unwrap();
+        let ppu_write = |nes: &mut Nes, addr: u16, value: u8| {
+            let bus = nes.cpu.bus_mut();
+            bus.write(0x2006, (addr >> 8) as u8);
+            bus.write(0x2006, addr as u8);
+            bus.write(0x2007, value);
+        };
+        let tables = |nes: &Nes| [0x2000u16, 0x2400, 0x2800, 0x2C00].map(|a| nes.peek_ppu(a));
+
+        // 先在 vertical（control mirroring = 2）下寫兩張不同的實體 nametable。
+        mmc1_write(&mut nes, 0x8000, 0b01110);
+        ppu_write(&mut nes, 0x2000, 0x11);
+        ppu_write(&mut nes, 0x2400, 0x22);
+        assert_eq!(tables(&nes), [0x11, 0x22, 0x11, 0x22], "vertical");
+
+        mmc1_write(&mut nes, 0x8000, 0b01111); // horizontal
+        assert_eq!(tables(&nes), [0x11, 0x11, 0x22, 0x22], "horizontal");
+
+        mmc1_write(&mut nes, 0x8000, 0b01100); // 單畫面 A
+        assert_eq!(tables(&nes), [0x11; 4], "single screen A");
+
+        mmc1_write(&mut nes, 0x8000, 0b01101); // 單畫面 B
+        assert_eq!(tables(&nes), [0x22; 4], "single screen B");
+
+        // 單畫面下經 PPU 寫入，落在被選到的那張實體 nametable。
+        ppu_write(&mut nes, 0x2C05, 0x77);
+        mmc1_write(&mut nes, 0x8000, 0b01110);
+        assert_eq!(nes.peek_ppu(0x2405), 0x77);
+        assert_eq!(nes.debug_snapshot().mapper_id, 1);
+    }
+
+    #[test]
+    fn mmc1_prg_ram_disable_hides_it_from_reads_and_writes() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(1, 2, 1)).unwrap();
+        nes.cpu.bus_mut().write(0x6000, 0x55);
+        assert_eq!(nes.peek(0x6000), 0x55);
+
+        mmc1_write(&mut nes, 0xE000, 0x10); // PRG-RAM 停用
+        nes.cpu.bus_mut().write(0x6000, 0x99); // 被忽略
+        let open_bus = nes.cpu.bus_mut().read(0x6000);
+        assert_ne!(open_bus, 0x55, "停用時讀到 open bus，不是 RAM 內容");
+
+        mmc1_write(&mut nes, 0xE000, 0x00); // 重新啟用：內容還在、停用期間的寫入沒有生效
+        assert_eq!(nes.peek(0x6000), 0x55);
+    }
+
+    /// 讀-改-寫指令對 MMC1 只有「舊值」那次寫入生效：`INC $9000`（ROM 該處是 `$00`）
+    /// 先寫 `$00`（進入移位暫存器）、下一個 cycle 才寫 `$01`（被忽略），所以只收到 1 個 bit。
+    #[test]
+    fn mmc1_rmw_instruction_counts_as_a_single_serial_write() {
+        let mut code = Asm::new(0xE000);
+        code.inc_abs(0x9000);
+        let forever = code.pc();
+        code.jmp(forever);
+        let rom = build_mapper_rom(1, 2, 1, &code, &[(0x9000, &[0x00])]);
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        assert_eq!(nes.peek(0x9000), 0x00);
+
+        nes.step_instruction(); // INC $9000
+        assert!(
+            mapper_row(&nes, "移位暫存器").contains("已寫入 1 / 5"),
+            "RMW 的兩次相鄰寫入只算一次：{}",
+            mapper_row(&nes, "移位暫存器")
+        );
+
+        // 對照：兩條獨立的 STA（相隔 ≥ 2 個 cycle）各算一次。
+        let mut code = Asm::new(0xE000);
+        code.lda_imm(0).sta_abs(0x9000).sta_abs(0x9000);
+        let forever = code.pc();
+        code.jmp(forever);
+        let rom = build_mapper_rom(1, 2, 1, &code, &[]);
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        for _ in 0..3 {
+            nes.step_instruction();
+        }
+        assert!(mapper_row(&nes, "移位暫存器").contains("已寫入 2 / 5"));
+    }
+
+    #[test]
+    fn uxrom_switches_8000_and_fixes_c000_through_the_bus() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(2, 8, 0)).unwrap(); // CHR-RAM
+        assert_eq!(nes.peek(0x8100), PRG_MARK);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 7);
+        nes.cpu.bus_mut().write(0x8000, 4);
+        assert_eq!(nes.peek(0x8100), PRG_MARK + 4);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 7);
+        assert_eq!(mapper_row(&nes, "PRG $8000-$BFFF"), "bank 4");
+        // UxROM 的 CHR-RAM 可寫。
+        let bus = nes.cpu.bus_mut();
+        bus.write(0x2006, 0x00);
+        bus.write(0x2006, 0x10);
+        bus.write(0x2007, 0x5A);
+        assert_eq!(nes.peek_ppu(0x0010), 0x5A);
+    }
+
+    #[test]
+    fn cnrom_switches_chr_and_keeps_prg_fixed_through_the_bus() {
+        let mut nes = Nes::from_rom(&idle_mapper_rom(3, 2, 4)).unwrap(); // 4 個 8KB CHR
+        assert_eq!(nes.peek_ppu(0x0000), CHR_MARK);
+        nes.cpu.bus_mut().write(0x8000, 2);
+        assert_eq!(
+            nes.peek_ppu(0x0000),
+            CHR_MARK + 4,
+            "8KB bank 2 = 4KB 區塊 4"
+        );
+        assert_eq!(nes.peek_ppu(0x1000), CHR_MARK + 5);
+        assert_eq!(nes.peek(0x8100), PRG_MARK);
+        assert_eq!(nes.peek(0xC100), PRG_MARK + 1);
+    }
+
+    #[test]
+    fn mapper_state_survives_save_and_load_including_a_half_finished_serial_write() {
+        let rom = idle_mapper_rom(1, 8, 2);
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        mmc1_write(&mut nes, 0xE000, 5);
+        for bit in [1, 0, 1] {
+            nes.cpu.bus_mut().write(0x8000, bit); // 序列寫入進行到一半
+        }
+        let saved = nes.save_state();
+        let hash = nes.state_hash();
+
+        mmc1_write(&mut nes, 0xE000, 2);
+        assert_ne!(nes.state_hash(), hash);
+        nes.load_state(&saved).unwrap();
+
+        assert_eq!(nes.state_hash(), hash);
+        assert_eq!(nes.peek(0x8100), PRG_MARK + 5);
+        assert!(mapper_row(&nes, "移位暫存器").contains("已寫入 3 / 5"));
+    }
+
+    #[test]
+    fn load_state_rejects_a_mapper_that_disagrees_with_the_header() {
+        let rom = idle_mapper_rom(1, 2, 1);
+        let mut tampered = Nes::from_rom(&rom).unwrap();
+        tampered.cpu.bus_mut().cartridge.mapper = Mapper::Uxrom(crate::cartridge::Uxrom::new());
+        let bytes = tampered.save_state();
+
+        let mut target = Nes::from_rom(&rom).unwrap();
+        assert!(matches!(
+            target.load_state(&bytes),
+            Err(StateError::Corrupt)
+        ));
+    }
+
+    /// rollback 性質在 MMC1 上同樣成立：mapper 暫存器（含移位暫存器）一直在變的
+    /// 程式，存檔、往前跑、讀檔、重跑，結果與不中斷相同。
+    #[test]
+    fn rollback_replay_matches_uninterrupted_run_with_an_active_mmc1() {
+        let rom = mmc1_churn_rom();
+        let inputs = inputs_for(40);
+
+        let mut baseline = Nes::from_rom(&rom).unwrap();
+        for input in &inputs {
+            baseline.run_frame(*input);
+        }
+
+        let mut replay = Nes::from_rom(&rom).unwrap();
+        for input in &inputs[..15] {
+            replay.run_frame(*input);
+        }
+        let checkpoint = replay.save_state();
+        for input in &inputs[15..30] {
+            replay.run_frame(*input);
+        }
+        replay.load_state(&checkpoint).unwrap();
+        for input in &inputs[15..] {
+            replay.run_frame(*input);
+        }
+        assert_eq!(replay.state_hash(), baseline.state_hash());
+    }
+
+    /// 隨機垃圾 ROM 在 mapper 1/2/3 下也不得 panic（暫存器被亂寫、bank 超出範圍）。
+    #[test]
+    fn random_garbage_roms_never_panic_on_mappers_1_2_3() {
+        fn xorshift(state: &mut u64) -> u8 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 24) as u8
+        }
+        for seed in 1..=18u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mapper = 1 + (seed % 3) as u8;
+            let prg_banks = 1 + (seed % 5) as u8; // 含奇數 bank 數
+            let chr_banks = (seed % 4) as u8; // 0 = CHR-RAM
+            let mut rom = vec![0u8; 16];
+            rom[0..4].copy_from_slice(b"NES\x1A");
+            rom[4] = prg_banks;
+            rom[5] = chr_banks;
+            rom[6] = mapper << 4;
+            for _ in 0..(prg_banks as usize * 0x4000 + chr_banks as usize * 0x2000) {
+                rom.push(xorshift(&mut state));
+            }
+            let mut nes = Nes::from_rom(&rom).unwrap();
+            for frame in 0..4 {
+                let pad = xorshift(&mut state);
+                nes.run_frame([Buttons::from_bits_truncate(pad), Buttons::empty()]);
+                let _ = nes.debug_snapshot();
+                if frame == 2 {
+                    let _ = nes.debug_ppu_views(pad);
+                    let saved = nes.save_state();
+                    nes.load_state(&saved).unwrap();
+                }
+            }
+        }
+    }
+
+    // ---- 合成 mapper 測試 ROM（blargg `$6000` 協定）--------------------------------
+
+    /// 跑到 `$6000` 不再是「執行中」（`$80`）為止，回傳 `(結果碼, 結果文字)`。
+    /// 簽章 `DE B0 61` 必須存在，否則視為 ROM 根本沒跑起來。
+    fn run_blargg_rom(rom: &[u8]) -> (u8, String) {
+        let mut nes = Nes::from_rom(rom).unwrap();
+        for _ in 0..30 {
+            nes.run_frame([Buttons::empty(); 2]);
+            if nes.peek(0x6001) == 0xDE && nes.peek(0x6000) != 0x80 {
+                break;
+            }
+        }
+        assert_eq!(
+            [nes.peek(0x6001), nes.peek(0x6002), nes.peek(0x6003)],
+            [0xDE, 0xB0, 0x61],
+            "缺少 blargg 簽章"
+        );
+        let text: String = (0x6004u16..)
+            .map(|a| nes.peek(a))
+            .take_while(|&b| b != 0)
+            .map(char::from)
+            .collect();
+        (nes.peek(0x6000), text)
+    }
+
+    #[test]
+    fn uxrom_synthetic_rom_passes_the_blargg_protocol() {
+        let (code, text) = run_blargg_rom(&crate::test_support::uxrom_test_rom());
+        assert_eq!((code, text.as_str()), (0, "UxROM: Passed"));
+    }
+
+    #[test]
+    fn cnrom_synthetic_rom_passes_the_blargg_protocol() {
+        let (code, text) = run_blargg_rom(&crate::test_support::cnrom_test_rom());
+        assert_eq!((code, text.as_str()), (0, "CNROM: Passed"));
     }
 }

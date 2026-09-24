@@ -11,6 +11,9 @@ use nes_core::{Buttons, DebugSnapshot, PpuViews, RomInfo};
 
 use crate::commands::{EmuCommand, EmuEvent};
 use crate::debugger::DebuggerUi;
+use crate::input::{
+    HOTKEY_LOAD_STATE, HOTKEY_SAVE_STATE, PLAYER1_KEYS, PLAYER2_KEYS, buttons_from_keys,
+};
 
 pub struct NesApp {
     cmd_tx: Sender<EmuCommand>,
@@ -27,7 +30,8 @@ pub struct NesApp {
     last_info: Option<String>,
     fps: f64,
     frame_count: u64,
-    last_input: Buttons,
+    /// 兩位玩家最近一次送給 emu 執行緒的按鈕狀態。
+    last_input: [Buttons; 2],
     quit_requested: bool,
     paused: bool,
     /// Debugger 面板「trace 到檔案」要記錄的指令數。
@@ -57,7 +61,7 @@ impl NesApp {
             last_info: None,
             fps: 0.0,
             frame_count: 0,
-            last_input: Buttons::empty(),
+            last_input: [Buttons::empty(); 2],
             quit_requested: false,
             paused: false,
             trace_count: 1000,
@@ -92,27 +96,20 @@ impl NesApp {
         }
     }
 
-    /// 讀鍵盤狀態，組成玩家 1 的按鍵狀態並送給 emu 執行緒（只在改變時送出，
+    /// 讀鍵盤狀態，組成兩位玩家的按鈕狀態並送給 emu 執行緒（各自只在改變時送出，
     /// 避免每幀塞爆 channel）。
     ///
-    /// 對應：方向鍵、Z=B、X=A、Enter=Start、Right Shift=Select。
+    /// 對應表與理由見 `input.rs`：玩家 1＝方向鍵、Z=B、X=A、Enter=Start、右 Shift=Select；
+    /// 玩家 2＝WASD、F=B、G=A、T=Start、R=Select。
     fn poll_keyboard_input(&mut self, ctx: &egui::Context) {
-        let buttons = ctx.input(|i| {
-            let mut b = Buttons::empty();
-            b.set(Buttons::UP, i.key_down(egui::Key::ArrowUp));
-            b.set(Buttons::DOWN, i.key_down(egui::Key::ArrowDown));
-            b.set(Buttons::LEFT, i.key_down(egui::Key::ArrowLeft));
-            b.set(Buttons::RIGHT, i.key_down(egui::Key::ArrowRight));
-            b.set(Buttons::B, i.key_down(egui::Key::Z));
-            b.set(Buttons::A, i.key_down(egui::Key::X));
-            b.set(Buttons::START, i.key_down(egui::Key::Enter));
-            b.set(Buttons::SELECT, i.key_down(egui::Key::ShiftRight));
-            b
-        });
-
-        if buttons != self.last_input {
-            self.last_input = buttons;
-            let _ = self.cmd_tx.send(EmuCommand::SetInput(0, buttons));
+        for (player, keys) in [&PLAYER1_KEYS, &PLAYER2_KEYS].into_iter().enumerate() {
+            let buttons = ctx.input(|i| buttons_from_keys(keys, |key| i.key_down(key)));
+            if buttons != self.last_input[player] {
+                self.last_input[player] = buttons;
+                let _ = self
+                    .cmd_tx
+                    .send(EmuCommand::SetInput(player as u8, buttons));
+            }
         }
     }
 
@@ -255,10 +252,10 @@ impl eframe::App for NesApp {
         });
 
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::F5) {
+            if i.key_pressed(HOTKEY_SAVE_STATE) {
                 let _ = self.cmd_tx.send(EmuCommand::SaveState);
             }
-            if i.key_pressed(egui::Key::F9) {
+            if i.key_pressed(HOTKEY_LOAD_STATE) {
                 let _ = self.cmd_tx.send(EmuCommand::LoadState);
             }
         });

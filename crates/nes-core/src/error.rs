@@ -43,4 +43,12 @@ pub enum StateError {
     /// 存檔屬於另一份 ROM（`rom_hash` 對不上目前已載入的 ROM）。
     #[error("存檔屬於不同的 ROM（目前 ROM 雜湊 {expected:#018x}，存檔雜湊 {found:#018x}）")]
     RomMismatch { expected: u64, found: u64 },
+
+    /// 存檔開頭的 magic 或兩個版本號（格式結構／模擬行為）任一不符。版本不同的
+    /// 存檔即使能解碼，重播出來的結果也不保證與當初相同，所以一律拒絕。
+    #[error("存檔版本不符（本程式：{expected}；存檔：{found}）")]
+    VersionMismatch {
+        expected: crate::state::StateHeader,
+        found: crate::state::StateHeader,
+    },
 }

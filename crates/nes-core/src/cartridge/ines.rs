@@ -15,8 +15,8 @@
 //! [`RomError::Nes20Unsupported`] 而不是嘗試用 iNES 1.0 規則誤解析。
 
 use super::{
-    CHR_BANK_SIZE, CHR_RAM_SIZE, Cartridge, Mapper, Mirroring, Nrom, PRG_BANK_SIZE, PRG_RAM_SIZE,
-    RomInfo,
+    CHR_BANK_SIZE, CHR_RAM_SIZE, Cartridge, Cnrom, Mapper, Mirroring, Mmc1, Nrom, PRG_BANK_SIZE,
+    PRG_RAM_SIZE, RomInfo, Uxrom,
 };
 use crate::error::RomError;
 
@@ -92,6 +92,9 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
 
     let mapper = match mapper_id {
         0 => Mapper::Nrom(Nrom::new(prg_rom_banks)),
+        1 => Mapper::Mmc1(Mmc1::new()),
+        2 => Mapper::Uxrom(Uxrom::new()),
+        3 => Mapper::Cnrom(Cnrom::new()),
         other => return Err(RomError::UnsupportedMapper(other)),
     };
 
@@ -220,9 +223,27 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_mapper() {
-        // mapper id 1 = MMC1, not implemented yet.
-        let rom = build_rom(1, 1, 0b0001_0000, 0, false);
-        assert_eq!(parse(&rom).unwrap_err(), RomError::UnsupportedMapper(1));
+        // mapper id 4 = MMC3, not implemented (Phase 3 只做 0/1/2/3)。
+        let rom = build_rom(1, 1, 0b0100_0000, 0, false);
+        assert_eq!(parse(&rom).unwrap_err(), RomError::UnsupportedMapper(4));
+    }
+
+    #[test]
+    fn parses_mmc1_uxrom_and_cnrom_headers() {
+        for (id, is_expected) in [
+            (
+                1u8,
+                (|m: &Mapper| matches!(m, Mapper::Mmc1(_))) as fn(&Mapper) -> bool,
+            ),
+            (2, |m| matches!(m, Mapper::Uxrom(_))),
+            (3, |m| matches!(m, Mapper::Cnrom(_))),
+        ] {
+            let rom = build_rom(2, 1, id << 4, 0, false);
+            let cart = parse(&rom).unwrap_or_else(|e| panic!("mapper {id} 應該可以解析: {e}"));
+            assert_eq!(cart.info.mapper_id, id);
+            assert!(is_expected(&cart.mapper), "mapper {id} 對到錯的變體");
+            assert_eq!(cart.mapper.id(), id);
+        }
     }
 
     #[test]

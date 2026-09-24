@@ -3,7 +3,7 @@
 pub mod ines;
 pub mod mapper;
 
-pub use mapper::{Mapper, Nrom};
+pub use mapper::{Cnrom, DebugRow, Mapper, Mmc1, Nrom, Uxrom};
 
 use crate::error::RomError;
 
@@ -16,12 +16,19 @@ pub const CHR_RAM_SIZE: usize = 8 * 1024;
 /// Phase 1 若要精準依 header 決定大小，可以讀 flags8 或 NES 2.0 的欄位。
 pub const PRG_RAM_SIZE: usize = 8 * 1024;
 
-/// 螢幕捲動的鏡像方式，由 iNES header 的 flags6 決定。
+/// nametable 的鏡像方式。多數卡帶由 iNES header 的 flags6 固定；MMC1 這類 mapper
+/// 會在執行期由暫存器改變（見 [`Cartridge::mirroring`]）。
+///
+/// **變體順序就是存檔的 variant tag**，只能在最後追加。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mirroring {
     Horizontal,
     Vertical,
     FourScreen,
+    /// 單畫面，四個 nametable 都指向 VRAM 的前 1KB（MMC1 的「單畫面 A」）。
+    SingleScreenLower,
+    /// 單畫面，四個 nametable 都指向 VRAM 的後 1KB（MMC1 的「單畫面 B」）。
+    SingleScreenUpper,
 }
 
 /// 從 iNES header 解析出來、跟遊戲邏輯無關的靜態中繼資料。
@@ -79,12 +86,36 @@ impl Cartridge {
         self.mapper.read_prg(&self.prg_rom, addr)
     }
 
+    /// CPU 寫入 `$8000..=$FFFF`：mapper 暫存器。`consecutive` 的意義見
+    /// [`Mapper::write_prg`]。
+    pub fn write_prg(&mut self, addr: u16, value: u8, consecutive: bool) {
+        self.mapper.write_prg(addr, value, consecutive);
+    }
+
+    /// 目前生效的 nametable mirroring：mapper 控制的（MMC1）取 mapper 目前的設定，
+    /// 其餘取 iNES header 的固定值。**PPU 每次存取 nametable 都要呼叫它**，不能在
+    /// 載入 ROM 時決定一次。
+    pub fn mirroring(&self) -> Mirroring {
+        self.mapper.mirroring().unwrap_or(self.info.mirroring)
+    }
+
+    /// `$6000-$7FFF` 的 PRG-RAM 目前是否啟用（MMC1 可停用）。
+    pub fn prg_ram_enabled(&self) -> bool {
+        self.mapper.prg_ram_enabled()
+    }
+
+    /// Debugger 用：mapper 名稱與 bank 暫存器 / 目前對應。
+    pub fn mapper_debug_rows(&self) -> Vec<DebugRow> {
+        let chr_len = self.chr_rom.len().max(self.chr_ram.len());
+        self.mapper.debug_rows(self.prg_rom.len(), chr_len)
+    }
+
     /// 寫入 PPU 位址空間 `$0000..=$1FFF`。只有 CHR-RAM 卡帶可寫；CHR-ROM 的
     /// 寫入被忽略（硬體上沒有效果）。
     pub fn write_chr(&mut self, addr: u16, value: u8) {
         if self.chr_rom.is_empty() && !self.chr_ram.is_empty() {
-            let len = self.chr_ram.len();
-            self.chr_ram[addr as usize % len] = value;
+            let offset = self.mapper.chr_offset(addr, self.chr_ram.len());
+            self.chr_ram[offset] = value;
         }
     }
 

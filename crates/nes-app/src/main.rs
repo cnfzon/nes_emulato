@@ -14,6 +14,7 @@ mod audio;
 mod commands;
 mod debugger;
 mod emu;
+mod input;
 
 use std::thread;
 

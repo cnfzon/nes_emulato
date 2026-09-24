@@ -4,13 +4,15 @@
 「應用軟體設計」課程的期末專案，涵蓋作業系統（多執行緒／timing）、視窗環境
 （egui GUI）、網路環境（UDP rollback netplay）、以及整合設計四大主題。
 
-> **目前狀態：Phase 2（PPU、NMI、OAM DMA、搖桿）。** CPU 通過 nestest（8991
+> **目前狀態：Phase 3（核心凍結：時序、mapper、存檔版本、玩家 2）。** CPU 通過 nestest（8991
 > 行逐指令比對全數通過）與 SingleStepTests 回歸閘門；PPU 以 scanline 為單位渲染
-> （含 loopy 捲動、精靈、8×16、sprite 0 hit、NMI），NROM 遊戲理論上可以遊玩
-> （尚未以真實遊戲驗證，見 [`docs/manual-test-phase2.md`](docs/manual-test-phase2.md)）。
-> APU 仍是 stub、只支援 mapper 0（NROM）。CPU 與 PPU 的時序模型（instruction-level
-> + catch-up）與限制、blargg 測試結果見 [`docs/architecture.md`](docs/architecture.md)
-> §13–§14。
+> （含 loopy 捲動、精靈、8×16、sprite 0 hit、NMI）。支援 mapper 0（NROM）、1（MMC1）、
+> 2（UxROM）、3（CNROM）；APU 仍是 stub。CPU 與 PPU 的時序模型（instruction-level +
+> 分段 catch-up）已定案，存檔開頭有 magic 與兩個版本號（格式、模擬行為）——之後任何會改變
+> 模擬結果的修改都必須遞增 `CORE_BEHAVIOR_VERSION`，規則見
+> [`docs/architecture.md`](docs/architecture.md) §13–§16。**尚未以真實遊戲驗證**，手動測試清單見
+> [`docs/manual-test-phase2.md`](docs/manual-test-phase2.md)、
+> [`docs/manual-test-phase3.md`](docs/manual-test-phase3.md)。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
@@ -61,8 +63,15 @@ cargo run --release -p nes-test -- golden path/to/rom.nes --frames 120
 cargo run --release -p nes-core --features testing --example bench_run_frame
 ```
 
-遊戲操作（`nes-app`）：方向鍵、Z = B、X = A、Enter = Start、右 Shift = Select；
-F5 存檔、F9 讀檔。
+遊戲操作（`nes-app`）：
+
+| | 玩家 1 | 玩家 2 |
+|---|---|---|
+| 方向 | 方向鍵 | W A S D |
+| B / A | Z / X | F / G |
+| Select / Start | 右 Shift / Enter | R / T |
+
+F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。
 
 ## 交付與效能量測
 

@@ -402,3 +402,231 @@ fn trace_does_not_mutate_cpu_state() {
     assert_eq!(before, after);
     assert!(line.starts_with("8000  A9 42"));
 }
+
+// ---- Phase 3：不穩定 opcode（SHY / SHX / LXA）與分段 catch-up ---------------
+
+#[test]
+fn shy_stores_y_and_h_plus_one_without_page_cross() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 1;
+    cpu.y = 0xFF;
+    load_program(&mut cpu, 0x8000, &[0x9C, 0x00, 0x01]); // SHY $0100,X -> $0101
+    assert_eq!(cpu.step(), 5);
+    // value = Y($FF) & (H($01) + 1) = 2
+    assert_eq!(cpu.bus().peek(0x0101), 2);
+}
+
+#[test]
+fn shy_page_cross_replaces_the_target_high_byte_with_the_value() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 1;
+    cpu.y = 0x05;
+    load_program(&mut cpu, 0x8000, &[0x9C, 0xFF, 0x02]); // SHY $02FF,X：一般會寫 $0300
+    cpu.step();
+    // value = Y & (H+1) = 5 & 3 = 1；跨頁 → 目標 = (1 << 8) | $00 = $0100。
+    assert_eq!(cpu.bus().peek(0x0100), 1);
+    assert_eq!(cpu.bus().peek(0x0300), 0, "沒有寫到原本的目標");
+}
+
+#[test]
+fn shx_stores_x_and_h_plus_one_and_handles_page_cross() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.y = 1;
+    cpu.x = 0x05;
+    load_program(&mut cpu, 0x8000, &[0x9E, 0xFF, 0x02]); // SHX $02FF,Y
+    assert_eq!(cpu.step(), 5);
+    assert_eq!(cpu.bus().peek(0x0100), 5 & 3);
+
+    cpu.pc = 0x8010;
+    cpu.y = 1;
+    cpu.x = 0xFF;
+    load_program(&mut cpu, 0x8010, &[0x9E, 0x10, 0x01]); // SHX $0110,Y -> $0111，不跨頁
+    cpu.step();
+    // value = X($FF) & (H($01) + 1) = 2
+    assert_eq!(cpu.bus().peek(0x0111), 2);
+}
+
+#[test]
+fn lxa_loads_the_immediate_into_a_and_x_with_magic_ff() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.a = 0x12;
+    load_program(&mut cpu, 0x8000, &[0xAB, 0x84]); // LXA #$84
+    assert_eq!(cpu.step(), 2);
+    assert_eq!((cpu.a, cpu.x), (0x84, 0x84));
+    assert!(cpu.status.contains(StatusFlags::NEGATIVE));
+    assert!(!cpu.status.contains(StatusFlags::ZERO));
+}
+
+/// 分段 catch-up：4 cycle 的 `LDA $2002` 在指令內的最後一個 cycle 讀取，所以讀取前
+/// PPU 已經前進 3 個 CPU cycle（9 dot）。vblank 旗標在 scanline 241、dot 1 被處理的
+/// 那個 tick 設起：從 (240, 334) 出發第 9 個 tick 剛好處理它，讀得到；從 (240, 333)
+/// 出發要第 10 個 tick，讀不到。
+#[test]
+fn split_catch_up_makes_ppu_register_reads_see_the_dots_before_the_last_cycle() {
+    for (start_dot, expect_vblank) in [(334u16, true), (333, false)] {
+        let mut cpu = new_test_cpu();
+        cpu.pc = 0x8000;
+        cpu.bus_mut().ppu.scanline = 240;
+        cpu.bus_mut().ppu.cycle = start_dot;
+        load_program(&mut cpu, 0x8000, &[0xAD, 0x02, 0x20]); // LDA $2002
+        assert_eq!(cpu.step(), 4);
+        assert_eq!(
+            cpu.a & 0x80 != 0,
+            expect_vblank,
+            "起始 dot {start_dot}：讀到的 vblank 旗標"
+        );
+    }
+}
+
+/// `step()` 回傳的 cycle 數與 `Bus` 累計的 cycle 數不因分段而改變（含跨頁與分支）。
+#[test]
+fn split_catch_up_keeps_total_cycles_identical() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 0xFF;
+    // LDA $8001,X → $8100（跨頁 5，讀到非 0 讓 Z=0）；BNE +0 成立不跨頁（3）；NOP（2）。
+    load_program(&mut cpu, 0x8000, &[0xBD, 0x01, 0x80, 0xD0, 0x00, 0xEA]);
+    poke_prg(&mut cpu, 0x8100, 0x01);
+    let before = cpu.bus().total_cycles();
+    let spent: u64 = (0..3).map(|_| cpu.step() as u64).sum();
+    assert_eq!(spent, 5 + 3 + 2);
+    assert_eq!(cpu.bus().total_cycles() - before, spent);
+}
+
+/// RMW 指令對 `$8000+` 的寫入被拆成「舊值、緊接的新值」兩次；不需要 `consecutive` 的
+/// mapper（NROM）看不出差別，最終沒有任何副作用。
+#[test]
+fn rmw_on_rom_space_is_a_harmless_no_op_for_nrom() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    load_program(&mut cpu, 0x8000, &[0xEE, 0x00, 0x90]); // INC $9000
+    poke_prg(&mut cpu, 0x9000, 0x41);
+    assert_eq!(cpu.step(), 6);
+    assert_eq!(cpu.bus().peek(0x9000), 0x41, "ROM 不可寫");
+}
+
+// ---- Phase 3.1：索引定址的 dummy read -----------------------------------------
+
+/// 用 flat RAM 匯流排跑一條指令，回傳匯流排存取的順序 `(位址, 值, 是否為寫入)`。
+fn access_log_of(program: &[u8], x: u8, y: u8, ram: &[(u16, u8)]) -> Vec<(u16, u8, bool)> {
+    let mut cpu = Cpu::new(Bus::new_flat_ram_for_testing(new_test_cpu_cartridge()));
+    cpu.pc = 0x0400;
+    cpu.x = x;
+    cpu.y = y;
+    for (i, b) in program.iter().enumerate() {
+        cpu.bus_mut().flat_ram_mut()[0x0400 + i] = *b;
+    }
+    for &(a, v) in ram {
+        cpu.bus_mut().flat_ram_mut()[a as usize] = v;
+    }
+    cpu.step();
+    cpu.bus_mut().take_access_log()
+}
+
+fn new_test_cpu_cartridge() -> Cartridge {
+    new_test_cpu().bus().cartridge.clone()
+}
+
+#[test]
+fn indexed_read_dummy_reads_the_uncorrected_address_only_when_the_page_is_crossed() {
+    // LDA $10F0,X：X=$10 → $1100 跨頁；未修正位址 = $10 高位元組 + $00 = $1000。
+    let crossed = access_log_of(&[0xBD, 0xF0, 0x10], 0x10, 0, &[(0x1100, 0x77)]);
+    assert_eq!(
+        crossed,
+        [
+            (0x0400, 0xBD, false),
+            (0x0401, 0xF0, false),
+            (0x0402, 0x10, false),
+            (0x1000, 0, false), // dummy read（未修正位址）
+            (0x1100, 0x77, false),
+        ]
+    );
+    // X=$05 → $10F5 沒跨頁：只有真正的讀取。
+    let same_page = access_log_of(&[0xBD, 0xF0, 0x10], 0x05, 0, &[]);
+    assert_eq!(same_page.len(), 4);
+    assert!(same_page.iter().all(|&(a, _, _)| a != 0x1000));
+}
+
+#[test]
+fn indexed_store_always_dummy_reads_even_without_a_page_cross() {
+    // STA $2000,X 的位址 `$2007`（X=7）沒跨頁，store 仍先讀一次 `$2007`，再寫。
+    let log = access_log_of(&[0x9D, 0x00, 0x20], 0x07, 0, &[]);
+    assert_eq!(&log[3..], [(0x2007, 0, false), (0x2007, 0, true)]);
+    // (ind),Y 的 store：STA ($20),Y，指標 $20/$21 = $10F0，Y=$10 → 跨頁，未修正 $1000。
+    let log = access_log_of(&[0x91, 0x20], 0, 0x10, &[(0x20, 0xF0), (0x21, 0x10)]);
+    assert!(log.contains(&(0x1000, 0, false)), "{log:04X?}");
+    assert!(log.last().unwrap().2);
+}
+
+/// RMW（`INC abs,X`）的存取順序：dummy read（未修正位址）→ 真正的讀取 → 寫回舊值
+/// （dummy write）→ 寫入新值。
+#[test]
+fn rmw_indexed_access_order_is_dummy_read_then_read_then_old_then_new_write() {
+    let log = access_log_of(&[0xFE, 0xF0, 0x10], 0x10, 0, &[(0x1100, 0x41)]);
+    assert_eq!(
+        &log[3..],
+        [
+            (0x1000, 0, false), // dummy read（未修正）
+            (0x1100, 0x41, false),
+            (0x1100, 0x41, true), // dummy write：舊值
+            (0x1100, 0x42, true), // 新值
+        ]
+    );
+}
+
+/// 其他定址模式（zero page 索引、implied……）不模擬 dummy read：存取次數與位址不變。
+#[test]
+fn zero_page_indexed_and_implied_have_no_dummy_read() {
+    let log = access_log_of(&[0xB5, 0x80], 0x05, 0, &[(0x85, 0x12)]); // LDA $80,X
+    assert_eq!(log.len(), 3); // opcode、operand、資料
+    assert_eq!(log[2], (0x0085, 0x12, false));
+    let log = access_log_of(&[0xEA], 0, 0, &[]); // NOP
+    assert_eq!(log.len(), 1);
+}
+
+/// 真的碰到 I/O 暫存器：`LDA $20F8,X`（X=$0F → `$2107`，跨頁）先 dummy read `$2007`，
+/// 使 PPU 位址多前進一次；不跨頁的 `LDA $2000,X`（X=7）只讀一次。
+#[test]
+fn dummy_read_advances_the_ppu_address_through_2007() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 0x0F;
+    load_program(&mut cpu, 0x8000, &[0xBD, 0xF8, 0x20]);
+    cpu.bus_mut().ppu.v = 0x0000;
+    cpu.step();
+    // dummy read $2007 + 真正讀 $2107（也是 $2007 的鏡像）＝ 前進 2。
+    assert_eq!(cpu.bus().ppu.v, 2);
+
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 0x07;
+    load_program(&mut cpu, 0x8000, &[0xBD, 0x00, 0x20]); // LDA $2000,X = $2007，不跨頁
+    cpu.bus_mut().ppu.v = 0x0000;
+    cpu.step();
+    assert_eq!(cpu.bus().ppu.v, 1);
+
+    // STA $2000,X（X=7）：dummy read 使 v 前進 1，接著寫入 $2007 再前進 1。
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    cpu.x = 0x07;
+    load_program(&mut cpu, 0x8000, &[0x9D, 0x00, 0x20]);
+    cpu.bus_mut().ppu.v = 0x0000;
+    cpu.step();
+    assert_eq!(cpu.bus().ppu.v, 2);
+}
+
+/// 對 PPU 暫存器的 RMW 現在也寫兩次（舊值、新值）：`INC $2006`（$2006 唯寫，讀到 latch）。
+#[test]
+fn rmw_on_a_ppu_register_writes_twice() {
+    let mut cpu = new_test_cpu();
+    cpu.pc = 0x8000;
+    load_program(&mut cpu, 0x8000, &[0xEE, 0x06, 0x20]); // INC $2006
+    cpu.bus_mut().ppu.w = false;
+    cpu.step();
+    // 兩次寫入 $2006 → 第二次寫完成一組位址，w 回到 false。
+    assert!(!cpu.bus().ppu.w);
+}

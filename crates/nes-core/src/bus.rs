@@ -59,6 +59,11 @@ pub struct Bus {
     #[cfg(test)]
     #[serde(skip)]
     test_flat_ram: Option<Vec<u8>>,
+    /// 只給測試用：flat RAM 模式下，依序記錄 `Bus::read`/`Bus::write` 的存取
+    /// `(位址, 值, 是否為寫入)`（不含 `peek`），讓 SingleStepTests 比對讀寫過的位址。
+    #[cfg(test)]
+    #[serde(skip)]
+    test_access_log: Vec<(u16, u8, bool)>,
 }
 
 impl Bus {
@@ -74,6 +79,8 @@ impl Bus {
             pending_oam_dma: None,
             #[cfg(test)]
             test_flat_ram: None,
+            #[cfg(test)]
+            test_access_log: Vec::new(),
         }
     }
 
@@ -85,6 +92,12 @@ impl Bus {
         let mut bus = Self::new(cartridge);
         bus.test_flat_ram = Some(vec![0u8; 0x1_0000]);
         bus
+    }
+
+    /// 取走目前為止記錄的存取（`(位址, 值, 是否為寫入)`）。
+    #[cfg(test)]
+    pub(crate) fn take_access_log(&mut self) -> Vec<(u16, u8, bool)> {
+        std::mem::take(&mut self.test_access_log)
     }
 
     #[cfg(test)]
@@ -127,6 +140,8 @@ impl Bus {
     /// `$2002`/`$2004`/`$2007` 會清旗標／前進位址，讀 `$4016/$4017` 會移位）。
     pub fn read(&mut self, addr: u16) -> u8 {
         if let Some(v) = self.test_flat_ram_read(addr) {
+            #[cfg(test)]
+            self.test_access_log.push((addr, v, false));
             return v;
         }
         let value = self.read_mapped(addr);
@@ -147,8 +162,22 @@ impl Bus {
             0x4000..=0x4017 => self.peek_apu_io_register(addr),
             0x4018..=0x401F => self.open_bus,
             0x4020..=0x5FFF => self.open_bus,
-            0x6000..=0x7FFF => self.cartridge.prg_ram[(addr - 0x6000) as usize],
+            0x6000..=0x7FFF => self.read_prg_ram(addr),
             0x8000..=0xFFFF => self.cartridge.read_prg(addr),
+        }
+    }
+
+    /// `$6000-$7FFF`：卡帶 PRG-RAM；被 mapper 停用時（MMC1）沒有裝置回應，讀到
+    /// open bus。
+    fn read_prg_ram(&self, addr: u16) -> u8 {
+        if self.cartridge.prg_ram_enabled() {
+            self.cartridge
+                .prg_ram
+                .get((addr - 0x6000) as usize)
+                .copied()
+                .unwrap_or(self.open_bus)
+        } else {
+            self.open_bus
         }
     }
 
@@ -162,14 +191,37 @@ impl Bus {
             0x4000..=0x4017 => self.read_apu_io_register(addr),
             0x4018..=0x401F => self.open_bus,
             0x4020..=0x5FFF => self.open_bus,
-            0x6000..=0x7FFF => self.cartridge.prg_ram[(addr - 0x6000) as usize],
+            0x6000..=0x7FFF => self.read_prg_ram(addr),
             0x8000..=0xFFFF => self.cartridge.read_prg(addr),
         }
     }
 
     /// 寫入 CPU 位址空間中的一個 byte。
     pub fn write(&mut self, addr: u16, value: u8) {
+        self.write_inner(addr, value, false);
+    }
+
+    /// 讀-改-寫指令（INC/DEC/ASL/LSR/ROL/ROR 與非官方的 DCP/ISB/SLO/RLA/SRE/RRA）
+    /// 的寫回。
+    ///
+    /// 真實 6502 的 RMW 會在連續兩個 cycle 各寫一次：先把**舊值**寫回（dummy write），
+    /// 再寫新值。多數裝置看不出差別，但 MMC1 會忽略「緊接在上一個 cycle 寫入之後」的
+    /// 那次寫入，所以 `INC $8000` 之類的指令對 MMC1 而言只有第一次（舊值）生效。
+    ///
+    /// instruction-level 的處理：CPU 不逐 cycle 執行，也沒有寫入的時間戳，所以 RMW 一律
+    /// 拆成「舊值、緊接的新值」兩次寫入，第二次標記為 `consecutive`（只有 mapper 用得到）。
+    /// 這是精確的：6502 上唯一會在相鄰 cycle 連續寫入的就是 RMW 指令，不同指令的寫入
+    /// 至少相隔 3 個 cycle。**Phase 3.1 起對所有位址都這樣做**（Phase 3 只對 `$8000+`），
+    /// 所以 `INC $2006` 之類對 PPU 暫存器的 RMW 也會如硬體般寫兩次。
+    pub fn write_rmw(&mut self, addr: u16, old: u8, new: u8) {
+        self.write_inner(addr, old, false);
+        self.write_inner(addr, new, true);
+    }
+
+    fn write_inner(&mut self, addr: u16, value: u8, consecutive: bool) {
         if self.test_flat_ram_write(addr, value) {
+            #[cfg(test)]
+            self.test_access_log.push((addr, value, true));
             return;
         }
         self.open_bus = value;
@@ -182,10 +234,15 @@ impl Bus {
             0x4000..=0x4017 => self.write_apu_io_register(addr, value),
             0x4018..=0x401F => {}
             0x4020..=0x5FFF => {}
-            0x6000..=0x7FFF => self.cartridge.prg_ram[(addr - 0x6000) as usize] = value,
-            // NROM（目前唯一支援的 mapper）沒有可寫暫存器；之後的 mapper
-            // （MMC1 等）靠寫這個範圍切換 bank，接口留在這裡。
-            0x8000..=0xFFFF => {}
+            0x6000..=0x7FFF => {
+                if self.cartridge.prg_ram_enabled()
+                    && let Some(slot) = self.cartridge.prg_ram.get_mut((addr - 0x6000) as usize)
+                {
+                    *slot = value;
+                }
+            }
+            // mapper 暫存器（NROM 沒有）。
+            0x8000..=0xFFFF => self.cartridge.write_prg(addr, value, consecutive),
         }
     }
 

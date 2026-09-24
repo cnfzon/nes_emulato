@@ -42,13 +42,11 @@ struct TestCase {
     initial: CpuState,
     #[serde(rename = "final")]
     expected: CpuState,
-    /// 逐 cycle 的匯流排讀寫紀錄。我們不比對「哪個位址、什麼時候被讀寫」
-    /// （instruction-level 精度不模擬這個，見 `cpu/mod.rs` 模組文件），只用
-    /// 這個陣列的長度跟 `Cpu::step()` 回傳的 cycle 數比對。用
-    /// `serde::de::IgnoredAny` 而不是完整的型別，讓 serde 只數元素個數、
-    /// 不用真的把每筆 `[addr, value, "read"|"write"]` 都解析/配置記憶體，
-    /// 解析速度接近完全略過這個欄位。
-    cycles: Vec<serde::de::IgnoredAny>,
+    /// 逐 cycle 的匯流排讀寫紀錄 `[位址, 值, "read"|"write"]`。**不比對順序**
+    /// （instruction-level 精度不追求逐 cycle 的次序，見 `cpu/mod.rs` 模組文件），
+    /// 比對的是：陣列長度 vs `Cpu::step()` 回傳的 cycle 數、「讀取過的位址集合」、
+    /// 「寫入過的 `(位址, 值)`」（見 [`compare_accesses`]）。
+    cycles: Vec<(u16, u8, String)>,
 }
 
 #[derive(serde::Deserialize)]
@@ -85,11 +83,101 @@ fn dummy_cartridge() -> Cartridge {
     }
 }
 
+/// 匯流排存取的比對結果（不看順序）。
+#[derive(Default, Clone)]
+struct AccessDiff {
+    /// 期望有讀、實際沒讀的位址。
+    missing_reads: Vec<u16>,
+    /// 實際有讀、期望沒有的位址。
+    extra_reads: Vec<u16>,
+    /// 期望有寫、實際沒寫的 `(位址, 值)`（依次數計）。
+    missing_writes: Vec<(u16, u8)>,
+    /// 實際有寫、期望沒有的 `(位址, 值)`。
+    extra_writes: Vec<(u16, u8)>,
+}
+
+impl AccessDiff {
+    fn reads_ok(&self) -> bool {
+        self.missing_reads.is_empty() && self.extra_reads.is_empty()
+    }
+    fn writes_ok(&self) -> bool {
+        self.missing_writes.is_empty() && self.extra_writes.is_empty()
+    }
+}
+
+/// 比對「讀取過的位址集合」與「寫入過的 `(位址, 值)`（多重集合）」。
+fn compare_accesses(tc: &TestCase, actual: &[(u16, u8, bool)]) -> AccessDiff {
+    use std::collections::BTreeSet;
+    let expected_reads: BTreeSet<u16> = tc
+        .cycles
+        .iter()
+        .filter(|(_, _, kind)| kind == "read")
+        .map(|&(a, _, _)| a)
+        .collect();
+    let actual_reads: BTreeSet<u16> = actual
+        .iter()
+        .filter(|(_, _, w)| !w)
+        .map(|&(a, _, _)| a)
+        .collect();
+    let mut expected_writes: Vec<(u16, u8)> = tc
+        .cycles
+        .iter()
+        .filter(|(_, _, kind)| kind == "write")
+        .map(|&(a, v, _)| (a, v))
+        .collect();
+    let mut actual_writes: Vec<(u16, u8)> = actual
+        .iter()
+        .filter(|(_, _, w)| *w)
+        .map(|&(a, v, _)| (a, v))
+        .collect();
+    expected_writes.sort_unstable();
+    actual_writes.sort_unstable();
+
+    let mut diff = AccessDiff {
+        missing_reads: expected_reads.difference(&actual_reads).copied().collect(),
+        extra_reads: actual_reads.difference(&expected_reads).copied().collect(),
+        ..AccessDiff::default()
+    };
+    // 多重集合差：兩個排序過的 Vec 逐一消去。
+    let mut remaining = actual_writes.clone();
+    for w in &expected_writes {
+        match remaining.iter().position(|x| x == w) {
+            Some(i) => {
+                remaining.swap_remove(i);
+            }
+            None => diff.missing_writes.push(*w),
+        }
+    }
+    diff.extra_writes = remaining;
+    diff
+}
+
+/// 一筆測試的完整執行結果。
+struct Run {
+    /// `Cpu::step()` 回傳的 cycle 數。
+    cycles: u8,
+    /// 暫存器與 RAM 是否相符（第一個不一致的描述）。
+    state: Result<(), String>,
+    access: AccessDiff,
+}
+
 /// 執行單一筆測試，回傳第一個不一致的欄位描述；`Ok(())` 代表通過。
 ///
 /// `check_cycles` 為 `false` 時不比對 cycle 數（JAM 類別用，見 [`Category::Jam`]），
-/// 其餘暫存器與 RAM 一律比對。
+/// 其餘暫存器與 RAM 一律比對。**不含**匯流排存取的比對（見 [`run_full`]）。
 fn run_one(tc: &TestCase, check_cycles: bool) -> Result<(), String> {
+    let run = run_full(tc);
+    if check_cycles && run.cycles as usize != tc.cycles.len() {
+        return Err(format!(
+            "cycle 數: 期望 {}，實際 {}",
+            tc.cycles.len(),
+            run.cycles
+        ));
+    }
+    run.state
+}
+
+fn run_full(tc: &TestCase) -> Run {
     let bus = Bus::new_flat_ram_for_testing(dummy_cartridge());
     let mut cpu = Cpu::new(bus);
 
@@ -104,10 +192,16 @@ fn run_one(tc: &TestCase, check_cycles: bool) -> Result<(), String> {
     }
 
     let cycles = cpu.step();
-    if check_cycles && cycles as usize != tc.cycles.len() {
-        return Err(format!("cycle 數: 期望 {}，實際 {cycles}", tc.cycles.len()));
+    let access = compare_accesses(tc, &cpu.bus_mut().take_access_log());
+    let state = check_state(tc, &mut cpu);
+    Run {
+        cycles,
+        state,
+        access,
     }
+}
 
+fn check_state(tc: &TestCase, cpu: &mut Cpu) -> Result<(), String> {
     if cpu.a != tc.expected.a {
         return Err(format!("A: 期望 {:02X}，實際 {:02X}", tc.expected.a, cpu.a));
     }
@@ -156,10 +250,18 @@ const JAM_OPCODES: [u8; 12] = [
     0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2,
 ];
 
-/// 8 個不穩定 opcode：真實行為取決於類比因素（bus 上的殘留電容、DMA 時機、
+/// 6 個不穩定 opcode：真實行為取決於類比因素（bus 上的殘留電容、DMA 時機、
 /// 晶片批次），SingleStepTests 的期望值只是其中一種取樣，本專案不追求相符。
 /// 預期失敗，只列出、不計入閘門。
-const UNSTABLE_OPCODES: [u8; 8] = [0x8B, 0x93, 0x9B, 0x9C, 0x9E, 0x9F, 0xAB, 0xBB];
+///
+/// Phase 3 之前是 8 個。`$9C`（SHY）與 `$9E`（SHX）依 blargg instr_test 實作後，
+/// SingleStepTests 實測 10000/10000（含 cycle 數）——它們的行為其實是確定的
+/// （`reg & (H+1)`、跨頁時位址高位元組被換成該值），不是真正不可預測，所以依實際
+/// 結果移到「非官方（穩定）」，納入必須 100% 的閘門。
+/// `$AB`（LXA）留在這裡：blargg 要 magic `$FF`（A=X=imm），SingleStepTests 的資料
+/// 逐 bit 分析是 magic `$EE`，兩者互相衝突；本專案以 blargg 為準，SST 相符率約 56%。
+/// 其餘 5 個（`$8B $93 $9B $9F $BB`）仍是 1-byte NOP 佔位，0%。
+const UNSTABLE_OPCODES: [u8; 6] = [0x8B, 0x93, 0x9B, 0x9F, 0xAB, 0xBB];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Category {
@@ -359,5 +461,164 @@ fn percentage(pass: u64, total: u64) -> f64 {
         0.0
     } else {
         pass as f64 / total as f64 * 100.0
+    }
+}
+
+/// 「刻意不模擬的 dummy read」：這個 opcode 的哪些「期望有讀、實際沒讀」的位址是允許的。
+///
+/// instruction-level 只模擬**會碰到 I/O 暫存器**的 dummy read：索引定址（abs,X / abs,Y /
+/// (ind),Y）修正位址前的那次讀取——它落在資料位址空間，可以是 `$2007` 這種有副作用的
+/// 暫存器。其餘的 dummy read 位址由指令本身決定、落在固定區域，沒有副作用，不模擬：
+///
+/// | 定址模式／指令 | 那次 dummy read 的位址 | 判斷 |
+/// |---|---|---|
+/// | Implied / Accumulator | `PC + 1`（讀下一個 byte 後丟棄） | 指令流，除非程式在 I/O 位址執行，否則無副作用 |
+/// | 堆疊指令（PHA/PHP/PLA/PLP/JSR/RTS/RTI/BRK） | 堆疊頁 `$0100-$01FF`、`PC + 1`；RTS 另有「彈出的返回位址」 | RAM 與指令流 |
+/// | ZeroPage,X / ZeroPage,Y / (zp,X) | 未加索引的 zero page 位址 `$00-$FF` | zero page 是 RAM，無副作用 |
+/// | Relative（分支） | 分支成立時的 `PC + 2`、跨頁時的未修正目標 | 指令流 |
+///
+/// 其餘模式（Immediate、ZeroPage、Absolute、Indirect、abs,X、abs,Y、(ind),Y）必須讀取集合
+/// **完全相符**，也不得有多讀。
+fn unmodeled_read_allowed(opcode: u8, pc: u16, addr: u16) -> bool {
+    use super::AddrMode::*;
+    let stack_page = (0x0100..=0x01FF).contains(&addr);
+    let next = addr == pc.wrapping_add(1);
+    match OPCODES[opcode as usize].mode {
+        Implied | Accumulator => match opcode {
+            // RTS 最後一次讀的是彈出的返回位址（指令流），無法從初始狀態單看，整個放行。
+            0x60 => true,
+            // 堆疊指令：堆疊頁或 PC+1。
+            0x00 | 0x08 | 0x28 | 0x40 | 0x48 | 0x68 => stack_page || next,
+            _ => next,
+        },
+        Absolute => opcode == 0x20 && stack_page, // JSR
+        ZeroPageX | ZeroPageY | IndirectX => addr <= 0x00FF,
+        Relative => true,
+        _ => false,
+    }
+}
+
+/// 匯流排存取比對（Phase 3.1）：除了暫存器／RAM／cycle 數，也比對每筆測試「讀取過的位址集合」
+/// 與「寫入過的 `(位址, 值)`」，**不比對順序**。JAM 不參與（測試資料把卡死展開成 11 個
+/// cycle 的活動，本核心沒有對應行為）。
+///
+/// 只印結果與每個 opcode 的失敗摘要（含範例）；閘門的判定見 [`ACCESS_GATE_MODES`]。
+#[test]
+#[ignore = "資料量大，預設不跑；見模組文件的手動執行指令"]
+fn singlestep_bus_accesses() {
+    let dir = singlestep_dir();
+    if !dir.is_dir() {
+        eprintln!("找不到 {}，略過（不算失敗）。", dir.display());
+        return;
+    }
+
+    #[derive(Default, Clone)]
+    struct OpStat {
+        total: u64,
+        reads_ok: u64,
+        writes_ok: u64,
+        both_ok: u64,
+        /// 通過閘門的筆數：寫入相符、沒有多讀，且缺的讀取都在 [`unmodeled_read_allowed`] 之內。
+        gate_ok: u64,
+        example: Option<(String, AccessDiff)>,
+    }
+    let mut per_opcode: BTreeMap<u8, OpStat> = BTreeMap::new();
+    for opcode in 0..=255u16 {
+        let opcode = opcode as u8;
+        if JAM_OPCODES.contains(&opcode) {
+            continue;
+        }
+        let path = dir.join(format!("{opcode:02x}.json"));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(cases) = serde_json::from_str::<Vec<TestCase>>(&content) else {
+            eprintln!("解析 {} 失敗，略過", path.display());
+            continue;
+        };
+        let stat = per_opcode.entry(opcode).or_default();
+        for tc in &cases {
+            let run = run_full(tc);
+            stat.total += 1;
+            let (r, w) = (run.access.reads_ok(), run.access.writes_ok());
+            stat.reads_ok += r as u64;
+            stat.writes_ok += w as u64;
+            stat.both_ok += (r && w) as u64;
+            let a = &run.access;
+            stat.gate_ok += (w
+                && a.extra_reads.is_empty()
+                && a.missing_reads
+                    .iter()
+                    .all(|&m| unmodeled_read_allowed(opcode, tc.initial.pc, m)))
+                as u64;
+            if !(r && w) && stat.example.is_none() {
+                stat.example = Some((tc.name.clone(), run.access));
+            }
+        }
+    }
+
+    let mut by_category: BTreeMap<Category, (u64, u64, u64)> = BTreeMap::new(); // total, reads_ok, writes_ok
+    let mut gate: BTreeMap<Category, (u64, u64)> = BTreeMap::new(); // total, gate_ok
+    let mut by_mode: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // total, both_ok
+    println!("---- 匯流排存取比對：每個 opcode 未 100% 者（讀取位址集合 / 寫入 (位址,值)）----");
+    for (opcode, st) in &per_opcode {
+        let info = &OPCODES[*opcode as usize];
+        let cat = Category::of(*opcode);
+        let e = by_category.entry(cat).or_default();
+        e.0 += st.total;
+        e.1 += st.reads_ok;
+        e.2 += st.writes_ok;
+        let g = gate.entry(cat).or_default();
+        g.0 += st.total;
+        g.1 += st.gate_ok;
+        let m = by_mode.entry(format!("{:?}", info.mode)).or_default();
+        m.0 += st.total;
+        m.1 += st.both_ok;
+        if st.both_ok != st.total {
+            let ex = st.example.as_ref().map(|(name, d)| {
+                format!(
+                    "  例 {name}: 缺讀 {:04X?} 多讀 {:04X?} 缺寫 {:02X?} 多寫 {:02X?}",
+                    d.missing_reads, d.extra_reads, d.missing_writes, d.extra_writes
+                )
+            });
+            println!(
+                "{opcode:02X} {:<4} {:<9} 讀 {:>5}/{:<5} 寫 {:>5}/{:<5} [{}]{}",
+                info.mnemonic,
+                format!("{:?}", info.mode),
+                st.reads_ok,
+                st.total,
+                st.writes_ok,
+                st.total,
+                cat.label(),
+                ex.unwrap_or_default()
+            );
+        }
+    }
+    println!("---- 各類別彙總（讀取集合 / 寫入）----");
+    for (cat, (total, r, w)) in &by_category {
+        println!(
+            "{:<24} 讀 {r}/{total}（{:.2}%）  寫 {w}/{total}（{:.2}%）",
+            cat.label(),
+            percentage(*r, *total),
+            percentage(*w, *total)
+        );
+    }
+    println!("---- 閘門（寫入相符、無多讀、缺讀只限不模擬的 dummy read）----");
+    for (cat, (total, ok)) in &gate {
+        println!(
+            "{:<24} {ok}/{total}（{:.2}%）",
+            cat.label(),
+            percentage(*ok, *total)
+        );
+    }
+    println!("---- 依定址模式彙總（讀寫皆相符 / 總數）----");
+    for (mode, (total, ok)) in &by_mode {
+        println!("{mode:<12} {ok}/{total}（{:.2}%）", percentage(*ok, *total));
+    }
+
+    for cat in [Category::Official, Category::UnofficialStable] {
+        let (total, ok) = gate.get(&cat).copied().unwrap_or_default();
+        assert!(total > 0, "類別 {} 沒有資料", cat.label());
+        assert_eq!(ok, total, "類別 {} 的匯流排存取閘門應 100%", cat.label());
     }
 }

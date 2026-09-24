@@ -114,6 +114,10 @@ pub enum Mnemonic {
     Alr,
     Arr,
     Axs,
+    // 「不穩定」但 blargg instr_test 有期望值的三個
+    Shy,
+    Shx,
+    Lxa,
     Jam,
 }
 
@@ -189,6 +193,9 @@ impl Mnemonic {
             Mnemonic::Alr => "ALR",
             Mnemonic::Arr => "ARR",
             Mnemonic::Axs => "AXS",
+            Mnemonic::Shy => "SHY",
+            Mnemonic::Shx => "SHX",
+            Mnemonic::Lxa => "LXA",
             Mnemonic::Jam => "JAM",
         }
     }
@@ -491,6 +498,11 @@ pub const OPCODES: [OpcodeInfo; 256] = {
     table[0x6B] = op(Mnemonic::Arr, Immediate, 2, 2, false, false);
     table[0xCB] = op(Mnemonic::Axs, Immediate, 2, 2, false, false);
     table[0xEB] = op(Mnemonic::Sbc, Immediate, 2, 2, false, false); // *SBC，跟官方 SBC 行為相同
+    // 「不穩定」opcode 中，blargg instr_test 有確定期望值的三個（其餘五個
+    // `$8B $93 $9B $9F $BB` 仍是 `UNDEFINED` 佔位，見 docs/architecture.md §10）。
+    table[0x9C] = op(Mnemonic::Shy, AbsoluteX, 3, 5, false, false);
+    table[0x9E] = op(Mnemonic::Shx, AbsoluteY, 3, 5, false, false);
+    table[0xAB] = op(Mnemonic::Lxa, Immediate, 2, 2, false, false);
 
     // 非官方 NOP（各種定址模式，含跨頁 penalty 的 read）
     table[0x1A] = op(Mnemonic::Nop, Implied, 1, 2, false, false);

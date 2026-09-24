@@ -116,3 +116,13 @@ TODO：本專案的授權條款尚未決定，由專案負責人（課程學生�
   fallback 清單尾端 —— 拉丁字母/數字仍優先用 egui 預設字型，只有中文等
   字符才會落到這套字型。
 - 目前內嵌的是完整字重（未做字符 subset），檔案約 16MB。
+
+## Mapper 與不穩定 opcode（Phase 3）
+
+`crates/nes-core/src/cartridge/mapper.rs`（NROM / MMC1 / UxROM / CNROM）與
+`cpu/mod.rs` 的 `$9C` SHY／`$9E` SHX／`$AB` LXA 是**依 NESdev wiki 公開文件描述的硬體行為
+自行實作**（<https://www.nesdev.org/wiki/>：MMC1、UxROM、INES Mapper 003（CNROM）、
+Bus conflict、CPU unofficial opcodes 各頁），沒有複製任何教學或其他模擬器的程式碼。
+實作時**沒有逐頁重新抓取原文對照**，行為的正確性以 blargg `instr_test-v5`（含 MMC1 的
+`official_only.nes`／`all_instrs.nes`）、SingleStepTests 與 Rust 測試（合成 ROM）為準，
+不是以 wiki 原文為準。LXA 的 magic 常數（`$FF`）選擇依據見 `docs/architecture.md` §14.5。

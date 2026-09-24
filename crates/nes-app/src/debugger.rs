@@ -1,4 +1,4 @@
-//! Debugger 面板的分頁內容：CPU、PPU 暫存器、調色盤、OAM、pattern table、nametable。
+//! Debugger 面板的分頁內容：CPU、PPU 暫存器、調色盤、OAM、Mapper、pattern table、nametable。
 //!
 //! 這個模組只負責「顯示」：資料來自 emu 執行緒送來的 `DebugSnapshot` 與
 //! `PpuViews`（見 `emu.rs`）。控制項（暫停／單步／trace）在 `app.rs`。
@@ -20,16 +20,18 @@ pub enum Tab {
     Ppu,
     Palette,
     Oam,
+    Mapper,
     Patterns,
     Nametables,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 6] = [
+    const ALL: [(Tab, &'static str); 7] = [
         (Tab::Cpu, "CPU"),
         (Tab::Ppu, "PPU"),
         (Tab::Palette, "調色盤"),
         (Tab::Oam, "OAM"),
+        (Tab::Mapper, "Mapper"),
         (Tab::Patterns, "Pattern"),
         (Tab::Nametables, "Nametable"),
     ];
@@ -110,6 +112,7 @@ impl DebuggerUi {
             Tab::Ppu => ppu_tab(ui, snap),
             Tab::Palette => palette_tab(ui, snap),
             Tab::Oam => oam_tab(ui, snap),
+            Tab::Mapper => mapper_tab(ui, snap),
             Tab::Patterns => self.patterns_tab(ui),
             Tab::Nametables => self.nametables_tab(ui),
         });
@@ -288,6 +291,20 @@ fn palette_tab(ui: &mut egui::Ui, snap: &DebugSnapshot) {
             ui.monospace(raw.join(" "));
         });
     }
+}
+
+/// Mapper 分頁：mapper 種類、bank 暫存器的原始內容，以及它們目前造成的實際 bank 對應。
+/// 手動測試 MMC1 / UxROM / CNROM 遊戲時，用它確認 bank 有沒有照預期切換。
+fn mapper_tab(ui: &mut egui::Ui, snap: &DebugSnapshot) {
+    ui.strong(format!("{}（mapper {}）", snap.mapper_name, snap.mapper_id));
+    ui.separator();
+    egui::Grid::new("mapper").striped(true).show(ui, |ui| {
+        for (name, value) in &snap.mapper_regs {
+            ui.label(name);
+            ui.monospace(value);
+            ui.end_row();
+        }
+    });
 }
 
 fn oam_tab(ui: &mut egui::Ui, snap: &DebugSnapshot) {

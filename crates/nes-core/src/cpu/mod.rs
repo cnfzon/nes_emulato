@@ -48,6 +48,9 @@ pub const IRQ_VECTOR: u16 = 0xFFFE;
 /// 呼叫端（`run_frame`）知道 CPU 卡住了（`DebugSnapshot::jammed`）。
 const JAM_CYCLES: u8 = 2;
 
+/// LXA（`$AB`）的 magic 常數；見 `Mnemonic::Lxa` 的實作註解。
+const LXA_MAGIC: u8 = 0xFF;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     pub a: u8,
@@ -128,6 +131,14 @@ impl Cpu {
     /// 回傳 7），這一步不執行任何指令。指令若寫了 `$4014`，OAM DMA 的暫停
     /// cycle 會在指令結束後追加（讓 PPU 追上），但**不**計入回傳值——回傳值
     /// 只是指令本身的 cycle 數。
+    ///
+    /// # 分段 catch-up（時序模型，定案；見 `docs/architecture.md` §13）
+    ///
+    /// 一條 N cycles 的指令，記憶體存取（讀寫 PPU 暫存器等）發生在最後一個 cycle
+    /// 附近。所以：解出運算元之後、執行指令**之前**，先讓 PPU 追上 `N − 1` 個 cycle；
+    /// 指令執行完再補最後 1 個 cycle（加上分支 taken／跨頁的額外 cycle）。這讓
+    /// 指令內的 PPU 存取與 PPU 的時間差縮到約 1 個 CPU cycle（3 dot）。改變這個
+    /// 切法會改變所有模擬結果，必須遞增 `CORE_BEHAVIOR_VERSION`。
     pub fn step(&mut self) -> u8 {
         if self.jammed {
             self.bus.tick(JAM_CYCLES);
@@ -143,83 +154,110 @@ impl Cpu {
         self.pc = self.pc.wrapping_add(1);
 
         let info = &OPCODES[opcode as usize];
-        let (addr, page_crossed) = self.resolve_operand(info.mode);
-
-        let extra = self.execute(opcode, info, addr);
+        let (addr, page_crossed, uncorrected) = self.resolve_operand(info.mode);
 
         let mut cycles = info.cycles;
         if info.page_cross_penalty && page_crossed {
             cycles += 1;
         }
-        cycles += extra;
 
-        self.bus.tick(cycles);
+        // 索引定址的 dummy read：硬體在位址高位元組修正之前，會先讀一次「低位元組已
+        // 加上索引、高位元組尚未進位」的位址。讀取類指令只有跨頁時才有（沒跨頁時
+        // 那次就是真正的讀取）；store 與 RMW 指令一律有。這次讀取有副作用
+        // （例如對 `$2007` 會推進位址與讀取緩衝），所以要真的做。
+        let dummy_read = uncorrected.filter(|_| page_crossed || !info.page_cross_penalty);
+
+        // 指令前先追 `cycles − 1`（每條指令至少 2 cycles），指令後再補最後 1 個
+        // cycle 與分支的額外 cycle（分支不碰 PPU，所以額外 cycle 放在後段無妨）。
+        let lead = cycles.saturating_sub(1);
+        if let Some(dummy) = dummy_read {
+            // dummy read 比真正的存取早 1 個 cycle。
+            self.bus.tick(lead.saturating_sub(1));
+            let _ = self.bus.read(dummy);
+            self.bus.tick(lead - lead.saturating_sub(1));
+        } else {
+            self.bus.tick(lead);
+        }
+
+        let extra = self.execute(opcode, info, addr);
+
+        self.bus.tick(cycles - lead + extra);
         self.bus.run_pending_oam_dma();
-        cycles
+        cycles + extra
     }
 
     // ---- 定址模式解析 --------------------------------------------------
 
     /// 依定址模式讀取 0~2 個 operand byte、把 PC 推進對應長度，回傳
-    /// `(有效位址, 是否跨頁)`。`Implied`/`Accumulator` 沒有位址概念，回傳
-    /// `(0, false)`，呼叫端（`execute`）看 `mode` 決定要不要理它。
-    fn resolve_operand(&mut self, mode: AddrMode) -> (u16, bool) {
+    /// `(有效位址, 是否跨頁, 未修正位址)`。未修正位址只有 abs,X / abs,Y / (ind),Y
+    /// 才有：低位元組已加上索引、高位元組還是基底的那個位址（dummy read 讀的位置）。
+    /// `Implied`/`Accumulator` 沒有位址概念，回傳 `(0, false, None)`，呼叫端
+    /// （`execute`）看 `mode` 決定要不要理它。
+    fn resolve_operand(&mut self, mode: AddrMode) -> (u16, bool, Option<u16>) {
         match mode {
-            AddrMode::Implied | AddrMode::Accumulator => (0, false),
+            AddrMode::Implied | AddrMode::Accumulator => (0, false, None),
             AddrMode::Immediate => {
                 let addr = self.pc;
                 self.pc = self.pc.wrapping_add(1);
-                (addr, false)
+                (addr, false, None)
             }
             AddrMode::ZeroPage => {
                 let addr = self.bus.read(self.pc) as u16;
                 self.pc = self.pc.wrapping_add(1);
-                (addr, false)
+                (addr, false, None)
             }
             AddrMode::ZeroPageX => {
                 let base = self.bus.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
-                ((base.wrapping_add(self.x)) as u16, false)
+                ((base.wrapping_add(self.x)) as u16, false, None)
             }
             AddrMode::ZeroPageY => {
                 let base = self.bus.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
-                ((base.wrapping_add(self.y)) as u16, false)
+                ((base.wrapping_add(self.y)) as u16, false, None)
             }
-            AddrMode::Absolute => (self.read_u16_operand(), false),
+            AddrMode::Absolute => (self.read_u16_operand(), false, None),
             AddrMode::AbsoluteX => {
                 let base = self.read_u16_operand();
                 let addr = base.wrapping_add(self.x as u16);
-                (addr, page_crossed(base, addr))
+                (
+                    addr,
+                    page_crossed(base, addr),
+                    Some(uncorrected(base, addr)),
+                )
             }
             AddrMode::AbsoluteY => {
                 let base = self.read_u16_operand();
                 let addr = base.wrapping_add(self.y as u16);
-                (addr, page_crossed(base, addr))
+                (
+                    addr,
+                    page_crossed(base, addr),
+                    Some(uncorrected(base, addr)),
+                )
             }
             AddrMode::Indirect => {
                 let ptr = self.read_u16_operand();
-                (self.read_u16_bugged(ptr), false)
+                (self.read_u16_bugged(ptr), false, None)
             }
             AddrMode::IndirectX => {
                 let base = self.bus.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
                 let ptr = base.wrapping_add(self.x);
                 let addr = self.read_u16_zp(ptr);
-                (addr, false)
+                (addr, false, None)
             }
             AddrMode::IndirectY => {
                 let base = self.bus.read(self.pc);
                 self.pc = self.pc.wrapping_add(1);
                 let ptr = self.read_u16_zp(base);
                 let addr = ptr.wrapping_add(self.y as u16);
-                (addr, page_crossed(ptr, addr))
+                (addr, page_crossed(ptr, addr), Some(uncorrected(ptr, addr)))
             }
             AddrMode::Relative => {
                 let offset = self.bus.read(self.pc) as i8;
                 self.pc = self.pc.wrapping_add(1);
                 let addr = self.pc.wrapping_add(offset as i16 as u16);
-                (addr, false)
+                (addr, false, None)
             }
         }
     }
@@ -502,14 +540,16 @@ impl Cpu {
                 0
             }
             Mnemonic::Inc => {
-                let v = self.bus.read(addr).wrapping_add(1);
-                self.bus.write(addr, v);
+                let old = self.bus.read(addr);
+                let v = old.wrapping_add(1);
+                self.bus.write_rmw(addr, old, v);
                 self.status.set_zero_negative(v);
                 0
             }
             Mnemonic::Dec => {
-                let v = self.bus.read(addr).wrapping_sub(1);
-                self.bus.write(addr, v);
+                let old = self.bus.read(addr);
+                let v = old.wrapping_sub(1);
+                self.bus.write_rmw(addr, old, v);
                 self.status.set_zero_negative(v);
                 0
             }
@@ -540,7 +580,7 @@ impl Cpu {
                 } else {
                     let old = self.bus.read(addr);
                     let v = self.asl_value(old);
-                    self.bus.write(addr, v);
+                    self.bus.write_rmw(addr, old, v);
                 }
                 0
             }
@@ -551,7 +591,7 @@ impl Cpu {
                 } else {
                     let old = self.bus.read(addr);
                     let v = self.lsr_value(old);
-                    self.bus.write(addr, v);
+                    self.bus.write_rmw(addr, old, v);
                 }
                 0
             }
@@ -562,7 +602,7 @@ impl Cpu {
                 } else {
                     let old = self.bus.read(addr);
                     let v = self.rol_value(old);
-                    self.bus.write(addr, v);
+                    self.bus.write_rmw(addr, old, v);
                 }
                 0
             }
@@ -573,7 +613,7 @@ impl Cpu {
                 } else {
                     let old = self.bus.read(addr);
                     let v = self.ror_value(old);
-                    self.bus.write(addr, v);
+                    self.bus.write_rmw(addr, old, v);
                 }
                 0
             }
@@ -666,21 +706,23 @@ impl Cpu {
                 0
             }
             Mnemonic::Dcp => {
-                let v = self.bus.read(addr).wrapping_sub(1);
-                self.bus.write(addr, v);
+                let old = self.bus.read(addr);
+                let v = old.wrapping_sub(1);
+                self.bus.write_rmw(addr, old, v);
                 self.compare(self.a, v);
                 0
             }
             Mnemonic::Isb => {
-                let v = self.bus.read(addr).wrapping_add(1);
-                self.bus.write(addr, v);
+                let old = self.bus.read(addr);
+                let v = old.wrapping_add(1);
+                self.bus.write_rmw(addr, old, v);
                 self.adc(v ^ 0xFF);
                 0
             }
             Mnemonic::Slo => {
                 let old = self.bus.read(addr);
                 let v = self.asl_value(old);
-                self.bus.write(addr, v);
+                self.bus.write_rmw(addr, old, v);
                 self.a |= v;
                 self.status.set_zero_negative(self.a);
                 0
@@ -688,7 +730,7 @@ impl Cpu {
             Mnemonic::Rla => {
                 let old = self.bus.read(addr);
                 let v = self.rol_value(old);
-                self.bus.write(addr, v);
+                self.bus.write_rmw(addr, old, v);
                 self.a &= v;
                 self.status.set_zero_negative(self.a);
                 0
@@ -696,7 +738,7 @@ impl Cpu {
             Mnemonic::Sre => {
                 let old = self.bus.read(addr);
                 let v = self.lsr_value(old);
-                self.bus.write(addr, v);
+                self.bus.write_rmw(addr, old, v);
                 self.a ^= v;
                 self.status.set_zero_negative(self.a);
                 0
@@ -704,7 +746,7 @@ impl Cpu {
             Mnemonic::Rra => {
                 let old = self.bus.read(addr);
                 let v = self.ror_value(old);
-                self.bus.write(addr, v);
+                self.bus.write_rmw(addr, old, v);
                 self.adc(v);
                 0
             }
@@ -738,11 +780,46 @@ impl Cpu {
                 self.status.set_zero_negative(self.x);
                 0
             }
+            Mnemonic::Shy => {
+                let base = addr.wrapping_sub(self.x as u16);
+                self.store_and_high(base, addr, self.y);
+                0
+            }
+            Mnemonic::Shx => {
+                let base = addr.wrapping_sub(self.y as u16);
+                self.store_and_high(base, addr, self.x);
+                0
+            }
+            Mnemonic::Lxa => {
+                // A = X = (A | magic) & imm。真實晶片的 magic 因批次／溫度而異
+                // （常見 $00、$EE、$FF）。本專案以 blargg instr_test 為準，取 $FF
+                // （即 A = X = imm）；SingleStepTests 的資料逐 bit 分析只符合 $EE，
+                // 與 blargg 互相衝突（用 $EE 時 03-immediate 失敗），所以 SST 對 $AB
+                // 只有約 56% 相符，見 docs/architecture.md §10。
+                let v = (self.a | LXA_MAGIC) & self.bus.read(addr);
+                self.a = v;
+                self.x = v;
+                self.status.set_zero_negative(v);
+                0
+            }
             Mnemonic::Jam => {
                 self.jammed = true;
                 0
             }
         }
+    }
+
+    /// SHY / SHX：把 `reg & (H + 1)` 寫到 `addr`，H 是「未加索引前」基底位址的高位元組。
+    /// 索引加法跨頁時，寫入位址的高位元組會被換成寫入的值（硬體上位址高位元與資料
+    /// 共用內部匯流排的副作用）。
+    fn store_and_high(&mut self, base: u16, addr: u16, reg: u8) {
+        let value = reg & ((base >> 8) as u8).wrapping_add(1);
+        let target = if page_crossed(base, addr) {
+            ((value as u16) << 8) | (addr & 0x00FF)
+        } else {
+            addr
+        };
+        self.bus.write(target, value);
     }
 
     /// 輸出跟 nestest.log 相同格式的一行 trace，例如：
@@ -887,6 +964,11 @@ impl Cpu {
             format!("{mnemonic} {operand}")
         }
     }
+}
+
+/// 索引加法的「未修正位址」：高位元組取基底的、低位元組取加上索引之後的。
+fn uncorrected(base: u16, effective: u16) -> u16 {
+    (base & 0xFF00) | (effective & 0x00FF)
 }
 
 fn page_crossed(a: u16, b: u16) -> bool {

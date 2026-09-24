@@ -131,6 +131,33 @@ const GOLDEN: &[(&str, u64, u64)] = &[
         200,
         0x189b937c05d5c7c1,
     ),
+    // ---- Phase 3 新增：新通過的項目，以及 MMC1 / CNROM 卡帶 ----
+    (
+        "instr_test-v5/rom_singles/03-immediate.nes",
+        200,
+        0xb4f1294b51d3144e,
+    ),
+    (
+        "instr_test-v5/rom_singles/07-abs_xy.nes",
+        400,
+        0xe880191be830f281,
+    ),
+    (
+        "blargg_ppu_tests_2005.09.15b/vbl_clear_time.nes",
+        120,
+        0x0de9bec08f758942,
+    ),
+    // mapper 1（MMC1）
+    ("instr_test-v5/official_only.nes", 2000, 0xd9672befbf91ef63),
+    ("instr_test-v5/all_instrs.nes", 2600, 0xd9672befbf91ef63),
+    ("scrolltest/scroll.nes", 200, 0xf012bec60dd7a3ba),
+    // mapper 3（CNROM）：Phase 3.1 加入索引定址的 dummy read 後 #35 通過，畫面從
+    // 「Failed tests: 35」變成「Passed」，所以雜湊改變（唯一一個改變的）。
+    (
+        "ppu_read_buffer/test_ppu_read_buffer.nes",
+        1300,
+        0x7b684f11f22228bf,
+    ),
 ];
 
 fn rom_root() -> PathBuf {
