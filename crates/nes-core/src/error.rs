@@ -14,6 +14,12 @@ pub enum RomError {
     #[error("偵測到 NES 2.0 格式，本階段尚未支援")]
     Nes20Unsupported,
 
+    #[error("ROM 沒有 PRG-ROM（header 宣告 0 個 PRG bank）")]
+    NoPrgRom,
+
+    #[error("four-screen（4 螢幕）nametable 卡帶尚未支援")]
+    FourScreenUnsupported,
+
     #[error("mapper {0} 尚未實作")]
     UnsupportedMapper(u8),
 

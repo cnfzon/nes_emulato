@@ -16,11 +16,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use nes_core::{Buttons, DebugSnapshot, FrameBuffer, Nes};
+use nes_core::{Buttons, DebugSnapshot, FrameBuffer, Nes, PpuViews};
 
 use crate::commands::{EmuCommand, EmuEvent};
 
 const TARGET_FPS: f64 = 60.0988;
+
+/// 執行中每隔幾幀更新一次 PPU 影像（pattern table / nametable）。它們要畫 6 張圖，
+/// 而且人眼不需要 60Hz 更新；暫停時單步／讀檔之後則會立即更新。
+const VIEWS_EVERY_N_FRAMES: u32 = 3;
 
 /// 單次 `TraceToFile` 允許的最大指令數，避免手誤輸入超大數字讓 emu 執行緒
 /// 卡在寫檔上（同步執行，期間不處理其他指令）。
@@ -39,16 +43,38 @@ fn write_trace(nes: &mut Nes, count: u32, path: &Path) -> io::Result<()> {
 
 const NOT_PAUSED_MSG: &str = "單步/trace 只能在暫停狀態下使用";
 
+/// UI 要看的除錯資料的產生開關與輸出端。
+struct DebugSinks {
+    /// Debugger 面板是否開著——只在開著時才產生/傳送 `DebugSnapshot`（見
+    /// `EmuCommand::SetDebugEnabled` 的文件說明理由）。
+    enabled: bool,
+    snapshot: triple_buffer::Input<Option<DebugSnapshot>>,
+    /// PPU 影像的 pattern table 調色盤選擇；`None` = 不產生。
+    views_palette: Option<u8>,
+    views: triple_buffer::Input<Option<PpuViews>>,
+    /// 距離上次產生 PPU 影像過了幾幀（只在執行中使用）。
+    frames_since_views: u32,
+}
+
+impl DebugSinks {
+    fn publish_views(&mut self, nes: &Nes) {
+        if let Some(palette) = self.views_palette {
+            self.views.write(Some(nes.debug_ppu_views(palette)));
+            self.frames_since_views = 0;
+        }
+    }
+}
+
 /// 把目前狀態發布給 UI：Debugger 面板開著時寫入 `DebugSnapshot`，並且不論
-/// 面板開不開都送出最新幀數（狀態列用）。
-fn publish_state(
-    nes: &Nes,
-    debug_enabled: bool,
-    debug_input: &mut triple_buffer::Input<Option<DebugSnapshot>>,
-    event_tx: &Sender<EmuEvent>,
-) {
-    if debug_enabled {
-        debug_input.write(Some(nes.debug_snapshot()));
+/// 面板開不開都送出最新幀數（狀態列用）。`immediate` 為 `true`（單步、讀檔等）
+/// 時 PPU 影像立即更新，否則依 [`VIEWS_EVERY_N_FRAMES`] 降頻。
+fn publish_state(nes: &Nes, sinks: &mut DebugSinks, event_tx: &Sender<EmuEvent>, immediate: bool) {
+    if sinks.enabled {
+        sinks.snapshot.write(Some(nes.debug_snapshot()));
+    }
+    sinks.frames_since_views += 1;
+    if immediate || sinks.frames_since_views >= VIEWS_EVERY_N_FRAMES {
+        sinks.publish_views(nes);
     }
     let _ = event_tx.send(EmuEvent::FrameAdvanced(nes.frame_count()));
 }
@@ -57,7 +83,8 @@ pub fn run(
     cmd_rx: Receiver<EmuCommand>,
     event_tx: Sender<EmuEvent>,
     mut frame_input: triple_buffer::Input<FrameBuffer>,
-    mut debug_input: triple_buffer::Input<Option<DebugSnapshot>>,
+    debug_input: triple_buffer::Input<Option<DebugSnapshot>>,
+    views_input: triple_buffer::Input<Option<PpuViews>>,
 ) {
     let frame_duration = Duration::from_secs_f64(1.0 / TARGET_FPS);
 
@@ -65,9 +92,13 @@ pub fn run(
     let mut current_input = [Buttons::empty(); 2];
     let mut paused = false;
     let mut saved_state: Option<Vec<u8>> = None;
-    // Debugger 面板是否開著——只在開著時才產生/傳送 `DebugSnapshot`（見
-    // `EmuCommand::SetDebugEnabled` 的文件說明理由）。
-    let mut debug_enabled = false;
+    let mut sinks = DebugSinks {
+        enabled: false,
+        snapshot: debug_input,
+        views_palette: None,
+        views: views_input,
+        frames_since_views: 0,
+    };
 
     let mut accumulator = Duration::ZERO;
     let mut last_tick = Instant::now();
@@ -102,11 +133,18 @@ pub fn run(
                 EmuCommand::Pause => paused = true,
                 EmuCommand::Resume => paused = false,
                 EmuCommand::SetDebugEnabled(enabled) => {
-                    debug_enabled = enabled;
+                    sinks.enabled = enabled;
                     // 剛打開面板時立刻送一份目前狀態，不必等到下一幀
                     // 才有資料（尤其是暫停中時，run_frame 不會再被呼叫）。
-                    if debug_enabled && let Some(n) = &nes {
-                        debug_input.write(Some(n.debug_snapshot()));
+                    if enabled && let Some(n) = &nes {
+                        sinks.snapshot.write(Some(n.debug_snapshot()));
+                    }
+                }
+                EmuCommand::SetDebugViews(palette) => {
+                    sinks.views_palette = palette;
+                    // 同上：立刻產生一次，不必等 N 幀（暫停中也才看得到）。
+                    if let Some(n) = &nes {
+                        sinks.publish_views(n);
                     }
                 }
                 EmuCommand::SaveState => {
@@ -129,6 +167,8 @@ pub fn run(
                         let _ = event_tx.send(EmuEvent::Error(NOT_PAUSED_MSG.to_string()));
                     } else if let Some(n) = &mut nes {
                         n.step_instruction();
+                        // 顯示「畫到一半」的畫面，可以看到掃描線逐步畫出來。
+                        frame_input.write(n.frame_buffer().clone());
                         state_changed = true;
                     }
                 }
@@ -160,7 +200,7 @@ pub fn run(
         }
 
         if state_changed && let Some(n) = &nes {
-            publish_state(n, debug_enabled, &mut debug_input, &event_tx);
+            publish_state(n, &mut sinks, &event_tx, true);
         }
 
         let now = Instant::now();
@@ -173,7 +213,7 @@ pub fn run(
                 let fb = n.run_frame(current_input).clone();
                 frame_input.write(fb);
                 fps_window_frames += 1;
-                publish_state(n, debug_enabled, &mut debug_input, &event_tx);
+                publish_state(n, &mut sinks, &event_tx, false);
             }
         }
 
@@ -222,8 +262,10 @@ mod tests {
         let (frame_input, _frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
         let (debug_input, mut debug_output) =
             triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
+        let (views_input, _views_output) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
 
-        let handle = thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input));
+        let handle =
+            thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
 
         cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
         match event_rx.recv_timeout(Duration::from_secs(2)) {
@@ -261,6 +303,7 @@ mod tests {
         cmd_tx: Sender<EmuCommand>,
         event_rx: Receiver<EmuEvent>,
         debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
+        views_output: triple_buffer::Output<Option<PpuViews>>,
         handle: thread::JoinHandle<()>,
     }
 
@@ -271,7 +314,10 @@ mod tests {
             let (frame_input, _frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
             let (debug_input, debug_output) =
                 triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
-            let handle = thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input));
+            let (views_input, views_output) =
+                triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
+            let handle =
+                thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
 
             cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
             cmd_tx.send(EmuCommand::Pause).unwrap();
@@ -280,6 +326,7 @@ mod tests {
                 cmd_tx,
                 event_rx,
                 debug_output,
+                views_output,
                 handle,
             };
             h.settle();
@@ -353,7 +400,9 @@ mod tests {
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<EmuEvent>();
         let (frame_input, _f) = triple_buffer::triple_buffer(&FrameBuffer::blank());
         let (debug_input, _d) = triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
-        let handle = thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input));
+        let (views_input, _v) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
+        let handle =
+            thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
 
         cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
         cmd_tx.send(EmuCommand::StepInstruction).unwrap();
@@ -399,6 +448,43 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, EmuEvent::TraceWritten { lines: 25, .. }))
         );
+        h.quit();
+    }
+
+    /// PPU 影像預設不產生（面板/分頁沒開時零成本）；`SetDebugViews(Some)` 之後
+    /// 立即產生一份，`None` 之後不再更新。
+    #[test]
+    fn ppu_views_are_only_produced_while_requested() {
+        let mut h = Harness::start_paused();
+        assert!(h.views_output.read().is_none(), "沒要求就不該產生");
+
+        h.cmd_tx.send(EmuCommand::SetDebugViews(Some(2))).unwrap();
+        h.settle();
+        let views = h.views_output.read().clone().expect("要求後應立即產生");
+        assert_eq!(views.pattern_tables[0].width, 128);
+        assert_eq!(views.nametables[3].height, 240);
+
+        // 關掉之後，單步不會再更新影像。
+        h.cmd_tx.send(EmuCommand::SetDebugViews(None)).unwrap();
+        h.settle();
+        h.views_output.read(); // 清掉「有新資料」狀態
+        h.cmd_tx.send(EmuCommand::StepFrame).unwrap();
+        h.settle();
+        assert!(!h.views_output.update(), "關閉後不該有新影像");
+        h.quit();
+    }
+
+    /// 暫停中單步一幀時，PPU 影像跟著立即更新（不必等降頻的 N 幀）。
+    #[test]
+    fn ppu_views_update_immediately_when_stepping_while_paused() {
+        let mut h = Harness::start_paused();
+        h.cmd_tx.send(EmuCommand::SetDebugViews(Some(0))).unwrap();
+        h.settle();
+        h.views_output.read();
+
+        h.cmd_tx.send(EmuCommand::StepInstruction).unwrap();
+        h.settle();
+        assert!(h.views_output.update(), "單步之後應立即有新影像");
         h.quit();
     }
 }

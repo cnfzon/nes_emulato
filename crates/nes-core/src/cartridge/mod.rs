@@ -79,6 +79,15 @@ impl Cartridge {
         self.mapper.read_prg(&self.prg_rom, addr)
     }
 
+    /// 寫入 PPU 位址空間 `$0000..=$1FFF`。只有 CHR-RAM 卡帶可寫；CHR-ROM 的
+    /// 寫入被忽略（硬體上沒有效果）。
+    pub fn write_chr(&mut self, addr: u16, value: u8) {
+        if self.chr_rom.is_empty() && !self.chr_ram.is_empty() {
+            let len = self.chr_ram.len();
+            self.chr_ram[addr as usize % len] = value;
+        }
+    }
+
     /// 讀取 PPU 位址空間 `$0000..=$1FFF`（pattern table）範圍內的一個 byte。
     pub fn read_chr(&self, addr: u16) -> u8 {
         if self.chr_rom.is_empty() {

@@ -123,10 +123,20 @@ impl Cpu {
     }
 
     /// 執行一條指令，回傳實際花掉的 cycle 數，並呼叫 `bus.tick`。
+    ///
+    /// 指令之間會先檢查 PPU 的 NMI：有待處理的 NMI 就改為服務中斷（7 cycles，
+    /// 回傳 7），這一步不執行任何指令。指令若寫了 `$4014`，OAM DMA 的暫停
+    /// cycle 會在指令結束後追加（讓 PPU 追上），但**不**計入回傳值——回傳值
+    /// 只是指令本身的 cycle 數。
     pub fn step(&mut self) -> u8 {
         if self.jammed {
             self.bus.tick(JAM_CYCLES);
             return JAM_CYCLES;
+        }
+
+        if self.bus.take_nmi() {
+            self.nmi();
+            return 7;
         }
 
         let opcode = self.bus.read(self.pc);
@@ -144,6 +154,7 @@ impl Cpu {
         cycles += extra;
 
         self.bus.tick(cycles);
+        self.bus.run_pending_oam_dma();
         cycles
     }
 

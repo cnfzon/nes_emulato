@@ -1,7 +1,7 @@
 //! 畫面緩衝區：256x240 RGBA8。
 //!
-//! Phase 0 還沒有真的 PPU 渲染器，所以 [`FrameBuffer::render_test_pattern`]
-//! 產生一張「可辨識的測試畫面」：依 `frame_count` 捲動的漸層，加上一塊會隨
+//! 真正的畫面由 PPU 渲染器（`ppu/render.rs`）直接寫進這個緩衝區；
+//! [`FrameBuffer::render_test_pattern`] 是 Phase 0 遺留的「可辨識的測試畫面」：依 `frame_count` 捲動的漸層，加上一塊會隨
 //! 玩家輸入變色的色塊。這張畫面完全是 `(frame_count, input)` 的函式，藉此
 //! 驗證「執行緒 → 輸入 → 畫面」這條管線在 GUI 端是通的，且不破壞決定性。
 
@@ -35,16 +35,28 @@ impl FrameBuffer {
         &self.pixels
     }
 
+    /// 畫面內容的 xxh3-64 雜湊。給黃金畫面（golden frame）回歸測試用：只存雜湊，
+    /// 不存圖片。
+    pub fn hash64(&self) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(&self.pixels)
+    }
+
+    /// 第 `y` 列的 RGBA 位元組（長度 `WIDTH * 4`）。給 PPU 渲染器整列寫入用。
+    pub(crate) fn row_mut(&mut self, y: usize) -> &mut [u8] {
+        &mut self.pixels[y * WIDTH * 4..(y + 1) * WIDTH * 4]
+    }
+
     fn set_pixel(&mut self, x: usize, y: usize, rgba: [u8; 4]) {
         let i = (y * WIDTH + x) * 4;
         self.pixels[i..i + 4].copy_from_slice(&rgba);
     }
 
-    /// Phase 0 佔位畫面產生器，未來會被真正的 PPU 掃描線渲染取代。
+    /// Phase 0 佔位畫面產生器。PPU 渲染器（Phase 2）已取代它在 `Nes::run_frame`
+    /// 中的角色，保留它作為「尚未載入 ROM」等情境的測試畫面與管線診斷用。
     ///
     /// 畫面內容只由 `frame_count` 與 `input` 決定，不讀取任何其他狀態，
     /// 因此兩個吃到相同輸入序列的 `Nes` 實例永遠會畫出一模一樣的畫面。
-    pub(crate) fn render_test_pattern(&mut self, frame_count: u64, input: [Buttons; 2]) {
+    pub fn render_test_pattern(&mut self, frame_count: u64, input: [Buttons; 2]) {
         let shift = (frame_count % WIDTH as u64) as usize;
         for y in 0..HEIGHT {
             for x in 0..WIDTH {

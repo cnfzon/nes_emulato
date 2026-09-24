@@ -6,12 +6,13 @@
 //!   固定步進推進模擬。
 //!
 //! 兩條執行緒間：`crossbeam-channel` 傳指令/事件（`commands.rs`），
-//! `triple_buffer` 傳最新畫面（不需要鎖，UI 執行緒讀取時不會擋到 emu 執行緒
-//! 寫入下一幀）。
+//! `triple_buffer` 傳最新畫面、Debug 快照與 PPU 影像（不需要鎖，UI 執行緒讀取時
+//! 不會擋到 emu 執行緒寫入下一幀）。
 
 mod app;
 mod audio;
 mod commands;
+mod debugger;
 mod emu;
 
 use std::thread;
@@ -19,7 +20,7 @@ use std::thread;
 use app::NesApp;
 use commands::EmuCommand;
 use eframe::egui;
-use nes_core::{DebugSnapshot, FrameBuffer};
+use nes_core::{DebugSnapshot, FrameBuffer, PpuViews};
 
 /// Noto Sans CJK TC（OFL-1.1，見 `assets/fonts/OFL.txt`），作為中文字元的
 /// fallback 字型，避免選單/Debugger 面板的中文顯示成方框。
@@ -51,10 +52,11 @@ fn main() -> eframe::Result {
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<commands::EmuEvent>();
     let (frame_input, frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
     let (debug_input, debug_output) = triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
+    let (views_input, views_output) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
 
     let emu_handle = thread::Builder::new()
         .name("nes-emu".to_string())
-        .spawn(move || emu::run(cmd_rx, event_tx, frame_input, debug_input))
+        .spawn(move || emu::run(cmd_rx, event_tx, frame_input, debug_input, views_input))
         .expect("failed to spawn emu thread");
 
     let native_options = eframe::NativeOptions {
@@ -74,6 +76,7 @@ fn main() -> eframe::Result {
                 event_rx,
                 frame_output,
                 debug_output,
+                views_output,
                 emu_handle,
             )))
         }),

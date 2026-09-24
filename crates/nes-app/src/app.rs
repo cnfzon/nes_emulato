@@ -7,9 +7,10 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
-use nes_core::{Buttons, DebugSnapshot, RomInfo};
+use nes_core::{Buttons, DebugSnapshot, PpuViews, RomInfo};
 
 use crate::commands::{EmuCommand, EmuEvent};
+use crate::debugger::DebuggerUi;
 
 pub struct NesApp {
     cmd_tx: Sender<EmuCommand>,
@@ -17,6 +18,7 @@ pub struct NesApp {
     frame_output: triple_buffer::Output<nes_core::FrameBuffer>,
     debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
     emu_handle: Option<JoinHandle<()>>,
+    debugger: DebuggerUi,
 
     texture: Option<egui::TextureHandle>,
     rom_info: Option<RomInfo>,
@@ -38,6 +40,7 @@ impl NesApp {
         event_rx: Receiver<EmuEvent>,
         frame_output: triple_buffer::Output<nes_core::FrameBuffer>,
         debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
+        views_output: triple_buffer::Output<Option<PpuViews>>,
         emu_handle: JoinHandle<()>,
     ) -> Self {
         Self {
@@ -46,6 +49,7 @@ impl NesApp {
             frame_output,
             debug_output,
             emu_handle: Some(emu_handle),
+            debugger: DebuggerUi::new(views_output),
             texture: None,
             rom_info: None,
             show_debugger: false,
@@ -209,6 +213,8 @@ impl eframe::App for NesApp {
         } else {
             None
         };
+        self.debugger
+            .sync_views(&ctx, self.show_debugger, &self.cmd_tx);
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -289,40 +295,14 @@ impl eframe::App for NesApp {
         });
 
         if self.show_debugger {
-            egui::Panel::right("debugger").show(ui, |ui| {
-                ui.heading("Debugger");
-                self.debugger_controls(ui);
-                ui.separator();
-                match &snapshot {
-                    Some(snap) => {
-                        ui.label(format!("PC: {:#06X}", snap.cpu_pc));
-                        ui.label(format!(
-                            "A: {:#04X}  X: {:#04X}  Y: {:#04X}",
-                            snap.cpu_a, snap.cpu_x, snap.cpu_y
-                        ));
-                        ui.label(format!(
-                            "SP: {:#04X}  Status: {:#04X}",
-                            snap.cpu_sp, snap.cpu_status
-                        ));
-                        ui.label(format!("CPU cycles: {}", snap.cpu_cycles));
-                        ui.label(format!("下一條指令: {}", snap.cpu_disassembly));
-                        if snap.cpu_jammed {
-                            ui.colored_label(egui::Color32::RED, "CPU JAMMED");
-                        }
-                        ui.separator();
-                        ui.label(format!(
-                            "PPU scanline: {}  cycle: {}",
-                            snap.ppu_scanline, snap.ppu_cycle
-                        ));
-                        ui.label(format!("PPU frame: {}", snap.ppu_frame));
-                        ui.separator();
-                        ui.label(format!("APU frame counter: {}", snap.apu_frame_counter));
-                    }
-                    None => {
-                        ui.label("尚未取得資料");
-                    }
-                }
-            });
+            egui::Panel::right("debugger")
+                .default_size(360.0)
+                .show(ui, |ui| {
+                    ui.heading("Debugger");
+                    self.debugger_controls(ui);
+                    ui.separator();
+                    self.debugger.show(ui, snapshot.as_ref());
+                });
         }
 
         egui::CentralPanel::default().show(ui, |ui| {

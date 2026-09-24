@@ -19,11 +19,14 @@ pub mod frame;
 pub mod joypad;
 pub mod ppu;
 pub mod state;
+/// 測試用的迷你組譯器與合成 ROM（`cargo test` 或 `testing` feature 才編譯）。
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
 
 pub use bus::Bus;
 pub use cartridge::{Cartridge, Mapper, Mirroring, RomInfo};
 pub use cpu::{Cpu, StatusFlags};
-pub use debug::DebugSnapshot;
+pub use debug::{DebugSnapshot, PpuImage, PpuViews};
 pub use error::{RomError, StateError};
 pub use frame::FrameBuffer;
 pub use joypad::{Buttons, Joypad};
@@ -37,53 +40,66 @@ pub use joypad::{Buttons, Joypad};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Nes {
     cpu: Cpu,
-    frame_buffer: FrameBuffer,
+    /// 已完成的 `run_frame` 次數（跟 `Ppu::frame` 不同：單步除錯時 PPU 可能
+    /// 自己跨過 vblank，但那不算一次 `run_frame`）。
     frame_count: u64,
 }
 
 impl Nes {
     /// 從一份 iNES ROM 檔案的原始位元組建立一台新的 NES。
+    ///
+    /// four-screen（4 螢幕 nametable）卡帶需要額外的 2KB VRAM，目前不支援，
+    /// 回傳 [`RomError::FourScreenUnsupported`]。
     pub fn from_rom(rom: &[u8]) -> Result<Self, RomError> {
         let cartridge = Cartridge::from_ines(rom)?;
+        if cartridge.info.mirroring == Mirroring::FourScreen {
+            return Err(RomError::FourScreenUnsupported);
+        }
         let bus = Bus::new(cartridge);
         let mut cpu = Cpu::new(bus);
         cpu.reset();
         Ok(Self {
             cpu,
-            frame_buffer: FrameBuffer::blank(),
             frame_count: 0,
         })
     }
 
-    /// NTSC 下一幀（1/60.0988 秒）大約對應的 CPU cycle 數
-    /// （`21_477_272.7 Hz 主時脈 / 12 / 60.0988 Hz ≈ 29780.5`，取整數 29781）。
-    const CPU_CYCLES_PER_FRAME: u64 = 29781;
+    /// 按下 reset 鍵：CPU 重置（PC 取自 reset vector）、PPU 清掉 PPUCTRL /
+    /// PPUMASK 等暫存器。RAM、VRAM、OAM、卡帶內容維持不變。
+    pub fn reset(&mut self) {
+        self.cpu.bus_mut().ppu.reset();
+        self.cpu.reset();
+    }
 
     /// 推進一幀模擬，回傳這一幀畫好的畫面。
+    ///
+    /// 一幀的邊界是「PPU 完成一幀」（進入 vblank：scanline 241、dot 1，此時
+    /// 240 條可見掃描線都已畫完），不是固定的 CPU cycle 預算。因為 CPU 是
+    /// instruction-level，PPU 可能越過邊界最多一條指令（最壞 8 cycles ＝ 24
+    /// dot；OAM DMA 則是 513/514 cycles）才被發現——越過的部分只是 vblank，
+    /// 不會影響畫面。
+    ///
+    /// **輸入在這一幀開始時鎖定**：整幀期間搖桿讀到的按鍵狀態不變。
     ///
     /// 由外部（GUI / netplay 迴圈）每幀呼叫一次並傳入雙人輸入，而不是靠
     /// `Nes` 自己起執行緒或呼叫 callback —— 這樣 rollback 才能在任意一幀
     /// 暫停、讀檔、用不同輸入重跑，行為完全可預期。
     ///
-    /// 因為 CPU 是 instruction-level 精度（見 `cpu` 模組文件），無法精準停在
-    /// 剛好 `CPU_CYCLES_PER_FRAME` 那個 cycle：這裡的作法是「跑到累積 cycle
-    /// 數達到或超過預算為止」，最多多跑一條指令的 cycle 數（最壞情況 8
-    /// cycles，相對一整幀 29781 cycles 是可忽略的誤差）。PPU 還沒實作
-    /// （Phase 2），畫面仍然使用 `render_test_pattern` 佔位。
+    /// 這個方法在任何 ROM 內容下都不會 panic：所有記憶體存取都在硬體位址空間
+    /// 內取模，CPU 卡死（JAM）時仍會每步推進 2 cycles，所以 PPU 一定會走完一幀。
     pub fn run_frame(&mut self, input: [Buttons; 2]) -> &FrameBuffer {
-        self.cpu.bus_mut().joypads[0].state = input[0];
-        self.cpu.bus_mut().joypads[1].state = input[1];
+        let bus = self.cpu.bus_mut();
+        bus.joypads[0].state = input[0];
+        bus.joypads[1].state = input[1];
+        // 單步除錯可能已經讓 PPU 越過 vblank 起點；這裡重新開始計一幀。
+        bus.ppu.clear_frame_done();
 
-        let target = self.cpu.bus().total_cycles() + Self::CPU_CYCLES_PER_FRAME;
-        while self.cpu.bus().total_cycles() < target {
+        while !self.cpu.bus_mut().ppu.take_frame_done() {
             self.cpu.step();
         }
 
         self.frame_count += 1;
-        self.frame_buffer
-            .render_test_pattern(self.frame_count, input);
-
-        &self.frame_buffer
+        self.cpu.bus().ppu.frame_buffer()
     }
 
     /// 把自從上次呼叫以來累積的音訊取樣附加到 `out`。
@@ -142,10 +158,7 @@ impl Nes {
         if bus.ram.len() != 0x0800 {
             return Err(StateError::Corrupt);
         }
-        if bus.ppu.vram.len() != 2048 {
-            return Err(StateError::Corrupt);
-        }
-        if bus.ppu.oam.len() != 256 {
+        if !bus.ppu.is_structurally_valid() {
             return Err(StateError::Corrupt);
         }
 
@@ -186,8 +199,36 @@ impl Nes {
             ppu_scanline: bus.ppu.scanline,
             ppu_cycle: bus.ppu.cycle,
             ppu_frame: bus.ppu.frame,
+            ppu_ctrl: bus.ppu.ctrl,
+            ppu_mask: bus.ppu.mask,
+            ppu_status: bus.ppu.status,
+            ppu_oam_addr: bus.ppu.oam_addr,
+            ppu_v: bus.ppu.v,
+            ppu_t: bus.ppu.t,
+            ppu_fine_x: bus.ppu.fine_x,
+            ppu_w: bus.ppu.w,
+            palette_ram: bus.ppu.palette,
+            oam: bus.ppu.oam.clone(),
             apu_frame_counter: bus.apu.frame_counter,
         }
+    }
+
+    /// 目前的畫面緩衝（**可能只畫到一半**：單步除錯停在一幀中間時，已經走過
+    /// 的掃描線是新的，其餘還是上一幀的內容）。給 Debugger 顯示用；一般遊戲邏輯
+    /// 應該用 [`Nes::run_frame`] 的回傳值（一定是完整的一幀）。
+    pub fn frame_buffer(&self) -> &FrameBuffer {
+        self.cpu.bus().ppu.frame_buffer()
+    }
+
+    /// Debugger 用的 PPU 影像：2 張 pattern table（128×128）與 4 張 nametable
+    /// （256×240）。`palette_index`（0–7）選擇 pattern table 用的調色盤：
+    /// 0–3 背景、4–7 精靈。
+    ///
+    /// 唯讀、沒有副作用，但要畫 6 張圖，**只在 Debugger 面板開著且該分頁可見時
+    /// 才呼叫**，不得每幀計算。
+    pub fn debug_ppu_views(&self, palette_index: u8) -> PpuViews {
+        let bus = self.cpu.bus();
+        bus.ppu.build_views(&bus.cartridge, palette_index)
     }
 
     /// 目前載入的 ROM 中繼資料。
@@ -222,6 +263,14 @@ impl Nes {
     /// （例如清除 vblank 旗標），任何時候都可以呼叫。
     pub fn peek(&self, addr: u16) -> u8 {
         self.cpu.bus().peek(addr)
+    }
+
+    /// 讀 PPU 位址空間（`$0000-$3FFF`：pattern table、nametable、調色盤）的一個
+    /// byte，沒有副作用。給 Debugger 與測試工具用（例如讀出 test ROM 畫在
+    /// nametable 上的文字）。
+    pub fn peek_ppu(&self, addr: u16) -> u8 {
+        let bus = self.cpu.bus();
+        bus.ppu.read_memory(addr, &bus.cartridge)
     }
 
     /// 覆寫 PC。給 nestest 的「automation mode」用：先正常 `from_rom`
@@ -314,7 +363,10 @@ mod tests {
         }
 
         assert_eq!(a.state_hash(), b.state_hash());
-        assert_eq!(a.frame_buffer.as_bytes(), b.frame_buffer.as_bytes());
+        assert_eq!(
+            a.cpu.bus().ppu.frame_buffer().as_bytes(),
+            b.cpu.bus().ppu.frame_buffer().as_bytes()
+        );
     }
 
     /// rollback 的核心性質：在第 k 幀存檔、跑到 k+m、讀回存檔、用「相同」的
@@ -463,5 +515,390 @@ mod tests {
 
         assert_eq!(nes.peek(0x8000), 0xAA);
         assert_eq!(nes.state_hash(), nes.state_hash());
+    }
+
+    // ---- Phase 2：PPU / NMI / DMA / 搖桿 的整合測試 ------------------------
+
+    use crate::test_support::{Asm, build_nrom, rendering_rom, test_chr};
+
+    fn framebuffer_hash(nes: &Nes) -> u64 {
+        nes.cpu.bus().ppu.frame_buffer().hash64()
+    }
+
+    fn distinct_pixels(nes: &Nes) -> usize {
+        let mut colors = std::collections::BTreeSet::new();
+        for px in nes
+            .cpu
+            .bus()
+            .ppu
+            .frame_buffer()
+            .as_bytes()
+            .as_chunks::<4>()
+            .0
+        {
+            colors.insert([px[0], px[1], px[2]]);
+        }
+        colors.len()
+    }
+
+    /// 竄改存檔裡 PPU 的掃描線/dot/v 之類的欄位（超出硬體範圍）必須被拒絕，而不是
+    /// 讀進來之後在 run_frame 裡 panic。
+    #[test]
+    fn load_state_rejects_out_of_range_ppu_fields() {
+        let rom = rendering_rom();
+        let mut source = Nes::from_rom(&rom).unwrap();
+        source.run_frame([Buttons::empty(); 2]);
+
+        for tamper in [
+            (|n: &mut Nes| n.cpu.bus_mut().ppu.scanline = 500) as fn(&mut Nes),
+            |n| n.cpu.bus_mut().ppu.cycle = 9999,
+            |n| n.cpu.bus_mut().ppu.v = 0xFFFF,
+            |n| n.cpu.bus_mut().ppu.fine_x = 200,
+        ] {
+            let mut bad = source.clone();
+            tamper(&mut bad);
+            let bytes = bad.save_state();
+
+            let mut target = Nes::from_rom(&rom).unwrap();
+            assert!(matches!(
+                target.load_state(&bytes),
+                Err(StateError::Corrupt)
+            ));
+        }
+    }
+
+    #[test]
+    fn four_screen_rom_is_rejected() {
+        let mut rom = test_rom();
+        rom[6] |= 0x08;
+        assert!(matches!(
+            Nes::from_rom(&rom),
+            Err(RomError::FourScreenUnsupported)
+        ));
+    }
+
+    #[test]
+    fn rendering_rom_draws_a_real_picture_and_takes_nmis() {
+        let mut nes = Nes::from_rom(&rendering_rom()).unwrap();
+        for _ in 0..10 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        // 背景 tile（多種顏色）+ 精靈：一張真的畫面，不是單色。
+        assert!(distinct_pixels(&nes) >= 5, "畫面顏色數太少");
+        // NMI 處理常式每幀把 $00 加 1；初始化在第一幀內完成，之後每幀一次 NMI。
+        let nmis = nes.peek(0x0000);
+        assert!(
+            (8..=10).contains(&nmis),
+            "10 幀應該約 9–10 次 NMI，實際 {nmis}"
+        );
+    }
+
+    #[test]
+    fn run_frame_ends_at_the_start_of_vblank() {
+        let mut nes = Nes::from_rom(&rendering_rom()).unwrap();
+        for _ in 0..3 {
+            nes.run_frame([Buttons::empty(); 2]);
+            let ppu = &nes.cpu.bus().ppu;
+            assert_eq!(ppu.scanline, 241, "幀邊界在 vblank 起點");
+            assert!(ppu.cycle < 40, "最多越過一條指令的 dot 數");
+            assert_ne!(ppu.status & crate::ppu::STATUS_VBLANK, 0);
+        }
+    }
+
+    #[test]
+    fn rendering_is_deterministic_across_instances() {
+        let rom = rendering_rom();
+        let mut a = Nes::from_rom(&rom).unwrap();
+        let mut b = Nes::from_rom(&rom).unwrap();
+        for input in inputs_for(60) {
+            a.run_frame(input);
+            b.run_frame(input);
+            assert_eq!(framebuffer_hash(&a), framebuffer_hash(&b));
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    /// rollback 性質：在真的有畫面的情況下（PPU 狀態、捲動暫存器、NMI 都在動），
+    /// 於第 k 幀存檔、往前跑、讀檔、用相同輸入重跑，結果（狀態雜湊與畫面）必須跟
+    /// 沒中斷的一路跑完完全相同。
+    #[test]
+    fn rollback_replay_matches_uninterrupted_run_with_real_rendering() {
+        let rom = rendering_rom();
+        let inputs = inputs_for(40);
+
+        let mut baseline = Nes::from_rom(&rom).unwrap();
+        for input in &inputs {
+            baseline.run_frame(*input);
+        }
+
+        let mut replay = Nes::from_rom(&rom).unwrap();
+        for input in &inputs[..15] {
+            replay.run_frame(*input);
+        }
+        let checkpoint = replay.save_state();
+        for input in &inputs[15..30] {
+            replay.run_frame(*input);
+        }
+        replay.load_state(&checkpoint).unwrap();
+        for input in &inputs[15..] {
+            replay.run_frame(*input);
+        }
+
+        assert_eq!(replay.state_hash(), baseline.state_hash());
+        assert_eq!(framebuffer_hash(&replay), framebuffer_hash(&baseline));
+    }
+
+    /// 存檔必須包含 CPU 與 PPU 之間的相位：在「一幀中間」（單步除錯停下來）
+    /// 存檔、讀檔後繼續，結果要跟不中斷的一路跑完相同。
+    #[test]
+    fn mid_frame_save_state_preserves_cpu_ppu_phase() {
+        let rom = rendering_rom();
+        let input = [Buttons::empty(); 2];
+
+        let mut baseline = Nes::from_rom(&rom).unwrap();
+        for _ in 0..5 {
+            baseline.run_frame(input);
+        }
+        for _ in 0..4000 {
+            baseline.step_instruction();
+        }
+        for _ in 0..5 {
+            baseline.run_frame(input);
+        }
+
+        let mut replay = Nes::from_rom(&rom).unwrap();
+        for _ in 0..5 {
+            replay.run_frame(input);
+        }
+        for _ in 0..4000 {
+            replay.step_instruction();
+        }
+        let mid_frame = replay.save_state();
+        let ppu_position = (replay.cpu.bus().ppu.scanline, replay.cpu.bus().ppu.cycle);
+        replay.run_frame(input); // 讓狀態走遠
+        replay.load_state(&mid_frame).unwrap();
+        assert_eq!(
+            (replay.cpu.bus().ppu.scanline, replay.cpu.bus().ppu.cycle),
+            ppu_position,
+            "讀檔後 PPU 掃描線/dot 位置必須還原"
+        );
+        for _ in 0..5 {
+            replay.run_frame(input);
+        }
+
+        assert_eq!(replay.state_hash(), baseline.state_hash());
+        assert_eq!(framebuffer_hash(&replay), framebuffer_hash(&baseline));
+    }
+
+    /// 黃金畫面：`rendering_rom` 在固定輸入下跑 30 幀的畫面雜湊。任何讓畫面
+    /// 改變的 PPU 修改（不論對錯）都會讓這個測試失敗，強迫作者確認變動是預期的，
+    /// 再更新常數。只存雜湊，不存圖片。
+    #[test]
+    fn golden_frame_hash_of_rendering_rom() {
+        let mut nes = Nes::from_rom(&rendering_rom()).unwrap();
+        for _ in 0..30 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        assert_eq!(
+            framebuffer_hash(&nes),
+            GOLDEN_RENDERING_ROM_30_FRAMES,
+            "畫面雜湊改變了；如果是預期的 PPU 變更，請更新 GOLDEN_RENDERING_ROM_30_FRAMES"
+        );
+    }
+
+    const GOLDEN_RENDERING_ROM_30_FRAMES: u64 = 0x7647a9d5508a0acf;
+
+    /// 搖桿：一幀開始時鎖定輸入，程式 strobe 之後讀 8 次得到 A、B、Select、Start、
+    /// 上、下、左、右。
+    #[test]
+    fn joypad_reads_reflect_the_input_locked_at_frame_start() {
+        let mut code = Asm::new(0x8000);
+        code.lda_imm(1)
+            .sta_abs(0x4016)
+            .lda_imm(0)
+            .sta_abs(0x4016)
+            .ldx_imm(0);
+        let l = code.pc();
+        code.lda_abs(0x4016)
+            .and_imm(1)
+            .sta_abs_x(0x0200)
+            .inx()
+            .cpx_imm(8)
+            .bne(l);
+        let forever = code.pc();
+        code.jmp(forever);
+        let rom = build_nrom(&code, 0x8000, None, &[], &test_chr(), false);
+
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        nes.run_frame([
+            Buttons::A | Buttons::START | Buttons::RIGHT,
+            Buttons::empty(),
+        ]);
+
+        let bits: Vec<u8> = (0..8).map(|i| nes.peek(0x0200 + i)).collect();
+        assert_eq!(bits, [1, 0, 0, 1, 0, 0, 0, 1]);
+    }
+
+    /// `STA $4014` 觸發 OAM DMA：256 byte 進 OAM，CPU 暫停 513 或 514 個 cycle。
+    #[test]
+    fn sta_4014_runs_oam_dma_and_stalls_the_cpu() {
+        let mut code = Asm::new(0x8000);
+        code.lda_imm(0x5A)
+            .sta_abs(0x0203)
+            .lda_imm(0x02)
+            .sta_abs(0x4014);
+        let forever = code.pc();
+        code.jmp(forever);
+        let rom = build_nrom(&code, 0x8000, None, &[], &test_chr(), false);
+
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        for _ in 0..3 {
+            nes.step_instruction(); // LDA, STA, LDA
+        }
+        let before = nes.cpu.bus().total_cycles();
+        let store_cycles = nes.step_instruction() as u64; // STA $4014（含 DMA）
+        let elapsed = nes.cpu.bus().total_cycles() - before;
+
+        assert_eq!(nes.cpu.bus().ppu.oam[3], 0x5A);
+        let stall = elapsed - store_cycles;
+        assert!(stall == 513 || stall == 514, "DMA 暫停 {stall} cycles");
+    }
+
+    #[test]
+    fn reset_clears_ppu_registers_but_keeps_ram() {
+        let mut nes = Nes::from_rom(&rendering_rom()).unwrap();
+        for _ in 0..3 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        assert_ne!(nes.cpu.bus().ppu.mask, 0);
+        assert_ne!(nes.peek(0x0000), 0);
+
+        nes.reset();
+        assert_eq!(nes.cpu.bus().ppu.mask, 0);
+        assert_eq!(nes.cpu.bus().ppu.ctrl, 0);
+        assert_ne!(nes.peek(0x0000), 0, "RAM 內容 reset 後保留");
+        assert_eq!(nes.cpu.pc, 0x8000);
+    }
+
+    #[test]
+    fn debug_ppu_views_have_expected_shapes_and_show_the_nametable() {
+        let mut nes = Nes::from_rom(&rendering_rom()).unwrap();
+        for _ in 0..3 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        let views = nes.debug_ppu_views(0);
+        assert_eq!(views.pattern_tables[0].width, 128);
+        assert_eq!(views.pattern_tables[0].height, 128);
+        assert_eq!(views.nametables[0].width, 256);
+        assert_eq!(views.nametables[0].height, 240);
+        // rendering_rom 用 horizontal mirroring：$2000 與 $2400 相同。
+        assert_eq!(views.nametables[0], views.nametables[1]);
+        // 只顯示背景 tile 的 nametable 影像不該是單色。
+        let colors: std::collections::BTreeSet<_> = views.nametables[0]
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect();
+        assert!(colors.len() >= 3);
+    }
+
+    /// 「run_frame 路徑不得 panic」：不論 PRG/CHR 內容是什麼垃圾（隨機位元組會
+    /// 執行到未定義行為的 opcode、亂寫 PPU 暫存器、亂觸發 DMA 與 NMI），跑幾幀都不
+    /// 可以 panic（debug 建置有溢位檢查）。用固定種子的 xorshift，結果可重現。
+    #[test]
+    fn random_garbage_roms_never_panic_in_run_frame() {
+        fn xorshift(state: &mut u64) -> u8 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            (*state >> 24) as u8
+        }
+
+        for seed in 1..=24u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rom = vec![0u8; 16];
+            rom[0..4].copy_from_slice(b"NES");
+            rom[4] = 1 + (seed % 2) as u8; // 16KB 或 32KB PRG
+            rom[5] = (seed % 3) as u8; // 0（CHR-RAM）、1、2 個 CHR bank
+            rom[6] = (seed % 2) as u8; // 交替 mirroring
+            for _ in 0..(rom[4] as usize * 0x4000 + rom[5] as usize * 0x2000) {
+                rom.push(xorshift(&mut state));
+            }
+            let mut nes = Nes::from_rom(&rom).unwrap();
+            for frame in 0..4 {
+                let pad = xorshift(&mut state);
+                nes.run_frame([Buttons::from_bits_truncate(pad), Buttons::empty()]);
+                let _ = nes.debug_snapshot();
+                if frame == 2 {
+                    let _ = nes.debug_ppu_views(pad);
+                    let saved = nes.save_state();
+                    nes.load_state(&saved).unwrap();
+                }
+            }
+        }
+    }
+
+    /// SMB 式的畫面分割：等 sprite 0 hit 之後在 hblank 前改水平捲動。合成 ROM 每幀：
+    /// 等 vblank → 捲動歸零 → 等 `$2002` bit6（sprite 0 hit）先清除再設起 → 寫 `$2005`
+    /// 水平捲動 8 px。
+    /// sprite 0 在第 40 條掃描線命中，所以第 0–40 條線用捲動 0，第 41 條線起用捲動 8
+    /// （水平位置的 hori(v)=hori(t) 發生在該條線的 dot 257）。
+    #[test]
+    fn sprite0_split_scroll_takes_effect_on_the_next_scanline() {
+        let mut a = Asm::new(0x8000);
+        a.sei().cld().ldx_imm(0xFF).txs();
+        a.set_ppu_addr(0x3F00);
+        for color in [0x0F, 0x16, 0x2A, 0x30] {
+            a.lda_imm(color).sta_abs(0x2007);
+        }
+        a.set_ppu_addr(0x2000).ldx_imm(0);
+        for _ in 0..2 {
+            let l = a.pc();
+            a.txa().and_imm(0x07).sta_abs(0x2007).inx().bne(l);
+        }
+        // sprite 0：Y = 39（第一列在掃描線 40）、tile 3（純色 3）、X = 100。
+        a.lda_imm(0).sta_abs(0x2003);
+        for byte in [39, 3, 0, 100] {
+            a.lda_imm(byte).sta_abs(0x2004);
+        }
+        a.lda_imm(0x00).sta_abs(0x2000);
+        a.lda_imm(0x1E).sta_abs(0x2001);
+
+        let wait_vblank = a.pc();
+        a.bit_abs(0x2002).bpl(wait_vblank);
+        a.lda_imm(0).sta_abs(0x2005).sta_abs(0x2005);
+        // 先等上一幀的 sprite 0 hit 旗標在 pre-render 行被清掉，再等這一幀的命中
+        // （SMB 也是這樣做，否則會在 vblank 就看到舊的旗標）。
+        let wait_clear = a.pc();
+        a.bit_abs(0x2002).bvs(wait_clear);
+        let wait_hit = a.pc();
+        a.bit_abs(0x2002).bvc(wait_hit);
+        a.lda_imm(8).sta_abs(0x2005).lda_imm(0).sta_abs(0x2005);
+        a.jmp(wait_vblank);
+
+        let rom = build_nrom(&a, 0x8000, None, &[], &test_chr(), false);
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        for _ in 0..4 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+
+        let fb = nes.cpu.bus().ppu.frame_buffer().as_bytes();
+        let px = |x: usize, y: usize| {
+            let i = (y * crate::frame::WIDTH + x) * 4;
+            [fb[i], fb[i + 1], fb[i + 2]]
+        };
+        let backdrop = crate::ppu::SYSTEM_PALETTE[0x0F];
+        let color1 = crate::ppu::SYSTEM_PALETTE[0x16];
+
+        // 第 0 欄是 tile 0（空白）→ 背景色；捲動 8 px 之後第 0 欄變成 tile 1（純色 1）。
+        // （nametable 只填了前 16 列 tile，所以只檢查到第 127 條線。）
+        for y in [0, 10, 39, 40] {
+            assert_eq!(px(4, y), backdrop, "第 {y} 條線應該用捲動 0");
+        }
+        for y in [41, 42, 100, 120] {
+            assert_eq!(px(4, y), color1, "第 {y} 條線應該用捲動 8");
+        }
     }
 }

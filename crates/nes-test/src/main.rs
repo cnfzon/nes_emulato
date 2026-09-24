@@ -2,9 +2,13 @@
 //!
 //! - `info <rom>`：解析並印出 iNES header。
 //! - `nestest <rom> <log>`：對照官方 nestest log 逐指令驗證 CPU。
-//! - `blargg <rom>`：跑 blargg 測試 ROM 並回報結果（尚未實作）。
+//! - `blargg <rom>`：跑 blargg 測試 ROM（`$6000` 結果協定）並回報結果。
+//! - `screenshot <rom> <out.png>`：跑 N 幀後把畫面存成 PNG（視覺除錯用）。
+//! - `golden <rom>`：跑 N 幀後印出畫面雜湊（黃金畫面測試用）。
 
+mod blargg;
 mod nestest_log;
+mod png;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -35,8 +39,32 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
-    /// 執行 blargg 測試 ROM 並回報 pass/fail（尚未實作）。
-    Blargg { rom: PathBuf },
+    /// 跑 N 幀後把畫面存成 PNG（視覺除錯用）。
+    Screenshot {
+        rom: PathBuf,
+        out: PathBuf,
+        #[arg(long, default_value_t = 120)]
+        frames: u64,
+        /// 放大倍率（最近鄰）。
+        #[arg(long, default_value_t = 2)]
+        scale: usize,
+    },
+    /// 跑 N 幀後印出畫面（RGBA）的 xxh3-64 雜湊。
+    Golden {
+        rom: PathBuf,
+        #[arg(long, default_value_t = 120)]
+        frames: u64,
+    },
+    /// 執行 blargg 測試 ROM（`$6000` 結果協定）並回報 pass/fail。
+    Blargg {
+        rom: PathBuf,
+        /// 最多跑幾幀（約 60 幀 = 1 秒模擬時間）。
+        #[arg(long, default_value_t = 12_000)]
+        max_frames: u64,
+        /// 結束時一併印出畫面（nametable 0）上的文字。
+        #[arg(long)]
+        screen: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -46,11 +74,136 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Info { rom } => cmd_info(&rom),
         Command::Nestest { rom, log, strict } => cmd_nestest(&rom, &log, strict),
-        Command::Blargg { rom: _ } => {
-            eprintln!("blargg: not implemented yet");
+        Command::Blargg {
+            rom,
+            max_frames,
+            screen,
+        } => cmd_blargg(&rom, max_frames, screen),
+        Command::Screenshot {
+            rom,
+            out,
+            frames,
+            scale,
+        } => cmd_screenshot(&rom, &out, frames, scale),
+        Command::Golden { rom, frames } => cmd_golden(&rom, frames),
+    }
+}
+
+/// 載入 ROM 並跑 `frames` 幀（不按任何鍵），回傳最後一幀。
+fn run_frames(rom: &Path, frames: u64) -> Result<nes_core::FrameBuffer, String> {
+    let bytes = std::fs::read(rom).map_err(|e| format!("讀取 ROM 檔案失敗: {e}"))?;
+    let mut nes = nes_core::Nes::from_rom(&bytes).map_err(|e| format!("無法載入 ROM: {e}"))?;
+    let mut last = nes_core::FrameBuffer::blank();
+    for _ in 0..frames {
+        last = nes.run_frame([nes_core::Buttons::empty(); 2]).clone();
+    }
+    Ok(last)
+}
+
+fn cmd_screenshot(rom: &Path, out: &Path, frames: u64, scale: usize) -> ExitCode {
+    let frame = match run_frames(rom, frames) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let scale = scale.max(1);
+    let (w, h) = (nes_core::frame::WIDTH, nes_core::frame::HEIGHT);
+    let pixels = png::upscale(w, h, frame.as_bytes(), scale);
+    let data = png::encode_rgba((w * scale) as u32, (h * scale) as u32, &pixels);
+    match std::fs::write(out, data) {
+        Ok(()) => {
+            println!(
+                "已寫入 {}（{frames} 幀，{}x{}）",
+                out.display(),
+                w * scale,
+                h * scale
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("寫入 PNG 失敗: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_golden(rom: &Path, frames: u64) -> ExitCode {
+    match run_frames(rom, frames) {
+        Ok(frame) => {
+            println!("{:#018x}", frame.hash64());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_blargg(path: &Path, max_frames: u64, show_screen: bool) -> ExitCode {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("讀取 ROM 檔案失敗: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut nes = match nes_core::Nes::from_rom(&bytes) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("無法載入 ROM: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let outcome = blargg::run(&mut nes, max_frames);
+    let code = match &outcome {
+        blargg::Outcome::Finished {
+            code,
+            text,
+            frames,
+            resets,
+        } => {
+            println!("結果碼 ${code:02X}（{frames} 幀，reset {resets} 次）");
+            println!("{}", text.trim_end());
+            if *code == 0 {
+                println!("PASS");
+                ExitCode::SUCCESS
+            } else {
+                println!("FAIL");
+                ExitCode::FAILURE
+            }
+        }
+        blargg::Outcome::Timeout { text, frames } => {
+            println!("TIMEOUT：跑了 {frames} 幀，狀態仍是 $80（執行中）");
+            println!("{}", text.trim_end());
+            ExitCode::FAILURE
+        }
+        blargg::Outcome::NoSignature {
+            screen,
+            frames,
+            verdict,
+        } => {
+            println!("無 $6000 簽章（舊版測試 ROM）：跑了 {frames} 幀，畫面判讀 = {verdict:?}");
+            println!(
+                "--- 畫面文字 ---
+{screen}"
+            );
+            if verdict.is_pass() {
+                println!("PASS");
+                ExitCode::SUCCESS
+            } else {
+                println!("FAIL");
+                ExitCode::FAILURE
+            }
+        }
+    };
+    if show_screen && !matches!(outcome, blargg::Outcome::NoSignature { .. }) {
+        println!("--- 畫面文字 ---\n{}", blargg::screen_text(&nes));
+    }
+    code
 }
 
 fn cmd_info(path: &Path) -> ExitCode {

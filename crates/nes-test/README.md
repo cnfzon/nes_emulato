@@ -5,7 +5,9 @@
 ```
 cargo run -p nes-test -- info <rom.nes>
 cargo run -p nes-test -- nestest <rom.nes> <log.txt> [--strict]
-cargo run -p nes-test -- blargg <rom.nes>               # 尚未實作
+cargo run -p nes-test -- blargg <rom.nes> [--max-frames N] [--screen]
+cargo run -p nes-test -- screenshot <rom.nes> <out.png> [--frames N] [--scale S]
+cargo run -p nes-test -- golden <rom.nes> [--frames N]
 ```
 
 `nestest` 會從 nestest.nes 的 automation entry point（`$C000`）開始，逐指令
@@ -42,7 +44,32 @@ cargo run -p nes-test -- blargg <rom.nes>               # 尚未實作
   時該測試會直接印訊息跳過，不算失敗。
 - **blargg 測試套件**（`cpu_dummy_reads`、`instr_test-v5`、
   `ppu_vbl_nmi`……等）：搜尋作者 "blargg" 在 NESdev wiki 上發布的測試 ROM
-  合集。用法：`cargo run -p nes-test -- blargg roms/instr_test-v5/official_only.nes`
+  合集。目前實際使用的是 GitHub 上的整理版（見下方與 `ATTRIBUTION.md`）；`official_only.nes`
+  這類多合一版本需要 MMC1，尚不支援，請用 `rom_singles/` 裡的單一 ROM。
 
-`blargg` 子命令目前只會印出 `not implemented yet` 並以非零狀態碼結束；
-排進之後做 PPU（Phase 2）之後的階段。
+## blargg 子命令
+
+實作 blargg 測試 ROM 的 `$6000` 結果協定：`$6001-$6003` 是簽章 `DE B0 61`，
+`$6000` 為 `$80` 表示執行中、`$81` 表示需要 reset（等 ≥100ms 後 reset）、其他是
+結果碼（0 = 通過），`$6004` 起是以 `\0` 結尾的結果文字。結束碼：通過 0、失敗/逾時 1。
+
+2005 年的舊版 ROM（`blargg_ppu_tests_2005.09.15b`、`sprite_hit_tests_2005.10.05`）
+沒有這個協定，只把結果印在畫面上；此時 `blargg` 會讀 nametable 0 的文字（tile
+編號當 ASCII）判讀 `$01`（通過）或 `PASSED`。
+
+用到的公開 test ROM 與取得方式見根目錄 `ATTRIBUTION.md`（放在被 gitignore 的
+`roms/nes-test-roms/`）。單一 ROM 的例子：
+
+```
+cargo run --release -p nes-test -- blargg roms/nes-test-roms/instr_test-v5/rom_singles/01-basics.nes
+cargo run --release -p nes-test -- blargg roms/nes-test-roms/ppu_vbl_nmi/rom_singles/01-vbl_basics.nes
+```
+
+結果表與失敗原因：`docs/architecture.md` §14。
+
+## screenshot / golden 子命令
+
+- `screenshot`：跑 N 幀（不按任何鍵）後把畫面存成 PNG（不依賴任何額外套件，
+  用未壓縮的 zlib stored block 自己編碼）。視覺除錯用。
+- `golden`：跑 N 幀後印出最後一幀畫面的 xxh3-64 雜湊，用來產生
+  `crates/nes-core/tests/golden_frames.rs` 的黃金畫面表（只存雜湊，不存圖片）。

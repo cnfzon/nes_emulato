@@ -22,3 +22,13 @@ serde_json = "1.0.151"
 # step_instruction / trace / peek 是正式公開 API，不在這個 feature 之後。
 # 一般遊戲邏輯（nes-app）不啟用；注意 Cargo 的 feature 統一機制，見 README。
 testing = []
+
+# 這兩個範例用到 `test_support`（合成 ROM 產生器），需要 `testing` feature：
+#   cargo run --release -p nes-core --features testing --example bench_run_frame
+[[example]]
+name = "bench_run_frame"
+required-features = ["testing"]
+
+[[example]]
+name = "write_rendering_rom"
+required-features = ["testing"]

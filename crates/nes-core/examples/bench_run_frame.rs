@@ -1,13 +1,17 @@
 //! `Nes::run_frame` 的簡易效能量測。跑法：
 //!
 //! ```text
-//! cargo run --release -p nes-core --example bench_run_frame
+//! cargo run --release -p nes-core --features testing --example bench_run_frame
+//! cargo run --release -p nes-core --features testing --example bench_run_frame -- path/to/rom.nes
 //! ```
 //!
-//! 兩種情境：
-//! 1. 全部填 `NOP`（`$EA`）：CPU 分支預測友善、記憶體存取最少的上限情境。
+//! 每幀耗時是 CPU + PPU 合計（Phase 2 起 PPU 會逐 dot 推進並渲染）。情境：
+//! 1. 全部填 `NOP`（`$EA`）、渲染關閉：CPU 最輕、PPU 只走時序的下限。
 //! 2. 一個具代表性的小迴圈（zero-page 讀取、abs,X 寫入、INX/CPX/BNE、外層
-//!    JMP）：比較接近真實遊戲程式碼會用到的指令組合。
+//!    JMP），渲染關閉：比較接近真實遊戲程式碼會用到的指令組合。
+//! 3. `test_support::rendering_rom()`：開啟背景 + 精靈渲染、每幀一次 NMI，
+//!    OAM 裡有 60 個精靈擠在同幾條掃描線（sprite 評估的壞情況）。
+//! 4. 命令列給的 ROM（選用）：例如公開 test ROM 或自己合法取得的遊戲。
 
 use std::time::Instant;
 
@@ -27,8 +31,11 @@ fn make_rom(prg: &[u8; 0x8000]) -> Vec<u8> {
 }
 
 fn bench(name: &str, prg: &[u8; 0x8000]) {
-    let rom = make_rom(prg);
-    let mut nes = Nes::from_rom(&rom).expect("valid rom");
+    bench_rom(name, &make_rom(prg));
+}
+
+fn bench_rom(name: &str, rom: &[u8]) {
+    let mut nes = Nes::from_rom(rom).expect("valid rom");
     let input = [Buttons::empty(), Buttons::empty()];
 
     for _ in 0..WARMUP_FRAMES {
@@ -70,4 +77,14 @@ fn main() {
     loop_prg[0x7FFC] = 0x00;
     loop_prg[0x7FFD] = 0x80;
     bench("LDA/STA/INX/CPX/BNE 迴圈", &loop_prg);
+
+    bench_rom(
+        "rendering_rom（背景 + 精靈 + NMI）",
+        &nes_core::test_support::rendering_rom(),
+    );
+
+    if let Some(path) = std::env::args().nth(1) {
+        let rom = std::fs::read(&path).expect("讀取 ROM 失敗");
+        bench_rom(&format!("ROM: {path}"), &rom);
+    }
 }

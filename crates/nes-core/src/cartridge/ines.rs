@@ -43,6 +43,11 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
         return Err(RomError::Nes20Unsupported);
     }
 
+    // 沒有 PRG-ROM 的卡帶連 reset vector 都讀不到；拒絕它，避免之後讀 PRG 時越界。
+    if prg_rom_banks == 0 {
+        return Err(RomError::NoPrgRom);
+    }
+
     let mapper_id = (flags7 & 0xF0) | (flags6 >> 4);
     let mirroring = if flags6 & 0x08 != 0 {
         Mirroring::FourScreen
@@ -185,6 +190,12 @@ mod tests {
         // that failure itself proves the two nibbles were combined correctly.
         let rom = build_rom(1, 1, 0b0001_0000, 0b0001_0000, false);
         assert_eq!(parse(&rom).unwrap_err(), RomError::UnsupportedMapper(0x11));
+    }
+
+    #[test]
+    fn rejects_rom_without_prg() {
+        let rom = build_rom(0, 1, 0, 0, false);
+        assert_eq!(parse(&rom).unwrap_err(), RomError::NoPrgRom);
     }
 
     #[test]

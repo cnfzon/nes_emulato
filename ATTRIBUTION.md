@@ -30,11 +30,54 @@ opcode 參考資料自行重新設計/實作）：
   "[CPU unofficial opcodes](https://www.nesdev.org/wiki/CPU_unofficial_opcodes)"
   頁面整理而成。
 
+- [`crates/nes-core/src/ppu/mod.rs`](crates/nes-core/src/ppu/mod.rs)、
+  [`crates/nes-core/src/ppu/render.rs`](crates/nes-core/src/ppu/render.rs) ——
+  Phase 2 的 PPU。**實作依據主要是 NESdev wiki**（見下方「NESdev Wiki」），
+  教學第 6–8 章（PPU、rendering、scrolling，
+  <https://bugzmanov.github.io/nes_ebook/chapter_6.html>）只被拿來參考「先做
+  暫存器與 mirroring → NMI → 背景/精靈渲染 → 捲動」的章節順序。沒有複製其程式
+  碼；跟教學不同的地方：捲動採用真實硬體的 loopy `v/t/x/w` 暫存器與逐 dot 的 v
+  遞增時序（教學是簡化版），sprite 0 hit 是「算出命中的 x、等 PPU 走到那個 dot
+  才設旗標」，NMI 用邊緣偵測，run_frame 以 PPU 完成一幀為邊界。搖桿、OAM DMA、
+  調色盤同樣依 NESdev wiki 自行實作。
+
+## NESdev Wiki（PPU 相關）
+
+Phase 2 的 PPU、搖桿、OAM DMA 是對照下列 NESdev wiki 頁面自行實作的
+（<https://www.nesdev.org/wiki/>）：PPU registers、PPU scrolling、PPU rendering、
+PPU sprite evaluation、PPU OAM、PPU palettes、PPU memory map、PPU nametables、
+NMI、Controller reading（Standard controller）、CPU memory map（OAM DMA）。
+
+### 2C02 調色盤
+
+`crates/nes-core/src/ppu/palette.rs` 的 64 色 sRGB 表取自 NESdev Wiki「PPU
+palettes」頁面 "2C02 and 2C07" 一節（<https://www.nesdev.org/wiki/PPU_palettes>）
+給出的 `.pal` 內容；該頁說明這張表是用 blargg 的 "Full Palette" 示範 ROM 在
+Nestopia 上產生的。wiki 只列出每列前 14 色，`$xE`/`$xF` 依頁面說明是黑色，
+本專案補 `[0, 0, 0]`。取得方式：讀取該頁面（archive.org 快取版本，因為
+nesdev.org 目前有 Cloudflare 擋自動化請求）並逐字解析，沒有手抄。這張表只影響
+輸出顏色，不影響模擬狀態。授權：NESdev wiki 內容的授權以該 wiki 的說明為準；
+這裡只用其中 64 組數值（事實性資料）。
+
 ## 測試資料來源
 
 - **nestest**（`roms/nestest/`，不進 repo）：`nestest.nes` 與 `nestest.log`
   下載自 <https://www.qmtpro.com/~nes/misc/>，這是 NESdev wiki nestest 頁面
   引用的來源。
+- **公開 test ROM**（`roms/nes-test-roms/`，不進 repo、被 `.gitignore` 排除）：
+  來自 GitHub 的 <https://github.com/christopherpow/nes-test-roms>（社群整理的
+  test ROM 合集；commit `95d8f621ae55cee0d09b91519a8989ae0e64753b`，2022-03-02），
+  以 `git sparse-checkout` **只取**需要的目錄：`instr_test-v5`、`ppu_vbl_nmi`、
+  `sprite_hit_tests_2005.10.05`、`ppu_read_buffer`、`oam_read`、
+  `blargg_ppu_tests_2005.09.15b`、`scrolltest`。這些 ROM 的作者是 Shay Green
+  （blargg）等人；**沒有**下載或使用任何商業遊戲 ROM。取得方式：
+  ```
+  git clone --depth 1 --filter=blob:none --sparse \
+      https://github.com/christopherpow/nes-test-roms.git roms/nes-test-roms
+  cd roms/nes-test-roms && git sparse-checkout set instr_test-v5 ppu_vbl_nmi \
+      sprite_hit_tests_2005.10.05 ppu_read_buffer oam_read \
+      blargg_ppu_tests_2005.09.15b scrolltest
+  ```
 - **SingleStepTests**（`roms/singlestep/`，不進 repo）：
   <https://github.com/SingleStepTests/65x02> 的 `nes6502/v1` 子集（256 個
   opcode，每個 10,000 筆單指令測試）。

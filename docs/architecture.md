@@ -50,15 +50,16 @@ graph TB
     Loop --> Nes
 ```
 
-emu 執行緒與 UI 執行緒之間目前有 4 條獨立通道，方向、型別、用途、背壓策略
+emu 執行緒與 UI 執行緒之間目前有 5 條獨立通道，方向、型別、用途、背壓策略
 各不相同：
 
 | 通道 | 型別 | 方向 | 用途 | 背壓策略 |
 |---|---|---|---|---|
-| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`StepInstruction`／`StepFrame`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
+| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`SetDebugViews`／`StepInstruction`／`StepFrame`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
 | 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`／`FrameAdvanced`／`TraceWritten`，每則都要送達 | unbounded：`FpsReport` 每秒 1 則、`FrameAdvanced` 每幀 1 則（UI 每次重繪都會 `try_iter()` 清空），不會累積成問題 |
 | 畫面 | `triple_buffer::Input/Output<FrameBuffer>` | Emu → UI | 每幀畫好的 `FrameBuffer` | `triple_buffer`：只在乎「最新一張」，UI 沒讀不會擋住 emu 寫入，也不會無限堆積 |
 | Debug 快照 | `triple_buffer::Input/Output<Option<DebugSnapshot>>` | Emu → UI | Debugger 面板顯示的 CPU/PPU/APU 狀態；`None` 代表「尚未收到任何快照」，跟真實模擬狀態（即使欄位剛好是 0）明確區分 | `triple_buffer`：同 FrameBuffer；另外用 `EmuCommand::SetDebugEnabled` 讓 emu 執行緒只在面板開啟時才產生快照，面板關閉時零成本 |
+| PPU 影像 | `triple_buffer::Input/Output<Option<PpuViews>>` | Emu → UI | Debugger 的 pattern table（2 張 128×128）與 nametable（4 張 256×240），約 1.1MB／份 | `triple_buffer`；而且 **預設不產生**：只有面板開著且目前分頁是 Pattern/Nametable 時，UI 才送 `EmuCommand::SetDebugViews(Some(調色盤))`，emu 執行緒執行中每 3 幀更新一次，暫停時單步/讀檔後立即更新；離開分頁就送 `None`，之後零成本 |
 
 - **為什麼 emu 執行緒跟 UI 執行緒分開？** GUI 重繪（尤其是開啟 debugger 面板、
   拖動視窗）耗時不固定，如果模擬迴圈跟 UI 畫在同一個執行緒，模擬的 timing
@@ -211,9 +212,11 @@ Rollback 與 desync 偵測完全依賴「同樣的初始狀態 + 同樣的輸入
    機制能運作的前提。（靜態 ROM bytes 是例外，刻意 `#[serde(skip)]`，理由與
    讀檔時如何確保接回同一份 ROM、如何拒絕損毀資料，見 §8。）
 6. **畫面渲染是純函式**：Phase 0 的 `FrameBuffer::render_test_pattern(frame_count,
-   input)` 只由這兩個參數決定輸出，不讀取任何全域/外部狀態；未來真正的 PPU
-   渲染器也必須維持這個性質（只由 `Ppu`/`Bus` 內部狀態決定，不能讀系統時間
-   或其他非決定性來源）。
+   input)` 只由這兩個參數決定輸出，不讀取任何全域/外部狀態；Phase 2 的 PPU
+   渲染器（`ppu/render.rs`）維持這個性質：一條掃描線的像素只由當下的 `Ppu`
+   （v/fine X/PPUCTRL/PPUMASK/OAM/調色盤）與卡帶 CHR 決定，沒有浮點運算、沒有
+   時間或亂數。調色盤（`ppu/palette.rs`）是整數查表。`Ppu::frame_buffer` 是
+   「輸出」而不是「狀態」，不進 save state（見 §8）。
 
 以下三個測試（`crates/nes-core/src/lib.rs` 的 `tests` module）直接驗證了規則
 5、6 帶來的性質：
@@ -311,6 +314,23 @@ flowchart TD
   `StateError::Corrupt`。
 - `load_state_rejects_mismatched_rom`：拿「另一份 ROM」存的檔去讀目前載入
   的 ROM，驗證回傳 `StateError::RomMismatch`。
+
+### Phase 2 補充：PPU 進 save state 的內容
+
+- **進存檔**：`Ppu` 的所有時序與暫存器狀態——PPUCTRL/MASK/STATUS、OAMADDR、
+  loopy `v`/`t`/fine X/`w`、`$2007` 讀取緩衝、I/O latch、OAM、VRAM、調色盤、
+  **掃描線與 dot（＝CPU 與 PPU 之間的相位）**、幀計數與奇偶幀旗標、NMI 線與
+  待處理旗標（含「寫 PPUCTRL 造成、要晚一條指令」的延遲旗標）、sprite 0 hit
+  排定的 dot、預取次數；`Bus` 的 `total_cycles`、OAM DMA 待處理旗標、搖桿移位
+  暫存器。因為 catch-up 模型下 PPU 位置就是 `total_cycles × 3` 的結果，存檔在
+  「一幀中間」（單步除錯停下來時）也能完整還原，測試
+  `mid_frame_save_state_preserves_cpu_ppu_phase` 驗證。
+- **不進存檔**：`Ppu::frame_buffer`（輸出，下一幀會整張重畫）。代價是讀檔之後
+  「立刻」拿到的畫面是全黑，直到下一次 `run_frame`；GUI 讀檔後不會更新畫面
+  緩衝，所以暫停中讀檔畫面維持舊圖，繼續跑之後就會是正確的。
+- **`load_state` 驗證**：除了 §8 原本的長度檢查，也檢查 PPU 欄位在硬體範圍內
+  （掃描線 ≤ 261、dot ≤ 340、v/t ≤ `$7FFF`、fine X ≤ 7……），超出範圍回傳
+  `StateError::Corrupt`，避免竄改的存檔讓 `run_frame` panic。
 
 ## 9. CPU 精度層級：instruction-level（Phase 1）
 
@@ -410,3 +430,143 @@ Debugger 快照卻是每幀更新，兩者就出現了約 35 幀的落差。
 （單步、讀檔、載入 ROM 後也會送），並在 `DebugSnapshot` 加入 `frame_count`。
 Debugger 開著時，狀態列直接用同一份快照的 `frame_count`，因此與面板的 cycle
 數必然一致；面板關閉時用 `FrameAdvanced`。
+
+## 12. 待辦
+
+- **Phase 6：字型瘦身。** 將 `NotoSansCJKtc-Regular.otf`（目前 16MB、完整字重）
+  subset 為常用繁體字以縮小執行檔，並確認 OFL 對修改後字型的命名規定
+  （OFL-1.1 對「Modified Version」的 Reserved Font Name 限制，以及 subset
+  後是否必須改名）。決定於第 0 步：目前保留完整字型，不做 subset。
+- Phase 3 的建議見 §14 末。
+
+## 13. Phase 2：PPU 時序模型（catch-up）與它的限制
+
+### 13.1 模型
+
+- CPU 維持 instruction-level（§9）。每條指令執行完，`Bus::tick(cycles)` 讓 PPU
+  追上 `cycles × 3` 個 dot（NTSC）；PPU 的 `(掃描線, dot)` 就是 `total_cycles × 3`
+  推進的結果，不另存「相位」。
+- **一幀的邊界是「PPU 完成一幀」**，不再用 cycle 預算：`Nes::run_frame` 迴圈跑
+  到 PPU 進入 vblank（掃描線 241、dot 1）為止。此時 240 條可見掃描線都已畫完，
+  之後到下一幀開始不會再寫 framebuffer，所以拿到的畫面不會撕裂。因為 CPU 只能
+  在指令邊界停下，實際會越過 vblank 起點最多一條指令（≤ 8 cycles ＝ 24 dot，
+  OAM DMA 則 513/514 cycles）——越過的部分只是 vblank，無害。
+- **輸入在一幀開始時鎖定**：`run_frame` 把兩個搖桿的按鍵狀態寫進 `Joypad::state`，
+  整幀不再變；程式 strobe `$4016` 之後讀到的永遠是這一幀的輸入。
+- **NMI**：PPU 在 vblank 起點（若 PPUCTRL bit7 開）或 vblank 期間寫 PPUCTRL
+  bit7 由 0 變 1 時，在「NMI 輸出線」上偵測到邊緣並登記；CPU 在每條指令開始前
+  檢查（`Cpu::step` 開頭），有就服務（7 cycles，該步不執行指令）。由 CPU 寫
+  PPUCTRL 造成的邊緣多等一次檢查（＝「下一條指令之後」才觸發），對應硬體上寫入
+  發生在指令最後一個 cycle、趕不上該指令結尾的偵測。
+- **OAM DMA**：`STA $4014` 之後，該指令結束時瞬間複製 256 bytes（從 OAMADDR 起、
+  繞回），CPU 暫停 513 cycles（DMA 起始 cycle 為奇數則 514）。暫停期間 PPU 照常追上。
+- **渲染**：每條可見掃描線在 dot 0 一次畫完（背景 33 個 tile + 精靈 + 優先順序）；
+  但 v 暫存器依真實時序逐 dot 遞增（dot 8/16/…/256 coarse X、dot 256 Y、dot 257
+  hori(v)=hori(t)、pre-render 行 dot 280–304 vert(v)=vert(t)、dot 328/336 預取），
+  所以 SMB 那種「等 sprite 0 hit 之後在 hblank 改捲動」的畫面分割會落在正確的
+  掃描線。sprite 0 hit 在渲染該線時算出命中的 x，等 PPU 走到 dot x+1 才設旗標。
+  測試 `sprite0_split_scroll_takes_effect_on_the_next_scanline`（合成 ROM，行為同
+  SMB：等 sprite 0 hit → 改 `$2005`）驗證：sprite 0 在第 40 條線命中時，第 0–40 條線
+  用舊捲動、第 41 條線起用新捲動，精確落在線的邊界。
+
+### 13.2 寫入 PPU 暫存器的時機誤差
+
+因為 PPU 是在指令**結束後**才追上，CPU 存取 PPU 暫存器時，PPU 還停在「這條指令
+開始時」的時間點；真實硬體上存取發生在指令的最後（或倒數）幾個 cycle。所以 PPU
+**落後**存取時間點最多 `指令 cycles − 1` 個 CPU cycle（× 3 個 dot）：
+
+| 指令 | cycles | PPU 落後（CPU cycles / dot） |
+|---|---|---|
+| `LDA $2002`、`STA $2005/$2006/$2007`（abs） | 4 | ≤ 3 / ≤ 9 |
+| `STA $2007,X`（abs,X）、`STA ($xx),Y` | 5–6 | ≤ 4–5 / ≤ 12–15 |
+| `INC/DEC $abs`（讀-改-寫，abs） | 6 | ≤ 5 / ≤ 15 |
+| 讀-改-寫 abs,X | 7 | ≤ 6 / ≤ 18 |
+
+（讀取 `$2002` 看到的旗標則是「稍微舊的」；寫入 `$2000/$2001/$2005/$2006` 則是
+「稍微早」生效。）一條掃描線有 341 個 dot，所以這個誤差對「以掃描線為單位」的
+用法（等 vblank、等 sprite 0 hit、在 hblank 改捲動）只造成最多 ±1 條線的不確定
+窗口，而且發生在 hblank 邊界附近。
+
+**受影響的東西：**
+
+- *測試*：需要 PPU-clock（1 dot）精度的測試會失敗——`ppu_vbl_nmi` 的 02（vbl 設旗標
+  時間）、05（NMI 時間）、06（讀 `$2002` 抑制）、07/08（NMI 開關時間）、10（奇偶幀
+  跳過的時間）、2005 版 `vbl_clear_time`。細節見 §14。
+- *遊戲*：依賴「逐 cycle 數指令、在特定 dot 改寫暫存器」的遊戲（例如常被舉為例子的
+  《Battletoads》、許多 demo）；在 hblank 中做 mid-scanline 特效、且時間窗口只有
+  幾個 dot 的畫面分割。一般 NROM 遊戲（大金剛、Super Mario Bros.）在掃描線精度
+  下已知可以正常運作，但**這一點尚未實測**（沒有 ROM），見手動測試清單。
+- *渲染粒度*：一條線畫完之後才發生的暫存器寫入（mask、捲動、PPUCTRL、CHR-RAM、
+  調色盤）要到下一條線才反映；硬體上這些會在線的中途生效。
+
+**本階段刻意不模擬的其他細節：** 開機後約 29658 cycles 內忽略部分暫存器寫入；
+`$2007` 在渲染中存取時 v 的怪異遞增；渲染中寫 OAMDATA 的位址損壞；sprite overflow
+的硬體 bug（只做「同一線超過 8 個精靈」的基本判斷）；I/O latch 的衰減；
+BRK/NMI 的 hijack；`$2002` 在剛好 vblank 起點被讀取時的旗標抑制。
+
+### 13.3 一個測過、未採用的改善
+
+把「PPU 追上」拆成兩段——指令前 `cycles − 1` 先追、指令（含讀寫 PPU 暫存器）執行、
+再補最後 1 個 cycle——可以把 §13.2 的落後降到約 1 個 CPU cycle。實驗結果：nestest
+仍 8991 行全過；blargg 測試只有 2005 版 `vbl_clear_time` 由失敗變通過，
+`ppu_vbl_nmi` 其他失敗項目（需要 1 dot 精度）不變。因為任務規格明訂「指令結束後
+catch-up」，且效益有限，**沒有採用**，列為 Phase 3 候選（會讓所有黃金畫面雜湊改變，
+需重新產生）。
+
+## 14. Phase 2 測試結果
+
+執行環境：`cargo build --release -p nes-test` 後以 `nes-test blargg <rom>` 執行
+（`--max-frames` 6000–12000；ROM 放在被 gitignore 的 `roms/nes-test-roms/`，見
+`ATTRIBUTION.md`）。CPU 與 PPU 結果都是實際執行的輸出。
+
+### 14.1 CPU：instr_test-v5（`rom_singles/`，NROM）
+
+| ROM | 結果 | 說明 |
+|---|---|---|
+| 01-basics、02-implied、04-zero_page、05-zp_xy、06-absolute、08-ind_x、09-ind_y、10-branches、11-stack、12-jmp_jsr、13-rts、14-rti、15-brk、16-special | **通過**（14 個） | 含官方與非官方（穩定）opcode |
+| 03-immediate | 失敗 `$01`：`AB ATX #n` | `$AB` 屬 §10 的 8 個「不穩定」opcode，刻意以 NOP 占位 |
+| 07-abs_xy | 失敗 `$01`：`9C SYA abs,X`、`9E SXA abs,Y` | 同上（`$9C`/`$9E` 是「不穩定」8 個之二） |
+| official_only.nes / all_instrs.nes | 無法載入 | 需要 mapper 1（MMC1），尚未實作（Phase 3 候選）；改跑 `rom_singles/` |
+
+三個失敗都是 §10 已分類為「預期失敗」的 opcode，不是 PPU 引入的退步。（這三個
+opcode 在 blargg 的測試裡其實有期望值，日後想補可以照它實作，Phase 3 候選。）
+
+### 14.2 PPU：ppu_vbl_nmi（`rom_singles/`，NROM）
+
+| ROM | 結果 | 原因 |
+|---|---|---|
+| 01-vbl_basics | **通過** | |
+| 03-vbl_clear_time | **通過** | |
+| 04-nmi_control | **通過** | 需要「寫 PPUCTRL 造成的 NMI 晚一條指令」（見 §13.1） |
+| 09-even_odd_frames | **通過** | 奇數幀少一個 dot |
+| 02-vbl_set_time | 失敗 `$01` | 要求在 vblank 設旗標的「那一個 PPU clock」讀 `$2002` 會讀到 0 且抑制旗標（表中 `04 - -`）；catch-up 模型無法把讀取定位到單一 dot |
+| 05-nmi_timing | 失敗 `$01` | 要求 NMI 落在「以 PPU clock 為單位」的精確指令位置；我們的 NMI 只能在指令邊界，輸出與期望表不同 |
+| 06-suppression | 失敗 `$01` | 同 02：在 vblank 起點前後讀 `$2002` 的抑制行為未模擬 |
+| 07-nmi_on_timing | 失敗 `$01` | 我們的轉折點與期望差 1 個 dot（06 vs 05） |
+| 08-nmi_off_timing | 失敗 `$01` | 差 2 個 dot（05 vs 07） |
+| 10-even_odd_timing | 失敗 `$03` | 訊息 `Clock is skipped too late, relative to enabling BG`：跳過的 dot 相對於「開啟 BG」的時間點需要 dot 精度，我們是指令結束後才追上 |
+
+全部失敗項目都是「需要單一 PPU dot 精度」，屬於 instruction-level + catch-up 模型
+的預期限制（§13.2），不做特殊處理去湊通過。
+
+### 14.3 其他 PPU 測試
+
+| ROM | 結果 | 說明 |
+|---|---|---|
+| oam_read | **通過** | `$2004` 讀取 |
+| blargg_ppu_tests：palette_ram | **通過**（`$01`） | 調色盤讀寫與鏡像 |
+| blargg_ppu_tests：sprite_ram | **通過**（`$01`） | `$2003/$2004/$4014` |
+| blargg_ppu_tests：vram_access | **通過**（`$01`） | `$2007` 讀緩衝 |
+| blargg_ppu_tests：vbl_clear_time | 失敗 `$03`（旗標清除太晚） | 需要在「指令內的最後一個 cycle」讀 `$2002`；見 §13.3 的實驗：拆段 catch-up 之後會通過 |
+| blargg_ppu_tests：power_up_palette | 失敗 `$02` | 測「開機時調色盤內容」是否與作者那台 NES 相同；readme 說這些值是那台機器獨有的，不是規格，本專案開機為全 0，不追求相符 |
+| sprite_hit_tests_2005.10.05 01–11 | **通過**（全部 11 個，含 09/10/11 的 timing） | |
+| ppu_read_buffer | 無法載入 | 需要 mapper 3（CNROM），尚未實作 |
+
+畫面判讀：舊版（2005）ROM 沒有 `$6000` 協定，結果印在畫面上；`nes-test blargg` 會
+讀 nametable 0 的文字（tile 編號當 ASCII）判讀 `$01`／`PASSED`。
+
+### 14.4 Phase 3 建議（摘要，完整清單在報告）
+
+MMC1／CNROM／UxROM 等 mapper（解鎖 `official_only.nes`、`ppu_read_buffer`、更多遊戲）；
+補上 `$9C/$9E/$AB` 等有確定行為的「不穩定」opcode；評估 §13.3 的拆段 catch-up；
+APU。

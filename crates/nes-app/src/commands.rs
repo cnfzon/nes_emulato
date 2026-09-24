@@ -20,6 +20,10 @@ pub enum EmuCommand {
     /// `debug_input`）。只在面板真的打開時才產生快照，避免面板關閉時
     /// 白白浪費每幀一次的複製成本。
     SetDebugEnabled(bool),
+    /// 開關 Debugger 的 PPU 影像（pattern table / nametable）產生：`Some(p)`
+    /// 表示要（`p` 是 0–7 的 pattern table 調色盤選擇），`None` 表示不要。
+    /// 這些影像要畫 6 張圖，只在對應分頁可見時才開，且執行中每隔幾幀才更新一次。
+    SetDebugViews(Option<u8>),
     /// 單步執行一條 CPU 指令。只在暫停狀態下有效（見
     /// `Nes::step_instruction` 的說明）；未暫停時 emu 執行緒回報
     /// [`EmuEvent::Error`]。

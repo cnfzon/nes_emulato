@@ -8,8 +8,11 @@
 //! | 範圍              | 內容                                                    |
 //! |-------------------|---------------------------------------------------------|
 //! | `$0000-$1FFF`     | 2KB 內部 RAM，每 `$0800` 鏡像一次                         |
-//! | `$2000-$3FFF`     | PPU 暫存器，每 8 bytes 鏡像一次（本階段是 stub，Phase 2 才有真正的側效應） |
-//! | `$4000-$4017`     | APU/IO 暫存器（本階段是 stub）                             |
+//! | `$2000-$3FFF`     | PPU 暫存器，每 8 bytes 鏡像一次                           |
+//! | `$4000-$4013`     | APU 暫存器（本階段仍是 stub）                              |
+//! | `$4014`           | OAM DMA                                                 |
+//! | `$4015`           | APU 狀態（stub）                                          |
+//! | `$4016-$4017`     | 搖桿（移位暫存器）；`$4017` 寫入是 APU frame counter        |
 //! | `$4018-$401F`     | APU/IO 測試模式，一般停用 → open bus                        |
 //! | `$4020-$5FFF`     | 未對映 → open bus                                        |
 //! | `$6000-$7FFF`     | 卡帶 PRG-RAM                                             |
@@ -23,11 +26,6 @@ use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::joypad::Joypad;
 use crate::ppu::Ppu;
-
-/// NTSC 下 PPU 一條掃描線的 dot 數。
-const DOTS_PER_SCANLINE: u64 = 341;
-/// NTSC 下一幀的掃描線數。
-const SCANLINES_PER_FRAME: u64 = 262;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bus {
@@ -46,6 +44,10 @@ pub struct Bus {
     total_cycles: u64,
     /// 資料匯流排上最後一次讀出或寫入的值，未對映位址的讀取回傳這個。
     open_bus: u8,
+    /// 寫入 `$4014` 後、尚未執行的 OAM DMA 來源頁（高位元組）。CPU 在該指令
+    /// 結束後立刻執行並清除（見 [`Bus::run_pending_oam_dma`]），所以在幀邊界
+    /// 永遠是 `None`。
+    pending_oam_dma: Option<u8>,
 
     /// 只給 CPU 一致性測試（SingleStepTests）用：`Some` 時整個 64KB 位址
     /// 空間變成一塊 flat RAM，`read`/`write`/`peek` 直接讀寫這裡、完全繞過
@@ -69,6 +71,7 @@ impl Bus {
             joypads: [Joypad::default(); 2],
             total_cycles: 0,
             open_bus: 0,
+            pending_oam_dma: None,
             #[cfg(test)]
             test_flat_ram: None,
         }
@@ -120,9 +123,8 @@ impl Bus {
         false
     }
 
-    /// 讀取 CPU 位址空間中的一個 byte（**有**副作用：更新 `open_bus`；
-    /// Phase 2 接上真正的 PPU 之後，讀 `$2002`/`$2007` 也會在這裡清旗標/
-    /// 前進位址）。
+    /// 讀取 CPU 位址空間中的一個 byte（**有**副作用：更新 `open_bus`；讀
+    /// `$2002`/`$2004`/`$2007` 會清旗標／前進位址，讀 `$4016/$4017` 會移位）。
     pub fn read(&mut self, addr: u16) -> u8 {
         if let Some(v) = self.test_flat_ram_read(addr) {
             return v;
@@ -132,18 +134,16 @@ impl Bus {
         value
     }
 
-    /// 跟 `read` 解碼邏輯完全相同，但**沒有**副作用，給 trace log 與
-    /// debugger 用。目前 Phase 1 的 PPU/APU 還是 stub，`read`/`peek` 對它們
-    /// 而言行為一樣；但两者刻意分開實作成兩個方法，這樣 Phase 2 幫 PPU 加上
-    /// 讀取側效應時，只需要改 `read_mapped` 內 `read`/`peek` 分岔的那幾行，
-    /// 不會不小心讓 trace 也觸發側效應。
+    /// 跟 `read` 解碼邏輯相同，但**沒有**副作用，給 trace log 與 debugger 用。
+    /// 兩者刻意分開實作：`peek` 走 `Ppu::peek_register`/`Joypad::peek`，
+    /// 不會因為印一行 trace 就清掉 vblank 旗標或移動搖桿的移位暫存器。
     pub fn peek(&self, addr: u16) -> u8 {
         if let Some(v) = self.test_flat_ram_read(addr) {
             return v;
         }
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize],
-            0x2000..=0x3FFF => self.peek_ppu_register(mirror_ppu_register(addr)),
+            0x2000..=0x3FFF => self.ppu.peek_register(mirror_ppu_register(addr)),
             0x4000..=0x4017 => self.peek_apu_io_register(addr),
             0x4018..=0x401F => self.open_bus,
             0x4020..=0x5FFF => self.open_bus,
@@ -155,7 +155,10 @@ impl Bus {
     fn read_mapped(&mut self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize],
-            0x2000..=0x3FFF => self.read_ppu_register(mirror_ppu_register(addr)),
+            0x2000..=0x3FFF => {
+                let reg = mirror_ppu_register(addr);
+                self.ppu.read_register(reg, &self.cartridge)
+            }
             0x4000..=0x4017 => self.read_apu_io_register(addr),
             0x4018..=0x401F => self.open_bus,
             0x4020..=0x5FFF => self.open_bus,
@@ -172,7 +175,10 @@ impl Bus {
         self.open_bus = value;
         match addr {
             0x0000..=0x1FFF => self.ram[(addr & 0x07FF) as usize] = value,
-            0x2000..=0x3FFF => self.write_ppu_register(mirror_ppu_register(addr), value),
+            0x2000..=0x3FFF => {
+                let reg = mirror_ppu_register(addr);
+                self.ppu.write_register(reg, value, &mut self.cartridge);
+            }
             0x4000..=0x4017 => self.write_apu_io_register(addr, value),
             0x4018..=0x401F => {}
             0x4020..=0x5FFF => {}
@@ -183,53 +189,26 @@ impl Bus {
         }
     }
 
-    // ---- PPU/APU 暫存器：Phase 1 stub -----------------------------------
+    // ---- APU / IO 暫存器 -------------------------------------------------
     //
-    // 只做「每 8 bytes 鏡像」「位址落在正確範圍」的解碼，暫存器本身的讀寫
-    // 側效應（vblank 清旗標、OAMDATA/PPUDATA 自動遞增、joypad 移位暫存器
-    // 等）留到 Phase 2/3。這裡先把原始 byte 存進/取出 `Ppu`/`Apu` 對應欄位，
-    // 讓之後接上真正邏輯時至少資料本身已經在正確的地方。
-
-    fn read_ppu_register(&mut self, addr: u16) -> u8 {
-        self.peek_ppu_register(addr)
-    }
-
-    fn peek_ppu_register(&self, addr: u16) -> u8 {
-        match addr {
-            0x2000 => self.ppu.ctrl,
-            0x2001 => self.ppu.mask,
-            0x2002 => self.ppu.status,
-            0x2003 => self.ppu.oam_addr,
-            0x2004 => self.ppu.oam[self.ppu.oam_addr as usize],
-            0x2007 => self.ppu.data_buffer,
-            _ => self.open_bus,
-        }
-    }
-
-    fn write_ppu_register(&mut self, addr: u16, value: u8) {
-        match addr {
-            0x2000 => self.ppu.ctrl = value,
-            0x2001 => self.ppu.mask = value,
-            0x2003 => self.ppu.oam_addr = value,
-            0x2004 => {
-                self.ppu.oam[self.ppu.oam_addr as usize] = value;
-                self.ppu.oam_addr = self.ppu.oam_addr.wrapping_add(1);
-            }
-            0x2005 | 0x2006 => {} // scroll / addr latch：Phase 2
-            0x2007 => self.ppu.data_buffer = value,
-            _ => {}
-        }
-    }
+    // APU 仍是 stub（尚未實作）：只把原始 byte 存進對應欄位。`$4014`（OAM DMA）
+    // 與 `$4016/$4017`（搖桿）是本階段的真正實作。
 
     fn read_apu_io_register(&mut self, addr: u16) -> u8 {
-        self.peek_apu_io_register(addr)
+        match addr {
+            // 搖桿只驅動資料匯流排的 bit0；高位元是 open bus（實機上通常是
+            // 位址高位元組 `$40`，這裡由上一次匯流排值自然帶出）。
+            0x4016 => (self.open_bus & 0xE0) | self.joypads[0].read(),
+            0x4017 => (self.open_bus & 0xE0) | self.joypads[1].read(),
+            _ => self.peek_apu_io_register(addr),
+        }
     }
 
     fn peek_apu_io_register(&self, addr: u16) -> u8 {
         match addr {
             0x4015 => self.apu.status,
-            // $4016/$4017 是搖桿的移位暫存器讀取，真正的按鍵回傳邏輯屬於
-            // Phase 2/3（joypad shift register），這裡先回傳 open bus。
+            0x4016 => (self.open_bus & 0xE0) | self.joypads[0].peek(),
+            0x4017 => (self.open_bus & 0xE0) | self.joypads[1].peek(),
             _ => self.open_bus,
         }
     }
@@ -241,13 +220,13 @@ impl Bus {
             0x4008..=0x400B => self.apu.triangle[(addr - 0x4008) as usize] = value,
             0x400C..=0x400F => self.apu.noise[(addr - 0x400C) as usize] = value,
             0x4010..=0x4013 => self.apu.dmc[(addr - 0x4010) as usize] = value,
-            0x4014 => {} // OAM DMA：Phase 2
+            0x4014 => self.pending_oam_dma = Some(value),
             0x4015 => self.apu.status = value,
             0x4016 => {
                 // $4016 bit0 是兩個搖桿共用的 strobe。
                 let strobe = value & 0x01 != 0;
-                self.joypads[0].strobe = strobe;
-                self.joypads[1].strobe = strobe;
+                self.joypads[0].write_strobe(strobe);
+                self.joypads[1].write_strobe(strobe);
             }
             0x4017 => self.apu.frame_counter = value,
             _ => {}
@@ -256,9 +235,15 @@ impl Bus {
 
     // ---- 計時 ----------------------------------------------------------
 
-    /// 累加 CPU cycle 數。PPU 的 dot 數是 CPU cycle 數的 3 倍（NTSC）。
+    /// 累加 CPU cycle 數，並讓 PPU 追上（catch-up）：PPU 時脈是 CPU 的 3 倍
+    /// （NTSC），所以每個 CPU cycle 推進 3 個 PPU dot。
     pub fn tick(&mut self, cycles: u8) {
+        self.advance(cycles as u32);
+    }
+
+    fn advance(&mut self, cycles: u32) {
         self.total_cycles += cycles as u64;
+        self.ppu.step_dots(cycles * 3, &self.cartridge);
     }
 
     pub fn total_cycles(&self) -> u64 {
@@ -267,12 +252,33 @@ impl Bus {
 
     /// 目前的 PPU `(scanline, cycle)`，給 trace 的 `PPU:` 欄位用。
     pub fn ppu_dot(&self) -> (u16, u16) {
-        let dots_per_frame = DOTS_PER_SCANLINE * SCANLINES_PER_FRAME;
-        let dots = (self.total_cycles * 3) % dots_per_frame;
-        (
-            (dots / DOTS_PER_SCANLINE) as u16,
-            (dots % DOTS_PER_SCANLINE) as u16,
-        )
+        (self.ppu.scanline, self.ppu.cycle)
+    }
+
+    /// CPU 在指令之間呼叫：PPU 有沒有一個待處理的 NMI。
+    pub(crate) fn take_nmi(&mut self) -> bool {
+        self.ppu.take_nmi()
+    }
+
+    /// 執行 `$4014` 觸發的 OAM DMA（如果有）：把 `page << 8` 起的 256 byte
+    /// 複製進 OAM（從目前的 OAMADDR 開始、繞回），CPU 暫停 513 個 cycle，
+    /// 若 DMA 起始 cycle 是奇數則 514 個。回傳暫停的 cycle 數（沒有 DMA 則 0）。
+    ///
+    /// instruction-level 的近似：複製在該指令結束後「瞬間」完成，接著才讓 PPU
+    /// 追上暫停的 cycle 數。DMA 通常在 vblank 進行，不影響渲染。
+    pub(crate) fn run_pending_oam_dma(&mut self) -> u32 {
+        let Some(page) = self.pending_oam_dma.take() else {
+            return 0;
+        };
+        let base = (page as u16) << 8;
+        let start = self.ppu.oam_addr;
+        for i in 0..256u16 {
+            let byte = self.read(base.wrapping_add(i));
+            self.ppu.oam[start.wrapping_add(i as u8) as usize] = byte;
+        }
+        let stall = 513 + (self.total_cycles & 1) as u32;
+        self.advance(stall);
+        stall
     }
 }
 
@@ -357,5 +363,97 @@ mod tests {
         let before = bus.peek(0x2004);
         let after = bus.peek(0x2004);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn oam_dma_copies_a_page_starting_at_oamaddr_and_wraps() {
+        let mut bus = Bus::new(test_cartridge());
+        for i in 0..256usize {
+            bus.ram[0x200 + i] = i as u8;
+        }
+        bus.write(0x2003, 0x10); // OAMADDR = $10
+        bus.write(0x4014, 0x02);
+        let stall = bus.run_pending_oam_dma();
+
+        assert!(stall == 513 || stall == 514);
+        assert_eq!(bus.ppu.oam[0x10], 0, "複製從 OAMADDR 開始");
+        assert_eq!(bus.ppu.oam[0x11], 1);
+        assert_eq!(bus.ppu.oam[0x0F], 255, "繞回 OAM 開頭");
+        assert_eq!(bus.ppu.oam_addr, 0x10, "OAMADDR 維持不變");
+        assert_eq!(bus.run_pending_oam_dma(), 0, "只執行一次");
+    }
+
+    #[test]
+    fn oam_dma_stall_is_514_cycles_when_started_on_an_odd_cycle() {
+        let mut even = Bus::new(test_cartridge());
+        even.write(0x4014, 0x00);
+        let a = even.run_pending_oam_dma();
+
+        let mut odd = Bus::new(test_cartridge());
+        odd.tick(1);
+        odd.write(0x4014, 0x00);
+        let b = odd.run_pending_oam_dma();
+
+        assert_eq!((a, b), (513, 514));
+        assert_eq!(odd.total_cycles(), 1 + 514);
+    }
+
+    #[test]
+    fn joypad_registers_shift_through_the_bus_and_have_open_bus_high_bits() {
+        let mut bus = Bus::new(test_cartridge());
+        bus.joypads[0].state = crate::joypad::Buttons::A | crate::joypad::Buttons::LEFT;
+        bus.joypads[1].state = crate::joypad::Buttons::B;
+        bus.write(0x4016, 1);
+        bus.write(0x4016, 0);
+
+        // 先把匯流排上的值設成 $40（實機上是位址高位元組）。
+        bus.open_bus = 0x40;
+        assert_eq!(bus.read(0x4016), 0x41, "A 有按");
+        bus.open_bus = 0x40;
+        assert_eq!(bus.read(0x4016), 0x40, "B 沒按");
+        bus.open_bus = 0x40;
+        assert_eq!(bus.read(0x4017), 0x40, "玩家 2 的 A 沒按");
+        bus.open_bus = 0x40;
+        assert_eq!(bus.read(0x4017), 0x41, "玩家 2 的 B 有按");
+
+        // peek 不移位。
+        let before = bus.peek(0x4016);
+        assert_eq!(bus.peek(0x4016), before);
+    }
+
+    #[test]
+    fn ppu_registers_are_reachable_through_the_bus_with_side_effects() {
+        let mut bus = Bus::new(test_cartridge());
+        bus.write(0x2006, 0x21);
+        bus.write(0x2006, 0x00);
+        bus.write(0x2007, 0x5A);
+        bus.write(0x2006, 0x21);
+        bus.write(0x2006, 0x00);
+        let _stale = bus.read(0x2007);
+        assert_eq!(bus.read(0x2007), 0x5A, "經 bus 讀 $2007 有緩衝的副作用");
+        // 鏡像：$3FFF 等於 $2007。
+        bus.write(0x2006, 0x21);
+        bus.write(0x2006, 0x00);
+        let _stale = bus.read(0x3FFF);
+        assert_eq!(bus.read(0x2007), 0x5A);
+    }
+
+    #[test]
+    fn nmi_is_taken_between_instructions_and_costs_7_cycles() {
+        use crate::cpu::Cpu;
+        let mut bus = Bus::new(test_cartridge());
+        bus.ppu.ctrl = 0x80;
+        let mut cpu = Cpu::new(bus);
+        cpu.pc = 0x8000;
+        while cpu.bus().ppu.scanline < 241 || cpu.bus().ppu.cycle < 3 {
+            cpu.step();
+        }
+        let before = cpu.bus().total_cycles();
+        let sp = cpu.sp;
+        let cycles = cpu.step();
+        assert_eq!(cycles, 7);
+        assert_eq!(cpu.bus().total_cycles(), before + 7);
+        assert_eq!(cpu.sp, sp.wrapping_sub(3), "推入 PC（2）與 P（1）");
+        assert!(cpu.status.contains(crate::cpu::StatusFlags::INTERRUPT));
     }
 }

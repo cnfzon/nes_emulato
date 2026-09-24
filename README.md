@@ -4,12 +4,13 @@
 「應用軟體設計」課程的期末專案，涵蓋作業系統（多執行緒／timing）、視窗環境
 （egui GUI）、網路環境（UDP rollback netplay）、以及整合設計四大主題。
 
-> **目前狀態：Phase 1（6502 CPU）。** CPU 已實作完成並通過 nestest（8991
-> 行逐指令比對全數通過，含官方與非官方 opcode）與 SingleStepTests（官方
-> opcode 100%、任務要求的非官方 opcode 100%）。PPU 還是 stub，`nes-app`
-> 顯示的仍是一張依幀數捲動的測試畫面，不是真正的遊戲畫面（PPU 渲染排進
-> Phase 2）。詳見 [`docs/architecture.md`](docs/architecture.md) 與各 crate
-> 原始碼中的 `TODO Phase 2` 註解。
+> **目前狀態：Phase 2（PPU、NMI、OAM DMA、搖桿）。** CPU 通過 nestest（8991
+> 行逐指令比對全數通過）與 SingleStepTests 回歸閘門；PPU 以 scanline 為單位渲染
+> （含 loopy 捲動、精靈、8×16、sprite 0 hit、NMI），NROM 遊戲理論上可以遊玩
+> （尚未以真實遊戲驗證，見 [`docs/manual-test-phase2.md`](docs/manual-test-phase2.md)）。
+> APU 仍是 stub、只支援 mapper 0（NROM）。CPU 與 PPU 的時序模型（instruction-level
+> + catch-up）與限制、blargg 測試結果見 [`docs/architecture.md`](docs/architecture.md)
+> §13–§14。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
@@ -48,7 +49,20 @@ cargo run -p nes-app
 
 # 解析一份 iNES ROM 的 header
 cargo run -p nes-test -- info path/to/rom.nes
+
+# 跑 blargg test ROM（$6000 結果協定；舊版 ROM 會判讀畫面文字）
+cargo run --release -p nes-test -- blargg roms/nes-test-roms/instr_test-v5/rom_singles/01-basics.nes
+
+# 跑 N 幀後存成 PNG／印出畫面雜湊（視覺除錯、黃金畫面）
+cargo run --release -p nes-test -- screenshot path/to/rom.nes out.png --frames 120
+cargo run --release -p nes-test -- golden path/to/rom.nes --frames 120
+
+# run_frame 效能（CPU + PPU 合計）
+cargo run --release -p nes-core --features testing --example bench_run_frame
 ```
+
+遊戲操作（`nes-app`）：方向鍵、Z = B、X = A、Enter = Start、右 Shift = Select；
+F5 存檔、F9 讀檔。
 
 ## 交付與效能量測
 
