@@ -5,9 +5,12 @@
 //! 累加，只要累積夠一幀的時間預算就推進一幀，這樣長時間下來的平均幀率會
 //! 準確收斂到目標值，不會因為 `sleep` 本身不精確而持續漂移。
 //!
+//! 音訊：每跑完一幀就把核心產生的取樣送進 `AudioShared` 的環形緩衝區（見 `audio.rs`），並依
+//! 緩衝區的填充程度微調核心的輸出取樣率（動態速率控制，±0.5%）。**節拍仍由這裡的計時器掌控，
+//! 不由音訊裝置驅動**；音訊裝置的時脈與這個計時器的長期漂移由動態速率控制吸收。
+//!
 //! TODO：之後可以換成 `spin_sleep`（忙等 + 讓出時間片混合，減少 sleep 的
-//! 系統排程抖動）或改由音訊裝置的 callback 驅動節奏（音訊硬體的時脈通常
-//! 比作業系統計時器更穩定）。
+//! 系統排程抖動）。
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use nes_core::{Buttons, DebugSnapshot, FrameBuffer, Nes, PpuViews};
 
+use crate::audio::{AudioProducer, RateController};
 use crate::commands::{EmuCommand, EmuEvent};
 
 const TARGET_FPS: f64 = 60.0988;
@@ -79,13 +83,70 @@ fn publish_state(nes: &Nes, sinks: &mut DebugSinks, event_tx: &Sender<EmuEvent>,
     let _ = event_tx.send(EmuEvent::FrameAdvanced(nes.frame_count()));
 }
 
+/// 音訊在 emu 執行緒這一側的狀態。
+struct AudioSide {
+    /// 環形緩衝區的生產者端（emu 執行緒獨占）。
+    output: AudioProducer,
+    rate: RateController,
+    /// 聽得到的聲道（換 ROM 之後要重新套用）。
+    channel_mask: u8,
+    /// 核心吐出的取樣的暫存區（重複使用，避免每幀配置）。
+    scratch: Vec<f32>,
+}
+
+impl AudioSide {
+    fn new(output: AudioProducer) -> Self {
+        let rate = RateController::new(output.target_fill());
+        Self {
+            output,
+            rate,
+            channel_mask: nes_core::apu::ALL_CHANNELS,
+            scratch: Vec::with_capacity(4096),
+        }
+    }
+
+    /// 新的 `Nes`（載入 ROM）：套用輸出取樣率與聲道遮罩，丟掉舊的取樣。
+    fn configure(&mut self, nes: &mut Nes) {
+        if self.output.is_active() {
+            nes.set_audio_sample_rate(f64::from(self.output.device_rate()));
+        }
+        nes.set_audio_channel_mask(self.channel_mask);
+        self.output.flush();
+        self.rate.reset(self.output.target_fill());
+    }
+
+    /// 一幀跑完：把取樣送去播放，並微調下一幀的輸出取樣率。
+    fn after_frame(&mut self, nes: &mut Nes) {
+        self.scratch.clear();
+        nes.drain_audio(&mut self.scratch);
+        if !self.output.is_active() {
+            return;
+        }
+        self.output.push_samples(&self.scratch);
+        let device = f64::from(self.output.device_rate());
+        let rate = self
+            .rate
+            .update(self.output.fill(), self.output.target_fill(), device);
+        nes.set_audio_sample_rate(rate);
+        self.output.set_current_rate(rate);
+    }
+
+    /// 暫停中（單步、讀檔……）產生的取樣不播放，直接丟掉。
+    fn discard(&mut self, nes: &mut Nes) {
+        self.scratch.clear();
+        nes.drain_audio(&mut self.scratch);
+    }
+}
+
 pub fn run(
     cmd_rx: Receiver<EmuCommand>,
     event_tx: Sender<EmuEvent>,
     mut frame_input: triple_buffer::Input<FrameBuffer>,
     debug_input: triple_buffer::Input<Option<DebugSnapshot>>,
     views_input: triple_buffer::Input<Option<PpuViews>>,
+    audio: AudioProducer,
 ) {
+    let mut audio = AudioSide::new(audio);
     let frame_duration = Duration::from_secs_f64(1.0 / TARGET_FPS);
 
     let mut nes: Option<Nes> = None;
@@ -106,6 +167,10 @@ pub fn run(
     let mut fps_window_start = Instant::now();
     let mut fps_window_frames: u64 = 0;
 
+    // 測試用屏障（`EmuCommand::Barrier`）：本輪結果發布之後才回覆。
+    #[cfg(test)]
+    let mut barriers: Vec<Sender<()>> = Vec::new();
+
     'outer: loop {
         // 本輪指令處理是否改變了模擬狀態（載入 ROM/讀檔/單步）。改變了就要
         // 立刻重發快照與幀數——暫停中 `run_frame` 不會再被呼叫，不補發的話
@@ -115,8 +180,9 @@ pub fn run(
         for cmd in cmd_rx.try_iter() {
             match cmd {
                 EmuCommand::LoadRom(bytes) => match Nes::from_rom(&bytes) {
-                    Ok(new_nes) => {
+                    Ok(mut new_nes) => {
                         let info = new_nes.rom_info().clone();
+                        audio.configure(&mut new_nes);
                         nes = Some(new_nes);
                         state_changed = true;
                         let _ = event_tx.send(EmuEvent::RomLoaded(info));
@@ -130,8 +196,21 @@ pub fn run(
                         *slot = buttons;
                     }
                 }
-                EmuCommand::Pause => paused = true,
-                EmuCommand::Resume => paused = false,
+                EmuCommand::Pause => {
+                    paused = true;
+                    audio.output.set_paused(true);
+                }
+                EmuCommand::Resume => {
+                    paused = false;
+                    audio.rate.reset(audio.output.target_fill());
+                    audio.output.set_paused(false);
+                }
+                EmuCommand::SetAudioChannelMask(mask) => {
+                    audio.channel_mask = mask;
+                    if let Some(n) = &mut nes {
+                        n.set_audio_channel_mask(mask);
+                    }
+                }
                 EmuCommand::SetDebugEnabled(enabled) => {
                     sinks.enabled = enabled;
                     // 剛打開面板時立刻送一份目前狀態，不必等到下一幀
@@ -196,11 +275,21 @@ pub fn run(
                     }
                 }
                 EmuCommand::Quit => break 'outer,
+                #[cfg(test)]
+                EmuCommand::Barrier(ack) => barriers.push(ack),
             }
         }
 
         if state_changed && let Some(n) = &nes {
             publish_state(n, &mut sinks, &event_tx, true);
+        }
+        // 暫停中單步、讀檔產生的音訊不播放（暫停時要完全靜音）。
+        if paused && let Some(n) = &mut nes {
+            audio.discard(n);
+        }
+        #[cfg(test)]
+        for ack in barriers.drain(..) {
+            let _ = ack.send(());
         }
 
         let now = Instant::now();
@@ -212,6 +301,7 @@ pub fn run(
             if !paused && let Some(n) = &mut nes {
                 let fb = n.run_frame(current_input).clone();
                 frame_input.write(fb);
+                audio.after_frame(n);
                 fps_window_frames += 1;
                 publish_state(n, &mut sinks, &event_tx, false);
             }
@@ -248,6 +338,97 @@ mod tests {
         bytes
     }
 
+    /// 測試裡等待事件／屏障的「卡死保護」上限：只用來在 emu 執行緒真的卡死時讓測試失敗而不是
+    /// 永遠掛著，**不是**時序假設——正常情況下每個等待都是事件驅動、立刻返回。
+    const HANG_GUARD: Duration = Duration::from_secs(120);
+
+    /// 啟動 emu 執行緒的測試工具：通道、triple buffer 的讀端、執行緒 handle。
+    struct Spawned {
+        cmd_tx: Sender<EmuCommand>,
+        event_rx: Receiver<EmuEvent>,
+        debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
+        views_output: triple_buffer::Output<Option<PpuViews>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl Spawned {
+        fn start(audio: AudioProducer) -> Self {
+            let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
+            let (event_tx, event_rx) = crossbeam_channel::unbounded::<EmuEvent>();
+            let (frame_input, _frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
+            let (debug_input, debug_output) =
+                triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
+            let (views_input, views_output) =
+                triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
+            let handle = thread::spawn(move || {
+                run(
+                    cmd_rx,
+                    event_tx,
+                    frame_input,
+                    debug_input,
+                    views_input,
+                    audio,
+                )
+            });
+            Self {
+                cmd_tx,
+                event_rx,
+                debug_output,
+                views_output,
+                handle,
+            }
+        }
+
+        /// 屏障：等 emu 執行緒處理完先前送出的所有指令（含發布的快照、事件、音訊）。
+        fn barrier(&self) {
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+            self.cmd_tx.send(EmuCommand::Barrier(ack_tx)).unwrap();
+            ack_rx
+                .recv_timeout(HANG_GUARD)
+                .expect("emu 執行緒沒有回應屏障");
+        }
+
+        /// 阻塞等下一個 `RomLoaded`（途中其他事件略過）。
+        fn wait_rom_loaded(&self) {
+            loop {
+                match self.event_rx.recv_timeout(HANG_GUARD) {
+                    Ok(EmuEvent::RomLoaded(_)) => return,
+                    Ok(_) => {}
+                    Err(e) => panic!("等不到 RomLoaded：{e}"),
+                }
+            }
+        }
+
+        /// 阻塞等到至少有 `n` 幀完成（`FrameAdvanced(f)`，`f >= n`）。emu 執行緒的幀是真實時間
+        /// 驅動的，但這裡只等「進度」，不假設多快。
+        fn wait_frames(&self, n: u64) {
+            loop {
+                match self.event_rx.recv_timeout(HANG_GUARD) {
+                    Ok(EmuEvent::FrameAdvanced(f)) if f >= n => return,
+                    Ok(_) => {}
+                    Err(e) => panic!("等不到第 {n} 幀：{e}"),
+                }
+            }
+        }
+
+        /// 阻塞等「現在起」再完成 `k` 幀：先丟掉已經在佇列裡的舊事件，記下最新的幀數，再等
+        /// 到幀數增加 `k`。用在「先改了設定（屏障確認生效），再看之後的幀」的情境。
+        fn wait_new_frames(&self, k: u64) {
+            let mut latest = 0;
+            for event in self.event_rx.try_iter() {
+                if let EmuEvent::FrameAdvanced(f) = event {
+                    latest = latest.max(f);
+                }
+            }
+            self.wait_frames(latest + k);
+        }
+
+        fn quit(self) {
+            self.cmd_tx.send(EmuCommand::Quit).unwrap();
+            self.handle.join().unwrap();
+        }
+    }
+
     /// 不需要 GUI 的迴歸測試：啟動真正的 emu 執行緒、載入 ROM、打開
     /// debug 開關、跑數幀，確認收到的 `DebugSnapshot` 不是「沒資料」也不是
     /// `DebugSnapshot::default()`，欄位看起來合理，最後正常關閉執行緒。
@@ -257,45 +438,29 @@ mod tests {
     /// `nes-core`，沒有人測過 emu 執行緒到 UI 這段真正的資料傳輸路徑。
     #[test]
     fn emu_thread_streams_real_debug_snapshots_while_running() {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<EmuEvent>();
-        let (frame_input, _frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
-        let (debug_input, mut debug_output) =
-            triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
-        let (views_input, _views_output) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
+        let mut emu = Spawned::start(crate::audio::disabled_audio());
+        emu.cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
+        emu.wait_rom_loaded();
+        emu.cmd_tx.send(EmuCommand::SetDebugEnabled(true)).unwrap();
+        // 屏障：確認面板已啟用（負載下，幀可能在這個指令被處理之前就已經跑了好幾幀）。
+        emu.barrier();
 
-        let handle =
-            thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
+        // 之後再完成 2 幀：`publish_state` 先寫快照、再送 `FrameAdvanced`，所以收到事件時快照
+        // 已經是那一幀的內容。等的是進度（事件），不是牆鐘時間。
+        emu.wait_new_frames(2);
+        let snap = emu
+            .debug_output
+            .read()
+            .clone()
+            .expect("執行中且面板開著，必須有快照");
 
-        cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
-        match event_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(EmuEvent::RomLoaded(_)) => {}
-            other => panic!("expected RomLoaded, got {other:?}"),
-        }
-
-        cmd_tx.send(EmuCommand::SetDebugEnabled(true)).unwrap();
-
-        // Poll 直到看到「跑過至少一幀」的快照，或逾時失敗——emu 執行緒的
-        // 節奏是真實時間驅動的，不是決定性的，所以用 poll 而不是固定次數。
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut observed: Option<DebugSnapshot> = None;
-        while Instant::now() < deadline {
-            if let Some(snap) = debug_output.read().clone()
-                && snap.cpu_cycles > 0
-            {
-                observed = Some(snap);
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-
-        let snap = observed.expect("沒有在逾時前收到有進度的 DebugSnapshot");
         assert_ne!(snap, DebugSnapshot::default());
         assert!(snap.cpu_cycles > 0);
-        assert_eq!(snap.cpu_sp, 0xFD, "test_rom 的內容不會動到堆疊指標");
-
-        cmd_tx.send(EmuCommand::Quit).unwrap();
-        handle.join().unwrap();
+        assert!(snap.frame_count >= 2, "快照的幀數 {}", snap.frame_count);
+        // 註：`test_rom` 全是 `$AA`，PC 會一路跑過 `$FFFF` 進入 RAM 的 `BRK`，所以 SP 不是固定值
+        //（舊版測試只讀到第 0 幀的快照，才碰巧是 `$FD`）。這裡只檢查「真的在前進」。
+        assert!(snap.ppu_frame >= 1, "PPU 已經跑過至少一幀");
+        emu.quit();
     }
 
     /// 啟動 emu 執行緒、載入測試 ROM、暫停並打開 debug 快照。
@@ -309,33 +474,29 @@ mod tests {
 
     impl Harness {
         fn start_paused() -> Self {
-            let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
-            let (event_tx, event_rx) = crossbeam_channel::unbounded::<EmuEvent>();
-            let (frame_input, _frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
-            let (debug_input, debug_output) =
-                triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
-            let (views_input, views_output) =
-                triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
-            let handle =
-                thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
-
-            cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
-            cmd_tx.send(EmuCommand::Pause).unwrap();
-            cmd_tx.send(EmuCommand::SetDebugEnabled(true)).unwrap();
+            let emu = Spawned::start(crate::audio::disabled_audio());
+            emu.cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
+            emu.cmd_tx.send(EmuCommand::Pause).unwrap();
+            emu.cmd_tx.send(EmuCommand::SetDebugEnabled(true)).unwrap();
             let mut h = Self {
-                cmd_tx,
-                event_rx,
-                debug_output,
-                views_output,
-                handle,
+                cmd_tx: emu.cmd_tx,
+                event_rx: emu.event_rx,
+                debug_output: emu.debug_output,
+                views_output: emu.views_output,
+                handle: emu.handle,
             };
             h.settle();
             h
         }
 
-        /// 等 emu 執行緒處理完已送出的指令（暫停中沒有新幀，狀態會靜止）。
+        /// 等 emu 執行緒處理完已送出的所有指令（屏障；暫停中沒有新幀，狀態會靜止）。
+        /// 不依賴時間：命令依序處理，屏障的回覆在本輪結果發布之後才送出。
         fn settle(&mut self) {
-            thread::sleep(Duration::from_millis(100));
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+            self.cmd_tx.send(EmuCommand::Barrier(ack_tx)).unwrap();
+            ack_rx
+                .recv_timeout(HANG_GUARD)
+                .expect("emu 執行緒沒有回應屏障");
         }
 
         fn snapshot(&mut self) -> DebugSnapshot {
@@ -396,25 +557,17 @@ mod tests {
 
     #[test]
     fn step_commands_are_rejected_while_running() {
-        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded::<EmuEvent>();
-        let (frame_input, _f) = triple_buffer::triple_buffer(&FrameBuffer::blank());
-        let (debug_input, _d) = triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
-        let (views_input, _v) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
-        let handle =
-            thread::spawn(move || run(cmd_rx, event_tx, frame_input, debug_input, views_input));
-
-        cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
-        cmd_tx.send(EmuCommand::StepInstruction).unwrap();
-        cmd_tx.send(EmuCommand::StepFrame).unwrap();
-        thread::sleep(Duration::from_millis(100));
-        cmd_tx.send(EmuCommand::Quit).unwrap();
-        handle.join().unwrap();
-
-        let errors = event_rx
+        let emu = Spawned::start(crate::audio::disabled_audio());
+        emu.cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
+        emu.cmd_tx.send(EmuCommand::StepInstruction).unwrap();
+        emu.cmd_tx.send(EmuCommand::StepFrame).unwrap();
+        emu.barrier();
+        let errors = emu
+            .event_rx
             .try_iter()
             .filter(|e| matches!(e, EmuEvent::Error(_)))
             .count();
+        emu.quit();
         assert_eq!(errors, 2);
     }
 
@@ -486,5 +639,52 @@ mod tests {
         h.settle();
         assert!(h.views_output.update(), "單步之後應立即有新影像");
         h.quit();
+    }
+
+    /// 執行中：每幀的音訊取樣被送進環形緩衝區；沒有消費者時緩衝區會被填到上限、多出來的
+    /// 丟掉並計數；緩衝區偏滿時動態速率控制把輸出取樣率調低（但不超過 −0.5%）。
+    #[test]
+    fn emu_thread_feeds_the_audio_ring_and_applies_rate_control() {
+        let (audio, producer, _consumer) = crate::audio::audio_channel(48_000);
+        let emu = Spawned::start(producer);
+        emu.cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
+        emu.wait_rom_loaded();
+
+        // 每幀約 800 個取樣、上限 7200：跑滿 30 幀一定會開始丟取樣。等的是「幀數」（進度），
+        // 不是牆鐘時間；每幀的音訊在 `FrameAdvanced` 之前就已經送進緩衝區。
+        emu.wait_frames(30);
+
+        let cap = audio.target_fill() * 3;
+        assert!(audio.fill() > audio.target_fill(), "取樣有送進緩衝區");
+        assert!(audio.fill() <= cap, "不超過延遲上限");
+        assert!(audio.dropped() > 0, "沒人消費 → 超過上限的取樣被丟掉");
+        let rate = audio.current_rate();
+        assert!(
+            (48_000.0 * 0.995 - 1e-6..48_000.0).contains(&rate),
+            "速率 {rate}"
+        );
+        emu.quit();
+    }
+
+    /// 暫停中單步一幀不會有聲音：取樣被丟掉，不進緩衝區；繼續之後才又有取樣。
+    #[test]
+    fn paused_stepping_does_not_feed_the_audio_ring() {
+        let (audio, producer, _consumer) = crate::audio::audio_channel(48_000);
+        let emu = Spawned::start(producer);
+        emu.cmd_tx.send(EmuCommand::LoadRom(test_rom())).unwrap();
+        emu.cmd_tx.send(EmuCommand::Pause).unwrap();
+        emu.barrier();
+        let before = audio.fill();
+
+        for _ in 0..5 {
+            emu.cmd_tx.send(EmuCommand::StepFrame).unwrap();
+        }
+        emu.barrier();
+        assert_eq!(audio.fill(), before, "暫停時單步的音訊不進緩衝區");
+
+        emu.cmd_tx.send(EmuCommand::Resume).unwrap();
+        emu.wait_frames(8); // 單步 5 幀之後，繼續跑到第 8 幀
+        assert!(audio.fill() > before, "繼續之後又有取樣");
+        emu.quit();
     }
 }

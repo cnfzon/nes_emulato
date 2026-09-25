@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use nes_core::{Buttons, DebugSnapshot, PpuViews, RomInfo};
 
+use crate::audio::AudioOutput;
 use crate::commands::{EmuCommand, EmuEvent};
 use crate::debugger::DebuggerUi;
 use crate::input::{
@@ -36,6 +37,14 @@ pub struct NesApp {
     paused: bool,
     /// Debugger 面板「trace 到檔案」要記錄的指令數。
     trace_count: u32,
+
+    /// 音訊輸出（持有 cpal 的串流與共享狀態）。
+    audio: AudioOutput,
+    /// 主音量（0.0–1.0）與靜音。
+    volume: f32,
+    muted: bool,
+    /// 聽得到的 APU 聲道（`nes_core::apu::CHANNEL_*` 位元）。
+    channel_mask: u8,
 }
 
 impl NesApp {
@@ -46,7 +55,10 @@ impl NesApp {
         debug_output: triple_buffer::Output<Option<DebugSnapshot>>,
         views_output: triple_buffer::Output<Option<PpuViews>>,
         emu_handle: JoinHandle<()>,
+        audio: AudioOutput,
     ) -> Self {
+        let volume = 0.7;
+        audio.shared.set_volume(volume, false);
         Self {
             cmd_tx,
             event_rx,
@@ -65,7 +77,15 @@ impl NesApp {
             quit_requested: false,
             paused: false,
             trace_count: 1000,
+            audio,
+            volume,
+            muted: false,
+            channel_mask: nes_core::apu::ALL_CHANNELS,
         }
+    }
+
+    fn apply_volume(&self) {
+        self.audio.shared.set_volume(self.volume, self.muted);
     }
 
     fn toggle_pause(&mut self) {
@@ -177,6 +197,20 @@ impl NesApp {
         }
     }
 
+    /// 狀態列的音訊資訊：緩衝區填充量與累計 underrun 次數（沒有裝置時顯示提示）。
+    fn audio_status_label(&self, ui: &mut egui::Ui) {
+        let shared = &self.audio.shared;
+        if !shared.is_active() {
+            ui.colored_label(egui::Color32::YELLOW, "音訊：無裝置（無聲）");
+            return;
+        }
+        let fill_ms = shared.fill_ms();
+        ui.label(format!(
+            "音訊：緩衝 {fill_ms:.0} ms | underrun {}",
+            shared.underruns()
+        ));
+    }
+
     fn ensure_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
         let fb = self.frame_output.read();
         let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -233,6 +267,35 @@ impl eframe::App for NesApp {
                             .send(EmuCommand::SetDebugEnabled(self.show_debugger));
                     }
                 });
+                ui.menu_button("Audio", |ui| {
+                    if ui.checkbox(&mut self.muted, "靜音").changed() {
+                        self.apply_volume();
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("音量");
+                        if ui
+                            .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(true))
+                            .changed()
+                        {
+                            self.apply_volume();
+                        }
+                    });
+                    ui.separator();
+                    match (&self.audio.device_name, &self.audio.notice) {
+                        (_, Some(notice)) => {
+                            ui.colored_label(egui::Color32::YELLOW, notice);
+                        }
+                        (Some(name), None) => {
+                            ui.label(format!(
+                                "裝置：{name}（{} Hz）",
+                                self.audio.shared.device_rate()
+                            ));
+                        }
+                        (None, None) => {
+                            ui.label("裝置：（未知）");
+                        }
+                    }
+                });
                 ui.menu_button("Emulation", |ui| {
                     let pause_label = if self.paused { "Resume" } else { "Pause" };
                     if ui.button(pause_label).clicked() {
@@ -280,6 +343,8 @@ impl eframe::App for NesApp {
                     .as_ref()
                     .map_or(self.frame_count, |s| s.frame_count);
                 ui.label(format!("Frame: {frame}"));
+                ui.separator();
+                self.audio_status_label(ui);
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
@@ -298,7 +363,13 @@ impl eframe::App for NesApp {
                     ui.heading("Debugger");
                     self.debugger_controls(ui);
                     ui.separator();
-                    self.debugger.show(ui, snapshot.as_ref());
+                    self.debugger.show(
+                        ui,
+                        snapshot.as_ref(),
+                        &self.audio.shared,
+                        &mut self.channel_mask,
+                        &self.cmd_tx,
+                    );
                 });
         }
 

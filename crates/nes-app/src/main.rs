@@ -8,6 +8,9 @@
 //! 兩條執行緒間：`crossbeam-channel` 傳指令/事件（`commands.rs`），
 //! `triple_buffer` 傳最新畫面、Debug 快照與 PPU 影像（不需要鎖，UI 執行緒讀取時
 //! 不會擋到 emu 執行緒寫入下一幀）。
+//!
+//! 音訊：emu 執行緒把核心產生的取樣送進無鎖環形緩衝區，系統的音訊執行緒（cpal callback）
+//! 從裡面取（見 `audio.rs`）。`cpal::Stream` 留在 UI 執行緒（`NesApp` 持有）。
 
 mod app;
 mod audio;
@@ -49,15 +52,36 @@ fn install_cjk_fonts(ctx: &egui::Context) {
 fn main() -> eframe::Result {
     env_logger::init();
 
+    // 診斷：不開視窗，只在真實音訊裝置上跑幾秒（音量 0），印出緩衝區與 underrun 統計。
+    if std::env::args().any(|a| a == "--audio-selftest") {
+        print!("{}", audio::selftest(12.0));
+        return Ok(());
+    }
+
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<EmuCommand>();
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<commands::EmuEvent>();
     let (frame_input, frame_output) = triple_buffer::triple_buffer(&FrameBuffer::blank());
     let (debug_input, debug_output) = triple_buffer::triple_buffer::<Option<DebugSnapshot>>(&None);
     let (views_input, views_output) = triple_buffer::triple_buffer::<Option<PpuViews>>(&None);
 
+    // 找不到音訊裝置也照常執行（無聲），提示由 UI 顯示。
+    let mut audio = audio::AudioOutput::start();
+    let audio_producer = audio
+        .take_producer()
+        .expect("AudioOutput::start 一定帶著生產者端");
+
     let emu_handle = thread::Builder::new()
         .name("nes-emu".to_string())
-        .spawn(move || emu::run(cmd_rx, event_tx, frame_input, debug_input, views_input))
+        .spawn(move || {
+            emu::run(
+                cmd_rx,
+                event_tx,
+                frame_input,
+                debug_input,
+                views_input,
+                audio_producer,
+            )
+        })
         .expect("failed to spawn emu thread");
 
     let native_options = eframe::NativeOptions {
@@ -79,6 +103,7 @@ fn main() -> eframe::Result {
                 debug_output,
                 views_output,
                 emu_handle,
+                audio,
             )))
         }),
     )

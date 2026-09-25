@@ -57,6 +57,10 @@ cargo run -p nes-test -- golden <rom.nes> [--frames N]
 沒有這個協定，只把結果印在畫面上；此時 `blargg` 會讀 nametable 0 的文字（tile
 編號當 ASCII）判讀 `$01`（通過）或 `PASSED`。
 
+Phase 3.5 起也用它跑 APU 與中斷測試（`apu_test/rom_singles/*`、`apu_test/apu_test.nes`、
+`blargg_apu_2005.07.30/*`（2005 舊版，判讀畫面上的 `$01`）、`apu_reset/*`（會要求 reset）、
+`cpu_interrupts_v2/rom_singles/*`）；結果與預期失敗的原因見 `docs/architecture.md` §14.7。
+
 用到的公開 test ROM 與取得方式見根目錄 `ATTRIBUTION.md`（放在被 gitignore 的
 `roms/nes-test-roms/`）。單一 ROM 的例子：
 

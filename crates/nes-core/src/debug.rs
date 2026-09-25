@@ -44,13 +44,94 @@ pub struct DebugSnapshot {
     /// 256 byte OAM 原始內容（64 個精靈 × 4 byte：Y、tile、attr、X）。
     pub oam: Vec<u8>,
 
-    pub apu_frame_counter: u8,
+    pub apu: ApuDebug,
 
     /// iNES mapper 編號與名稱（例如 1 / "MMC1"）。
     pub mapper_id: u8,
     pub mapper_name: String,
     /// mapper 的 bank 暫存器與它們目前造成的實際對應，`(名稱, 內容)` 列，照顯示順序。
     pub mapper_regs: Vec<(String, String)>,
+}
+
+/// 一個 pulse 聲道的暫存器與計數器。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PulseDebug {
+    pub enabled: bool,
+    pub duty: u8,
+    /// 長度計數器目前的值（0 = 靜音）。
+    pub length: u8,
+    /// 長度計數器 halt（同時是包絡線的 loop）。
+    pub halt: bool,
+    /// 固定音量（否則用包絡線）。
+    pub constant: bool,
+    /// 音量／包絡週期（暫存器 bit 0–3）。
+    pub volume: u8,
+    /// 包絡線目前的衰減值。
+    pub envelope: u8,
+    pub sweep_enabled: bool,
+    pub sweep_period: u8,
+    pub sweep_negate: bool,
+    pub sweep_shift: u8,
+    pub timer_period: u16,
+    pub seq: u8,
+    /// 目前輸出的 4 bit 值（0–15）。
+    pub output: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriangleDebug {
+    pub enabled: bool,
+    pub control: bool,
+    pub linear_reload: u8,
+    pub linear_counter: u8,
+    pub length: u8,
+    pub timer_period: u16,
+    pub seq: u8,
+    pub output: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoiseDebug {
+    pub enabled: bool,
+    pub mode: bool,
+    pub period_index: u8,
+    pub length: u8,
+    pub halt: bool,
+    pub constant: bool,
+    pub volume: u8,
+    pub envelope: u8,
+    pub shift: u16,
+    pub output: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DmcDebug {
+    pub irq_enabled: bool,
+    pub looping: bool,
+    pub rate_index: u8,
+    pub sample_addr: u16,
+    pub sample_length: u16,
+    pub current_addr: u16,
+    pub bytes_remaining: u16,
+    pub output_level: u8,
+    pub irq_flag: bool,
+}
+
+/// APU 的暫存器與計數器摘要（Debugger 的 APU 分頁）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApuDebug {
+    pub pulse: [PulseDebug; 2],
+    pub triangle: TriangleDebug,
+    pub noise: NoiseDebug,
+    pub dmc: DmcDebug,
+    /// frame counter：5 步模式、IRQ 抑制、下一個步驟、已經過的 cycle 數。
+    pub frame_mode5: bool,
+    pub frame_inhibit_irq: bool,
+    pub frame_step: u8,
+    pub frame_cycle: u32,
+    pub frame_irq: bool,
+    /// `$4015` 讀值（不含 bit 5）。
+    pub status: u8,
 }
 
 /// 一張 RGBA8 影像（Debugger 顯示用）。

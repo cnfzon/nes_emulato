@@ -1,4 +1,4 @@
-//! Debugger 面板的分頁內容：CPU、PPU 暫存器、調色盤、OAM、Mapper、pattern table、nametable。
+//! Debugger 面板的分頁內容：CPU、PPU 暫存器、調色盤、OAM、Mapper、APU、pattern table、nametable。
 //!
 //! 這個模組只負責「顯示」：資料來自 emu 執行緒送來的 `DebugSnapshot` 與
 //! `PpuViews`（見 `emu.rs`）。控制項（暫停／單步／trace）在 `app.rs`。
@@ -9,9 +9,15 @@
 
 use crossbeam_channel::Sender;
 use eframe::egui;
+use nes_core::apu::{
+    ALL_CHANNELS, CHANNEL_DMC, CHANNEL_NOISE, CHANNEL_PULSE1, CHANNEL_PULSE2, CHANNEL_TRIANGLE,
+    CPU_CLOCK_HZ,
+};
+use nes_core::debug::{ApuDebug, DmcDebug, NoiseDebug, PulseDebug, TriangleDebug};
 use nes_core::ppu::SYSTEM_PALETTE;
 use nes_core::{DebugSnapshot, PpuImage, PpuViews};
 
+use crate::audio::AudioShared;
 use crate::commands::EmuCommand;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -21,17 +27,19 @@ pub enum Tab {
     Palette,
     Oam,
     Mapper,
+    Apu,
     Patterns,
     Nametables,
 }
 
 impl Tab {
-    const ALL: [(Tab, &'static str); 7] = [
+    const ALL: [(Tab, &'static str); 8] = [
         (Tab::Cpu, "CPU"),
         (Tab::Ppu, "PPU"),
         (Tab::Palette, "調色盤"),
         (Tab::Oam, "OAM"),
         (Tab::Mapper, "Mapper"),
+        (Tab::Apu, "APU"),
         (Tab::Patterns, "Pattern"),
         (Tab::Nametables, "Nametable"),
     ];
@@ -94,7 +102,14 @@ impl DebuggerUi {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, snapshot: Option<&DebugSnapshot>) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: Option<&DebugSnapshot>,
+        audio: &AudioShared,
+        channel_mask: &mut u8,
+        cmd_tx: &Sender<EmuCommand>,
+    ) {
         ui.horizontal_wrapped(|ui| {
             for (tab, label) in Tab::ALL {
                 ui.selectable_value(&mut self.tab, tab, label);
@@ -113,6 +128,7 @@ impl DebuggerUi {
             Tab::Palette => palette_tab(ui, snap),
             Tab::Oam => oam_tab(ui, snap),
             Tab::Mapper => mapper_tab(ui, snap),
+            Tab::Apu => apu_tab(ui, &snap.apu, audio, channel_mask, cmd_tx),
             Tab::Patterns => self.patterns_tab(ui),
             Tab::Nametables => self.nametables_tab(ui),
         });
@@ -198,7 +214,22 @@ fn cpu_tab(ui: &mut egui::Ui, snap: &DebugSnapshot) {
         ui.colored_label(egui::Color32::RED, "CPU JAMMED");
     }
     ui.separator();
-    ui.label(format!("APU frame counter: {}", snap.apu_frame_counter));
+    ui.label(format!(
+        "APU frame counter: {}",
+        frame_counter_text(&snap.apu)
+    ));
+}
+
+fn frame_counter_text(apu: &ApuDebug) -> String {
+    format!(
+        "{}步模式{}",
+        if apu.frame_mode5 { 5 } else { 4 },
+        if apu.frame_inhibit_irq {
+            "（IRQ 抑制）"
+        } else {
+            ""
+        }
+    )
 }
 
 fn flag(value: u8, bit: u8) -> u8 {
@@ -304,6 +335,244 @@ fn mapper_tab(ui: &mut egui::Ui, snap: &DebugSnapshot) {
             ui.monospace(value);
             ui.end_row();
         }
+    });
+}
+
+/// pulse／triangle 的計時器週期換算成頻率（Hz）：pulse = CPU / (16 × (t + 1))，
+/// triangle = CPU / (32 × (t + 1))。
+fn timer_hz(period: u16, steps: f64) -> f64 {
+    CPU_CLOCK_HZ / (steps * (f64::from(period) + 1.0))
+}
+
+fn yes(v: bool) -> &'static str {
+    if v { "是" } else { "否" }
+}
+
+fn channel_row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(label);
+    ui.monospace(value);
+    ui.end_row();
+}
+
+/// APU 分頁：聲道靜音開關、frame counter、各聲道的暫存器與計數器、音訊緩衝區。
+fn apu_tab(
+    ui: &mut egui::Ui,
+    apu: &ApuDebug,
+    audio: &AudioShared,
+    channel_mask: &mut u8,
+    cmd_tx: &Sender<EmuCommand>,
+) {
+    // 各聲道獨立靜音（只影響混音，不影響模擬狀態）。
+    ui.strong("聲道（勾選 = 聽得到）");
+    let before = *channel_mask;
+    ui.horizontal_wrapped(|ui| {
+        for (bit, name) in [
+            (CHANNEL_PULSE1, "Pulse 1"),
+            (CHANNEL_PULSE2, "Pulse 2"),
+            (CHANNEL_TRIANGLE, "Triangle"),
+            (CHANNEL_NOISE, "Noise"),
+            (CHANNEL_DMC, "DMC"),
+        ] {
+            let mut audible = *channel_mask & bit != 0;
+            if ui.checkbox(&mut audible, name).changed() {
+                if audible {
+                    *channel_mask |= bit;
+                } else {
+                    *channel_mask &= !bit;
+                }
+            }
+        }
+    });
+    if *channel_mask != before {
+        let _ = cmd_tx.send(EmuCommand::SetAudioChannelMask(
+            *channel_mask & ALL_CHANNELS,
+        ));
+    }
+    ui.separator();
+
+    ui.strong("Frame counter / 狀態");
+    egui::Grid::new("apu_frame").striped(true).show(ui, |ui| {
+        channel_row(ui, "模式", frame_counter_text(apu));
+        channel_row(
+            ui,
+            "下一步驟／已過 cycle",
+            format!("{} / {}", apu.frame_step, apu.frame_cycle),
+        );
+        channel_row(ui, "Frame IRQ 旗標", yes(apu.frame_irq).to_string());
+        channel_row(ui, "DMC IRQ 旗標", yes(apu.dmc.irq_flag).to_string());
+        channel_row(ui, "$4015 讀值", format!("${:02X}", apu.status));
+    });
+    ui.separator();
+
+    for (i, p) in apu.pulse.iter().enumerate() {
+        pulse_section(ui, i, p);
+    }
+    triangle_section(ui, &apu.triangle);
+    noise_section(ui, &apu.noise);
+    dmc_section(ui, &apu.dmc);
+    ui.separator();
+    audio_section(ui, audio);
+}
+
+fn pulse_section(ui: &mut egui::Ui, index: usize, p: &PulseDebug) {
+    ui.strong(format!("Pulse {}", index + 1));
+    egui::Grid::new(format!("apu_pulse{index}"))
+        .striped(true)
+        .show(ui, |ui| {
+            channel_row(ui, "啟用（$4015）", yes(p.enabled).to_string());
+            channel_row(ui, "Duty", format!("{}", p.duty));
+            channel_row(
+                ui,
+                "長度計數器",
+                format!("{}{}", p.length, if p.halt { "（halt）" } else { "" }),
+            );
+            channel_row(
+                ui,
+                "音量／包絡線",
+                format!(
+                    "{} {}（衰減 {}）",
+                    if p.constant { "固定" } else { "包絡線" },
+                    p.volume,
+                    p.envelope
+                ),
+            );
+            channel_row(
+                ui,
+                "Sweep",
+                format!(
+                    "{} 週期 {} {} 位移 {}",
+                    if p.sweep_enabled { "開" } else { "關" },
+                    p.sweep_period,
+                    if p.sweep_negate { "往下" } else { "往上" },
+                    p.sweep_shift
+                ),
+            );
+            channel_row(
+                ui,
+                "計時器週期",
+                format!(
+                    "{}（{:.1} Hz）",
+                    p.timer_period,
+                    timer_hz(p.timer_period, 16.0)
+                ),
+            );
+            channel_row(ui, "序列位置／輸出", format!("{} / {}", p.seq, p.output));
+        });
+}
+
+fn triangle_section(ui: &mut egui::Ui, t: &TriangleDebug) {
+    ui.strong("Triangle");
+    egui::Grid::new("apu_triangle")
+        .striped(true)
+        .show(ui, |ui| {
+            channel_row(ui, "啟用（$4015）", yes(t.enabled).to_string());
+            channel_row(
+                ui,
+                "Linear counter",
+                format!(
+                    "{} / 重載值 {}{}",
+                    t.linear_counter,
+                    t.linear_reload,
+                    if t.control { "（control）" } else { "" }
+                ),
+            );
+            channel_row(ui, "長度計數器", format!("{}", t.length));
+            channel_row(
+                ui,
+                "計時器週期",
+                format!(
+                    "{}（{:.1} Hz）",
+                    t.timer_period,
+                    timer_hz(t.timer_period, 32.0)
+                ),
+            );
+            channel_row(ui, "序列位置／輸出", format!("{} / {}", t.seq, t.output));
+        });
+}
+
+fn noise_section(ui: &mut egui::Ui, n: &NoiseDebug) {
+    ui.strong("Noise");
+    egui::Grid::new("apu_noise").striped(true).show(ui, |ui| {
+        channel_row(ui, "啟用（$4015）", yes(n.enabled).to_string());
+        channel_row(
+            ui,
+            "長度計數器",
+            format!("{}{}", n.length, if n.halt { "（halt）" } else { "" }),
+        );
+        channel_row(
+            ui,
+            "音量／包絡線",
+            format!(
+                "{} {}（衰減 {}）",
+                if n.constant { "固定" } else { "包絡線" },
+                n.volume,
+                n.envelope
+            ),
+        );
+        channel_row(
+            ui,
+            "模式／週期索引",
+            format!("{} / {}", if n.mode { "短" } else { "長" }, n.period_index),
+        );
+        channel_row(ui, "LFSR／輸出", format!("${:04X} / {}", n.shift, n.output));
+    });
+}
+
+fn dmc_section(ui: &mut egui::Ui, d: &DmcDebug) {
+    ui.strong("DMC");
+    egui::Grid::new("apu_dmc").striped(true).show(ui, |ui| {
+        channel_row(
+            ui,
+            "IRQ 致能／loop／速率",
+            format!(
+                "{} / {} / {}",
+                yes(d.irq_enabled),
+                yes(d.looping),
+                d.rate_index
+            ),
+        );
+        channel_row(
+            ui,
+            "取樣位址／長度",
+            format!("${:04X} / {}", d.sample_addr, d.sample_length),
+        );
+        channel_row(
+            ui,
+            "目前位址／剩餘 byte",
+            format!("${:04X} / {}", d.current_addr, d.bytes_remaining),
+        );
+        channel_row(ui, "輸出電平", format!("{}", d.output_level));
+    });
+}
+
+/// 音訊緩衝區的填充程度與累計 underrun 次數（報告「作業系統與應用程式的關係」的素材）。
+fn audio_section(ui: &mut egui::Ui, audio: &AudioShared) {
+    ui.strong("音訊緩衝區");
+    if !audio.is_active() {
+        ui.colored_label(egui::Color32::YELLOW, "沒有音訊裝置（無聲執行）");
+        return;
+    }
+    let target = audio.target_fill().max(1);
+    let fill = audio.fill();
+    let fraction = (fill as f32 / (target * 3) as f32).clamp(0.0, 1.0);
+    ui.add(egui::ProgressBar::new(fraction).text(format!(
+        "{:.0} ms（目標 {:.0} ms）",
+        audio.fill_ms(),
+        crate::audio::TARGET_LATENCY_MS
+    )));
+    egui::Grid::new("apu_audio").striped(true).show(ui, |ui| {
+        channel_row(ui, "累計 underrun", format!("{}", audio.underruns()));
+        channel_row(ui, "累計丟棄取樣", format!("{}", audio.dropped()));
+        let device = f64::from(audio.device_rate());
+        let rate = audio.current_rate();
+        channel_row(
+            ui,
+            "輸出取樣率",
+            format!(
+                "{rate:.1} Hz（裝置 {device:.0} Hz，調整 {:+.3}%）",
+                (rate / device - 1.0) * 100.0
+            ),
+        );
     });
 }
 

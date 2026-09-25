@@ -61,6 +61,11 @@ pub struct Cpu {
     pub status: StatusFlags,
     /// JAM/KIL 類 opcode 執行後會設成 true；之後的 `step()` 不再做任何事。
     pub jammed: bool,
+    /// 上一條指令倒數第二個 cycle 結束時，IRQ 線的電位（硬體在這個時間點偵測 IRQ）。
+    irq_sample: bool,
+    /// 上一條指令用來「遮蔽」IRQ 的 I 旗標值。多數指令就是指令之後的 I；CLI／SEI／PLP 的新
+    /// I 旗標在最後一個 cycle 才生效，趕不上偵測，所以是**指令之前**的 I（見 [`Cpu::step`]）。
+    irq_masked: bool,
     bus: Bus,
 }
 
@@ -74,6 +79,8 @@ impl Cpu {
             pc: 0,
             status: StatusFlags::default(),
             jammed: false,
+            irq_sample: false,
+            irq_masked: true,
             bus,
         }
     }
@@ -93,6 +100,8 @@ impl Cpu {
         self.sp = 0xFD;
         self.status = StatusFlags::default();
         self.jammed = false;
+        self.irq_sample = false;
+        self.irq_masked = true;
         self.pc = self.read_u16(RESET_VECTOR);
         self.bus.tick(7);
     }
@@ -110,12 +119,8 @@ impl Cpu {
 
     /// IRQ：跟 `nmi()` 完全對稱，只是向量換成 `$FFFE`。
     ///
-    /// IRQ 是可遮蔽中斷：呼叫端必須自己先確認 `status` 沒有設定
-    /// `StatusFlags::INTERRUPT` 才呼叫這個方法——`irq()` 本身不會檢查，只
-    /// 負責「服務中斷」這個動作本身，耗時固定 7 cycles。之所以不在這裡檢查，
-    /// 是因為「該不該中斷」牽涉到哪個裝置在拉 IRQ 線（APU frame counter、
-    /// mapper IRQ……），這些是 Phase 2+ 才會接上的東西；現在還沒有任何呼叫
-    /// 端會用到這個方法。
+    /// 「該不該服務」（IRQ 線電位與 I 旗標的遮蔽）由 [`Cpu::step`] 判斷；這個方法只負責
+    /// 「服務中斷」這個動作本身，耗時固定 7 cycles。
     pub fn irq(&mut self) {
         self.push_u16(self.pc);
         let flags = (self.status & !StatusFlags::BREAK) | StatusFlags::UNUSED;
@@ -147,6 +152,16 @@ impl Cpu {
 
         if self.bus.take_nmi() {
             self.nmi();
+            self.irq_sample = false;
+            self.irq_masked = true;
+            return 7;
+        }
+        // IRQ 是 level-triggered：只要偵測到的線電位為高、且遮蔽用的 I 旗標為 0 就服務。
+        // 服務之後 I = 1，處理常式的第一條指令一定會先執行。
+        if self.irq_sample && !self.irq_masked {
+            self.irq();
+            self.irq_sample = false;
+            self.irq_masked = true;
             return 7;
         }
 
@@ -179,7 +194,21 @@ impl Cpu {
             self.bus.tick(lead);
         }
 
+        // IRQ 偵測：硬體在指令倒數第二個 cycle 結束時取樣 IRQ 線，也就是「追上 N − 1 個
+        // cycle 之後、最後一個 cycle 之前」。指令自己在最後一個 cycle 造成的變化（寫
+        // `$4015`／`$4017`、讀 `$4015` 清旗標）趕不上這次取樣。
+        let i_before = self.status.contains(StatusFlags::INTERRUPT);
+        self.irq_sample = self.bus.irq_line();
+
         let extra = self.execute(opcode, info, addr);
+
+        // CLI／SEI／PLP 改變 I 旗標的時間點是它們的最後一個 cycle，晚於偵測：新的 I 旗標
+        // 要到「下一條指令之後」才對 IRQ 有效，所以本次偵測用的是指令之前的 I。
+        // （RTI 在倒數第二個 cycle 之前就還原了 I，所以立即生效；BRK／IRQ／NMI 自己設 I。）
+        self.irq_masked = match info.mnemonic {
+            Mnemonic::Cli | Mnemonic::Sei | Mnemonic::Plp => i_before,
+            _ => self.status.contains(StatusFlags::INTERRUPT),
+        };
 
         self.bus.tick(cycles - lead + extra);
         self.bus.run_pending_oam_dma();
@@ -873,6 +902,20 @@ impl Cpu {
         self.disassemble(info, &bytes)
     }
 
+    /// trace／反組譯的 `= xx`（運算元位址上的目前內容）。
+    ///
+    /// `$4000-$4015`（APU 暫存器）顯示 `FF`：其中 `$4000-$4014` 是唯寫暫存器，沒有東西可讀；
+    /// `$4015` 雖然可讀，但讀取有副作用（清 frame IRQ 旗標），trace 不能做。nestest.log（由
+    /// Nintendulator 產生）在這些位址一律顯示 `FF`，沿用這個約定，`nestest --strict` 才能與參考
+    /// log 逐字相符。這只影響顯示，不影響 `Bus::peek` 的回傳值。
+    fn trace_value(&self, addr: u16) -> u8 {
+        if (0x4000..=0x4015).contains(&addr) {
+            0xFF
+        } else {
+            self.bus.peek(addr)
+        }
+    }
+
     /// 純觀察用的反組譯，只呼叫 `peek`。`bytes` 是這條指令的原始位元組
     /// （已經包含 opcode 本身）。
     fn disassemble(&self, info: &OpcodeInfo, bytes: &[u8]) -> String {
@@ -902,18 +945,24 @@ impl Cpu {
                 if info.mnemonic == Mnemonic::Jmp || info.mnemonic == Mnemonic::Jsr {
                     format!("${addr:04X}")
                 } else {
-                    format!("${addr:04X} = {:02X}", self.bus.peek(addr))
+                    format!("${addr:04X} = {:02X}", self.trace_value(addr))
                 }
             }
             AddrMode::AbsoluteX => {
                 let base = u16::from_le_bytes([bytes[1], bytes[2]]);
                 let addr = base.wrapping_add(self.x as u16);
-                format!("${base:04X},X @ {addr:04X} = {:02X}", self.bus.peek(addr))
+                format!(
+                    "${base:04X},X @ {addr:04X} = {:02X}",
+                    self.trace_value(addr)
+                )
             }
             AddrMode::AbsoluteY => {
                 let base = u16::from_le_bytes([bytes[1], bytes[2]]);
                 let addr = base.wrapping_add(self.y as u16);
-                format!("${base:04X},Y @ {addr:04X} = {:02X}", self.bus.peek(addr))
+                format!(
+                    "${base:04X},Y @ {addr:04X} = {:02X}",
+                    self.trace_value(addr)
+                )
             }
             AddrMode::Indirect => {
                 let ptr = u16::from_le_bytes([bytes[1], bytes[2]]);
@@ -934,7 +983,7 @@ impl Cpu {
                 let addr = (hi << 8) | lo;
                 format!(
                     "(${base:02X},X) @ {ptr:02X} = {addr:04X} = {:02X}",
-                    self.bus.peek(addr)
+                    self.trace_value(addr)
                 )
             }
             AddrMode::IndirectY => {
@@ -945,7 +994,7 @@ impl Cpu {
                 let addr = ptr.wrapping_add(self.y as u16);
                 format!(
                     "(${base:02X}),Y = {ptr:04X} @ {addr:04X} = {:02X}",
-                    self.bus.peek(addr)
+                    self.trace_value(addr)
                 )
             }
             AddrMode::Relative => {

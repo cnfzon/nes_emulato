@@ -46,6 +46,18 @@ impl Asm {
     pub fn sei(&mut self) -> &mut Self {
         self.emit(&[0x78])
     }
+    pub fn cli(&mut self) -> &mut Self {
+        self.emit(&[0x58])
+    }
+    pub fn pha(&mut self) -> &mut Self {
+        self.emit(&[0x48])
+    }
+    pub fn pla(&mut self) -> &mut Self {
+        self.emit(&[0x68])
+    }
+    pub fn nop(&mut self) -> &mut Self {
+        self.emit(&[0xEA])
+    }
     pub fn cld(&mut self) -> &mut Self {
         self.emit(&[0xD8])
     }
@@ -146,6 +158,19 @@ pub fn build_nrom(
     chr: &[u8],
     vertical: bool,
 ) -> Vec<u8> {
+    build_nrom_irq(code, reset, nmi, None, data, chr, vertical)
+}
+
+/// 同 [`build_nrom`]，另外可以指定 IRQ／BRK 向量（`None` 時指向 `reset`）。
+pub fn build_nrom_irq(
+    code: &Asm,
+    reset: u16,
+    nmi: Option<u16>,
+    irq: Option<u16>,
+    data: &[DataBlock],
+    chr: &[u8],
+    vertical: bool,
+) -> Vec<u8> {
     let mut prg = vec![0u8; 2 * PRG_BANK_SIZE];
     let put = |prg: &mut Vec<u8>, addr: u16, bytes: &[u8]| {
         let start = addr as usize - 0x8000;
@@ -158,7 +183,8 @@ pub fn build_nrom(
     let nmi = nmi.unwrap_or(reset);
     put(&mut prg, 0xFFFA, &[nmi as u8, (nmi >> 8) as u8]);
     put(&mut prg, 0xFFFC, &[reset as u8, (reset >> 8) as u8]);
-    put(&mut prg, 0xFFFE, &[reset as u8, (reset >> 8) as u8]);
+    let irq = irq.unwrap_or(reset);
+    put(&mut prg, 0xFFFE, &[irq as u8, (irq >> 8) as u8]);
 
     let mut chr_rom = chr.to_vec();
     chr_rom.resize(CHR_BANK_SIZE, 0);
@@ -350,6 +376,93 @@ pub fn dummy_read_probe_rom() -> Vec<u8> {
         .inc_abs(0x0000)
         .jmp(l);
     build_nrom(&a, 0x8000, None, &[], &test_chr(), false)
+}
+
+/// APU 探針 ROM 的參數。
+#[derive(Clone, Copy, Debug)]
+pub struct ApuProbe {
+    /// 寫進 `$4017` 的值（frame counter 模式與 IRQ 抑制）。
+    pub frame_counter: u8,
+    /// IRQ 處理常式有沒有讀 `$4015` 確認（清 frame IRQ 旗標）。
+    pub ack_frame_irq: bool,
+    /// 是否啟動會產生 IRQ 的 DMC 取樣。
+    pub dmc: bool,
+}
+
+impl ApuProbe {
+    pub const DEFAULT: ApuProbe = ApuProbe {
+        frame_counter: 0x00,
+        ack_frame_irq: true,
+        dmc: true,
+    };
+}
+
+/// 會用到 frame IRQ、`$4015`、DMC（含 DMC IRQ 與抓取樣本造成的 CPU 暫停）的合成 ROM
+/// （給行為指紋用）。
+///
+/// 主程式啟用各聲道、把 `$4017` 設成 `frame_counter`、`CLI` 之後進入無窮迴圈，迴圈裡不斷
+/// `INC $00` 並讀 `$4015` 存到 `$01`。IRQ 處理常式（`$8100`）把 `$02` 加 1、把進入時的
+/// `$4015` 存到 `$03`（會清掉 frame IRQ 旗標）、再寫 `$4015 = $1F`（清 DMC IRQ 並重啟
+/// DMC 取樣）。所以最後的 RAM 內容與 CPU 的 cycle 數會反映：frame IRQ 的時間點與頻率、
+/// `$4015` 的讀值與清旗標、DMC 的節拍、IRQ 遮蔽與 DMC 暫停。
+pub fn apu_probe_rom(probe: ApuProbe) -> Vec<u8> {
+    let mut a = Asm::new(0x8000);
+    a.sei().cld().ldx_imm(0xFF).txs();
+    a.lda_imm(probe.frame_counter).sta_abs(0x4017);
+    // 先啟用聲道（停用的聲道不接受長度載入），再設各聲道。
+    a.lda_imm(0x0F).sta_abs(0x4015);
+    // pulse 1：duty 2、halt、固定音量 15；pulse 2：包絡線、長度只有 2；triangle；noise。
+    a.lda_imm(0xBF).sta_abs(0x4000);
+    a.lda_imm(0x8A).sta_abs(0x4001); // sweep：往下（pulse 1 用 1 的補數）
+    a.lda_imm(0x40).sta_abs(0x4002);
+    a.lda_imm(0x08).sta_abs(0x4003);
+    a.lda_imm(0x15).sta_abs(0x4004);
+    a.lda_imm(0x89).sta_abs(0x4005); // sweep：往下（pulse 2 用 2 的補數）
+    a.lda_imm(0x80).sta_abs(0x4006);
+    a.lda_imm(0x18).sta_abs(0x4007);
+    a.lda_imm(0xFF).sta_abs(0x4008);
+    a.lda_imm(0x30).sta_abs(0x400A);
+    a.lda_imm(0x08).sta_abs(0x400B);
+    a.lda_imm(0x0F).sta_abs(0x400C);
+    a.lda_imm(0x84).sta_abs(0x400E); // 短模式
+    a.lda_imm(0x08).sta_abs(0x400F);
+    if probe.dmc {
+        a.lda_imm(0x8F).sta_abs(0x4010); // IRQ 致能、最快的速率
+        a.lda_imm(0x00).sta_abs(0x4012); // $C000
+        a.lda_imm(0x02).sta_abs(0x4013); // 33 bytes
+        a.lda_imm(0x1F);
+    } else {
+        a.lda_imm(0x0F);
+    }
+    a.sta_abs(0x4015);
+    a.cli();
+    let main_loop = a.pc();
+    a.inc_abs(0x0000)
+        .lda_abs(0x4015)
+        .sta_abs(0x0001)
+        .jmp(main_loop);
+
+    let mut irq = Asm::new(0x8100);
+    irq.pha().inc_abs(0x0002);
+    if probe.ack_frame_irq {
+        irq.lda_abs(0x4015).sta_abs(0x0003);
+    }
+    if probe.dmc {
+        irq.lda_imm(0x1F).sta_abs(0x4015);
+    }
+    irq.pla().rti();
+
+    // DMC 取樣資料（$C000 起）。
+    let sample: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) ^ 0x5A).collect();
+    build_nrom_irq(
+        &a,
+        0x8000,
+        None,
+        Some(0x8100),
+        &[(0x8100, &irq.bytes), (0xC000, &sample)],
+        &test_chr(),
+        false,
+    )
 }
 
 /// 一個 8×8 tile 的 CHR 資料：`plane0`/`plane1` 各 8 byte。

@@ -17,7 +17,8 @@ target\release\nes-app.exe
   名稱、bank 暫存器的原始值，以及它們**目前造成的實際 bank 對應**）。
 - 按鍵：玩家 1＝方向鍵、Z = B、X = A、Enter = Start、右 Shift = Select；
   玩家 2＝W/A/S/D、F = B、G = A、R = Select、T = Start；F5 存檔、F9 讀檔。
-- 目前**沒有聲音**（APU 尚未實作）。**沒有 Reset 選單項**（只有載入 ROM 會重來）。
+- 聲音（Phase 3.5 起已實作）的手動測試見 [`manual-test-phase3_5.md`](manual-test-phase3_5.md)。
+  **沒有 Reset 選單項**（只有載入 ROM 會重來）。
 - 每個遊戲用 `nes-test info` 確認 mapper 編號再測；下面列的遊戲只是常見例子，我沒有驗證過你手上
   那個版本的 mapper 編號。
 - **回報失敗時請附**：ROM 名稱、`nes-test info` 的輸出、發生時 Mapper 分頁的截圖（bank 暫存器的值

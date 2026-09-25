@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+cpal = "0.18.2"
 crossbeam-channel = "0.5.17"
 eframe = "0.36"
 egui = "0.36"
@@ -16,4 +17,5 @@ log = "0.4.34"
 nes-core = { version = "0.1.0", path = "../nes-core" }
 nes-net = { version = "0.1.0", path = "../nes-net" }
 rfd = "0.17.2"
+rtrb = "0.4.0"
 triple_buffer = "9"

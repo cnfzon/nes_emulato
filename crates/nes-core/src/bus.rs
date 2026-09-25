@@ -9,9 +9,9 @@
 //! |-------------------|---------------------------------------------------------|
 //! | `$0000-$1FFF`     | 2KB 內部 RAM，每 `$0800` 鏡像一次                         |
 //! | `$2000-$3FFF`     | PPU 暫存器，每 8 bytes 鏡像一次                           |
-//! | `$4000-$4013`     | APU 暫存器（本階段仍是 stub）                              |
+//! | `$4000-$4013`     | APU 暫存器（唯寫；讀取回傳 open bus）                        |
 //! | `$4014`           | OAM DMA                                                 |
-//! | `$4015`           | APU 狀態（stub）                                          |
+//! | `$4015`           | APU 狀態（讀取會清 frame IRQ 旗標；bit 5 是 open bus）       |
 //! | `$4016-$4017`     | 搖桿（移位暫存器）；`$4017` 寫入是 APU frame counter        |
 //! | `$4018-$401F`     | APU/IO 測試模式，一般停用 → open bus                        |
 //! | `$4020-$5FFF`     | 未對映 → open bus                                        |
@@ -145,7 +145,10 @@ impl Bus {
             return v;
         }
         let value = self.read_mapped(addr);
-        self.open_bus = value;
+        // `$4015` 是 APU 內部的暫存器：讀它不會把值放到外部資料匯流排上，open bus 不變。
+        if addr != 0x4015 {
+            self.open_bus = value;
+        }
         value
     }
 
@@ -248,11 +251,15 @@ impl Bus {
 
     // ---- APU / IO 暫存器 -------------------------------------------------
     //
-    // APU 仍是 stub（尚未實作）：只把原始 byte 存進對應欄位。`$4014`（OAM DMA）
-    // 與 `$4016/$4017`（搖桿）是本階段的真正實作。
+    // 存取 APU 暫存器（`$4000-$4013`、`$4015`、`$4017`）之前先 `Apu::sync`，讓 APU 處理完
+    // 存取所在的那個 cycle（見 `apu/mod.rs` 的「存取前先跑一個 cycle」）。
 
     fn read_apu_io_register(&mut self, addr: u16) -> u8 {
         match addr {
+            0x4015 => {
+                self.apu.sync(&self.cartridge);
+                (self.open_bus & 0x20) | self.apu.read_status()
+            }
             // 搖桿只驅動資料匯流排的 bit0；高位元是 open bus（實機上通常是
             // 位址高位元組 `$40`，這裡由上一次匯流排值自然帶出）。
             0x4016 => (self.open_bus & 0xE0) | self.joypads[0].read(),
@@ -263,7 +270,7 @@ impl Bus {
 
     fn peek_apu_io_register(&self, addr: u16) -> u8 {
         match addr {
-            0x4015 => self.apu.status,
+            0x4015 => (self.open_bus & 0x20) | self.apu.peek_status(),
             0x4016 => (self.open_bus & 0xE0) | self.joypads[0].peek(),
             0x4017 => (self.open_bus & 0xE0) | self.joypads[1].peek(),
             _ => self.open_bus,
@@ -272,20 +279,17 @@ impl Bus {
 
     fn write_apu_io_register(&mut self, addr: u16, value: u8) {
         match addr {
-            0x4000..=0x4003 => self.apu.pulse1[(addr - 0x4000) as usize] = value,
-            0x4004..=0x4007 => self.apu.pulse2[(addr - 0x4004) as usize] = value,
-            0x4008..=0x400B => self.apu.triangle[(addr - 0x4008) as usize] = value,
-            0x400C..=0x400F => self.apu.noise[(addr - 0x400C) as usize] = value,
-            0x4010..=0x4013 => self.apu.dmc[(addr - 0x4010) as usize] = value,
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.sync(&self.cartridge);
+                self.apu.write_register(addr, value);
+            }
             0x4014 => self.pending_oam_dma = Some(value),
-            0x4015 => self.apu.status = value,
             0x4016 => {
                 // $4016 bit0 是兩個搖桿共用的 strobe。
                 let strobe = value & 0x01 != 0;
                 self.joypads[0].write_strobe(strobe);
                 self.joypads[1].write_strobe(strobe);
             }
-            0x4017 => self.apu.frame_counter = value,
             _ => {}
         }
     }
@@ -294,13 +298,35 @@ impl Bus {
 
     /// 累加 CPU cycle 數，並讓 PPU 追上（catch-up）：PPU 時脈是 CPU 的 3 倍
     /// （NTSC），所以每個 CPU cycle 推進 3 個 PPU dot。
+    ///
+    /// APU 也在這裡追上；DMC 抓取樣本造成的 CPU 暫停（[`crate::apu::DMC_STALL_CYCLES`]）
+    /// 緊接著補上，PPU 與 APU 在暫停期間照常前進。
     pub fn tick(&mut self, cycles: u8) {
         self.advance(cycles as u32);
+        self.settle_dmc_stall();
     }
 
     fn advance(&mut self, cycles: u32) {
         self.total_cycles += cycles as u64;
         self.ppu.step_dots(cycles * 3, &self.cartridge);
+        self.apu.step(cycles, &self.cartridge);
+    }
+
+    /// 補上 DMC 抓取樣本累積的暫停 cycle（暫停期間可能又觸發下一次抓取，所以迴圈）。
+    fn settle_dmc_stall(&mut self) {
+        loop {
+            let stall = self.apu.take_dmc_stall();
+            if stall == 0 {
+                break;
+            }
+            self.advance(stall);
+        }
+    }
+
+    /// IRQ 線的電位（level-triggered）：所有來源做 OR。目前的來源是 APU 的 frame IRQ 與
+    /// DMC IRQ；日後的 mapper IRQ 也加在這裡。CPU 在指令之間檢查，且要 I 旗標為 0 才服務。
+    pub(crate) fn irq_line(&self) -> bool {
+        self.apu.irq()
     }
 
     pub fn total_cycles(&self) -> u64 {
@@ -335,6 +361,7 @@ impl Bus {
         }
         let stall = 513 + (self.total_cycles & 1) as u32;
         self.advance(stall);
+        self.settle_dmc_stall();
         stall
     }
 }

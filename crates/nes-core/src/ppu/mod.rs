@@ -124,6 +124,14 @@ pub struct Ppu {
     /// 下一次 `run_frame` 重新畫滿。
     #[serde(skip, default = "FrameBuffer::blank")]
     pub(crate) frame_buffer: FrameBuffer,
+    /// 輸出開關（見 `Nes::set_output_enabled`）：關閉時不寫 `frame_buffer`，其餘（包含
+    /// sprite 0 hit、overflow 的判斷）照常，所以不影響模擬狀態。設定值，不進存檔。
+    #[serde(skip, default = "default_output_enabled")]
+    output_enabled: bool,
+}
+
+fn default_output_enabled() -> bool {
+    true
 }
 
 impl Default for Ppu {
@@ -154,6 +162,7 @@ impl Default for Ppu {
             overflow_pending: false,
             prefetch_incs: 0,
             frame_buffer: FrameBuffer::blank(),
+            output_enabled: true,
         }
     }
 }
@@ -226,6 +235,10 @@ impl Ppu {
     /// 清掉「剛完成一幀」旗標（`run_frame` 開始時呼叫，避免上一次單步遺留）。
     pub(crate) fn clear_frame_done(&mut self) {
         self.frame_done = false;
+    }
+
+    pub(crate) fn set_output_enabled(&mut self, enabled: bool) {
+        self.output_enabled = enabled;
     }
 
     /// 最近一次完成的畫面。

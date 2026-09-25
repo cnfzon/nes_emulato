@@ -69,7 +69,9 @@ nesdev.org 目前有 Cloudflare 擋自動化請求）並逐字解析，沒有手
   test ROM 合集；commit `95d8f621ae55cee0d09b91519a8989ae0e64753b`，2022-03-02），
   以 `git sparse-checkout` **只取**需要的目錄：`instr_test-v5`、`ppu_vbl_nmi`、
   `sprite_hit_tests_2005.10.05`、`ppu_read_buffer`、`oam_read`、
-  `blargg_ppu_tests_2005.09.15b`、`scrolltest`。這些 ROM 的作者是 Shay Green
+  `blargg_ppu_tests_2005.09.15b`、`scrolltest`；Phase 3.5 追加 `apu_test`、
+  `blargg_apu_2005.07.30`、`apu_reset`、`cpu_interrupts_v2`（`git sparse-checkout add ...`，同一個
+  commit）；另外多拉了 `dmc_tests`（沒有自動判定，未列入驗收清單）。這些 ROM 的作者是 Shay Green
   （blargg）等人；**沒有**下載或使用任何商業遊戲 ROM。取得方式：
   ```
   git clone --depth 1 --filter=blob:none --sparse \
@@ -77,10 +79,33 @@ nesdev.org 目前有 Cloudflare 擋自動化請求）並逐字解析，沒有手
   cd roms/nes-test-roms && git sparse-checkout set instr_test-v5 ppu_vbl_nmi \
       sprite_hit_tests_2005.10.05 ppu_read_buffer oam_read \
       blargg_ppu_tests_2005.09.15b scrolltest
+  # Phase 3.5 追加：
+  git sparse-checkout add apu_test blargg_apu_2005.07.30 apu_reset cpu_interrupts_v2
   ```
 - **SingleStepTests**（`roms/singlestep/`，不進 repo）：
   <https://github.com/SingleStepTests/65x02> 的 `nes6502/v1` 子集（256 個
   opcode，每個 10,000 筆單指令測試）。
+
+## APU 與音訊（Phase 3.5）
+
+`crates/nes-core/src/apu/`（`mod.rs`、`channels.rs`、`output.rs`）與 `cpu/mod.rs` 的 IRQ 偵測是**依 NESdev
+wiki 公開文件描述的硬體行為自行實作**（<https://www.nesdev.org/wiki/>：APU、APU Frame Counter、
+APU Length Counter、APU Envelope、APU Sweep、APU Pulse／Triangle／Noise／DMC、APU Mixer、
+CPU interrupts、Clock rate 各頁），沒有複製任何教學或其他模擬器的程式碼。
+
+- **時序慣例**：frame counter 的逐 cycle 步驟表、`$4017` 寫入的 3／4 cycle 生效延遲、長度計數器的
+  「延遲一個 cycle 才生效的 halt／reload」，以及「存取 APU 暫存器時 APU 已處理過該 cycle」的約定，
+  是**對照 blargg 的 APU 測試 ROM 結果，並參考公開的逐 cycle 模擬器 Mesen（<https://github.com/SourMesen/Mesen2>）
+  已知能通過這些測試的行為慣例**整理出來的。只參考了「行為與數值」，沒有複製其程式碼；實作時
+  **沒有重新抓取其原始碼逐行對照**，正確性以 blargg 測試 ROM 的實際結果（`docs/architecture.md` §14.7）
+  為準。
+- **混音**：`apu/output.rs` 的非線性混音查表公式取自 NESdev wiki「APU Mixer」頁面（事實性公式）。
+  濾波器（90 Hz／442 Hz high-pass、14 kHz low-pass）取自同頁對真實 NES 類比輸出級的描述。
+- **音訊輸出**：`nes-app` 用 [`cpal`](https://crates.io/crates/cpal)（音訊裝置抽象，Apache-2.0；
+  Phase 3.5 新增依賴，經使用者同意）。環形緩衝區用 [`rtrb`](https://crates.io/crates/rtrb)（MIT OR Apache-2.0；Phase 3.5 收尾新增依賴，經使用者同意；
+  取代原本自製的實作，理由見 `docs/architecture.md` §17.9）；動態速率控制是自行實作。
+- **測試 ROM**：`apu_test`、`blargg_apu_2005.07.30`、`apu_reset`、`cpu_interrupts_v2` 的作者是 Shay Green
+  （blargg）等人，取自上面的 nes-test-roms 合集，不進 repo。
 
 ## 授權
 

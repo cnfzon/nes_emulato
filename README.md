@@ -4,15 +4,18 @@
 「應用軟體設計」課程的期末專案，涵蓋作業系統（多執行緒／timing）、視窗環境
 （egui GUI）、網路環境（UDP rollback netplay）、以及整合設計四大主題。
 
-> **目前狀態：Phase 3（核心凍結：時序、mapper、存檔版本、玩家 2）。** CPU 通過 nestest（8991
-> 行逐指令比對全數通過）與 SingleStepTests 回歸閘門；PPU 以 scanline 為單位渲染
-> （含 loopy 捲動、精靈、8×16、sprite 0 hit、NMI）。支援 mapper 0（NROM）、1（MMC1）、
-> 2（UxROM）、3（CNROM）；APU 仍是 stub。CPU 與 PPU 的時序模型（instruction-level +
-> 分段 catch-up）已定案，存檔開頭有 magic 與兩個版本號（格式、模擬行為）——之後任何會改變
-> 模擬結果的修改都必須遞增 `CORE_BEHAVIOR_VERSION`，規則見
-> [`docs/architecture.md`](docs/architecture.md) §13–§16。**尚未以真實遊戲驗證**，手動測試清單見
+> **目前狀態：Phase 3.5（APU 與音訊輸出；模擬核心正式凍結）。** CPU 通過 nestest（8991
+> 行逐指令比對，含 `--strict`）與 SingleStepTests 回歸閘門；PPU 以 scanline 為單位渲染
+> （含 loopy 捲動、精靈、8×16、sprite 0 hit、NMI）；**APU 五個聲道、frame counter、frame／DMC IRQ、
+> DMC 抓取樣本暫停 CPU 都已實作**（blargg 的 `apu_test`、`blargg_apu_2005.07.30`、`apu_reset` 全數通過），
+> 音訊經 cpal 輸出（lock-free 環形緩衝區 + ±0.5% 動態速率控制，目標延遲約 50 ms）。支援 mapper 0
+> （NROM）、1（MMC1）、2（UxROM）、3（CNROM）。CPU 與 PPU 的時序模型（instruction-level + 分段
+> catch-up）已定案，存檔開頭有 magic 與兩個版本號（格式、模擬行為）——之後任何會改變模擬結果的修改都必須
+> 遞增 `CORE_BEHAVIOR_VERSION`，規則見 [`docs/architecture.md`](docs/architecture.md) §13–§17。
+> **尚未以真實遊戲驗證**（尤其是聲音要用耳朵確認），手動測試清單見
 > [`docs/manual-test-phase2.md`](docs/manual-test-phase2.md)、
-> [`docs/manual-test-phase3.md`](docs/manual-test-phase3.md)。
+> [`docs/manual-test-phase3.md`](docs/manual-test-phase3.md)、
+> [`docs/manual-test-phase3_5.md`](docs/manual-test-phase3_5.md)。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
@@ -33,7 +36,8 @@ nes-netplay/
 
 ## 建置方式
 
-需要 Rust stable（見 `rust-toolchain.toml`，edition 2024）。
+需要 Rust stable（見 `rust-toolchain.toml`，edition 2024）。Linux 另需 ALSA 開發標頭
+（`libasound2-dev`，cpal 的後端；見 `.github/workflows/ci.yml`）。
 
 ```bash
 # 建置整個 workspace
@@ -59,8 +63,11 @@ cargo run --release -p nes-test -- blargg roms/nes-test-roms/instr_test-v5/rom_s
 cargo run --release -p nes-test -- screenshot path/to/rom.nes out.png --frames 120
 cargo run --release -p nes-test -- golden path/to/rom.nes --frames 120
 
-# run_frame 效能（CPU + PPU 合計）
+# run_frame 效能（CPU + PPU + APU 合計；輸出開啟與關閉各量一次）
 cargo run --release -p nes-core --features testing --example bench_run_frame
+
+# 音訊診斷：不開視窗、音量 0（不出聲），在真實音訊裝置上跑 12 秒並印出緩衝區／underrun 統計
+cargo run --release -p nes-app -- --audio-selftest
 ```
 
 遊戲操作（`nes-app`）：
@@ -71,7 +78,8 @@ cargo run --release -p nes-core --features testing --example bench_run_frame
 | B / A | Z / X | F / G |
 | Select / Start | 右 Shift / Enter | R / T |
 
-F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。
+F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
+各聲道獨立靜音、暫存器與計數器、音訊緩衝區填充量與累計 underrun。
 
 ## 交付與效能量測
 

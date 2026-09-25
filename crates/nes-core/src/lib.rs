@@ -69,6 +69,7 @@ impl Nes {
     /// PPUMASK 等暫存器。RAM、VRAM、OAM、卡帶內容維持不變。
     pub fn reset(&mut self) {
         self.cpu.bus_mut().ppu.reset();
+        self.cpu.bus_mut().apu.reset(true);
         self.cpu.reset();
     }
 
@@ -103,9 +104,48 @@ impl Nes {
         self.cpu.bus().ppu.frame_buffer()
     }
 
-    /// 把自從上次呼叫以來累積的音訊取樣附加到 `out`。
+    /// 把自從上次呼叫以來累積的音訊取樣（單聲道、`f32`、取樣率見
+    /// [`Nes::audio_sample_rate`]）附加到 `out`。
+    ///
+    /// 音訊是**輸出**，與畫面同地位：不進存檔、不影響 `state_hash`（見 `apu/output.rs`）。
     pub fn drain_audio(&mut self, out: &mut Vec<f32>) {
         self.cpu.bus_mut().apu.take_samples(out);
+    }
+
+    /// 設定音訊輸出的取樣率（Hz，夾在 8k–192k）。app 端做動態速率控制時會頻繁微調，
+    /// 所以只重算濾波係數，不清除已產生的取樣。
+    pub fn set_audio_sample_rate(&mut self, hz: f64) {
+        self.cpu.bus_mut().apu.set_sample_rate(hz);
+    }
+
+    pub fn audio_sample_rate(&self) -> f64 {
+        self.cpu.bus().apu.sample_rate()
+    }
+
+    /// 開關輸出。關閉時**不產生畫面（不寫 framebuffer）也不產生音訊**，只推進模擬狀態；
+    /// `state_hash` 與開啟時逐位元相同（測試 `output_switch_does_not_change_the_state_hash`）。
+    /// Phase 4 的 rollback 重跑幀時會用到。預設開啟。
+    ///
+    /// 關閉期間 `run_frame` 回傳的 `FrameBuffer` 是舊內容。輸出設定不進存檔，`load_state`
+    /// 會保留它。
+    pub fn set_output_enabled(&mut self, enabled: bool) {
+        let bus = self.cpu.bus_mut();
+        bus.ppu.set_output_enabled(enabled);
+        bus.apu.set_output_enabled(enabled);
+    }
+
+    pub fn output_enabled(&self) -> bool {
+        self.cpu.bus().apu.output_enabled()
+    }
+
+    /// 設定聽得到的聲道（[`apu::CHANNEL_PULSE1`] 等位元，1 = 聽得到）。只影響混音，
+    /// 不影響模擬狀態。
+    pub fn set_audio_channel_mask(&mut self, mask: u8) {
+        self.cpu.bus_mut().apu.set_channel_mask(mask);
+    }
+
+    pub fn audio_channel_mask(&self) -> u8 {
+        self.cpu.bus().apu.channel_mask()
     }
 
     /// 把目前狀態序列化成一份存檔（postcard 編碼）。
@@ -143,6 +183,13 @@ impl Nes {
         let decoded_bus = decoded.cpu.bus_mut();
         decoded_bus.cartridge.prg_rom = prg_rom;
         decoded_bus.cartridge.chr_rom = chr_rom;
+        // 輸出設定（開關、取樣率、聲道遮罩）不進存檔：從目前的實例帶過來；
+        // 音訊濾波器與尚未取走的取樣則重設。
+        let current = self.cpu.bus();
+        decoded_bus
+            .ppu
+            .set_output_enabled(current.apu.output_enabled());
+        decoded_bus.apu.adopt_output_settings(&current.apu);
 
         *self = decoded;
         Ok(())
@@ -159,7 +206,7 @@ impl Nes {
         if bus.ram.len() != 0x0800 {
             return Err(StateError::Corrupt);
         }
-        if !bus.ppu.is_structurally_valid() {
+        if !bus.ppu.is_structurally_valid() || !bus.apu.is_structurally_valid() {
             return Err(StateError::Corrupt);
         }
 
@@ -216,7 +263,7 @@ impl Nes {
             ppu_w: bus.ppu.w,
             palette_ram: bus.ppu.palette,
             oam: bus.ppu.oam.clone(),
-            apu_frame_counter: bus.apu.frame_counter,
+            apu: bus.apu.debug(),
             mapper_id: bus.cartridge.mapper.id(),
             mapper_name: bus.cartridge.mapper.name().to_string(),
             mapper_regs: bus.cartridge.mapper_debug_rows(),
@@ -857,6 +904,16 @@ mod tests {
     /// （水平位置的 hori(v)=hori(t) 發生在該條線的 dot 257）。
     #[test]
     fn sprite0_split_scroll_takes_effect_on_the_next_scanline() {
+        let rom = sprite0_split_rom();
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        for _ in 0..4 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        check_sprite0_split(&nes);
+    }
+
+    /// 見 `sprite0_split_scroll_takes_effect_on_the_next_scanline`。
+    fn sprite0_split_rom() -> Vec<u8> {
         let mut a = Asm::new(0x8000);
         a.sei().cld().ldx_imm(0xFF).txs();
         a.set_ppu_addr(0x3F00);
@@ -888,12 +945,10 @@ mod tests {
         a.lda_imm(8).sta_abs(0x2005).lda_imm(0).sta_abs(0x2005);
         a.jmp(wait_vblank);
 
-        let rom = build_nrom(&a, 0x8000, None, &[], &test_chr(), false);
-        let mut nes = Nes::from_rom(&rom).unwrap();
-        for _ in 0..4 {
-            nes.run_frame([Buttons::empty(); 2]);
-        }
+        build_nrom(&a, 0x8000, None, &[], &test_chr(), false)
+    }
 
+    fn check_sprite0_split(nes: &Nes) {
         let fb = nes.cpu.bus().ppu.frame_buffer().as_bytes();
         let px = |x: usize, y: usize| {
             let i = (y * crate::frame::WIDTH + x) * 4;
@@ -1022,11 +1077,12 @@ mod tests {
     /// 兩個常數。判定規則見 `docs/architecture.md` §15。
     #[test]
     fn behavior_fingerprint_is_pinned_to_the_version_numbers() {
-        const PINNED_CORE_BEHAVIOR_VERSION: u16 = 2;
-        const PINNED_STATE_FORMAT_VERSION: u16 = 1;
-        const FINGERPRINT_NROM: u64 = 0x1c686ba19318685f;
-        const FINGERPRINT_MMC1: u64 = 0xd38a4123209ca9ca;
-        const FINGERPRINT_DUMMY_READ: u64 = 0xf15c811d05950484;
+        const PINNED_CORE_BEHAVIOR_VERSION: u16 = 3;
+        const PINNED_STATE_FORMAT_VERSION: u16 = 2;
+        const FINGERPRINT_NROM: u64 = 0xcbf95010461fa807;
+        const FINGERPRINT_MMC1: u64 = 0xde9bf3d88ee097c0;
+        const FINGERPRINT_DUMMY_READ: u64 = 0x7ede5740dc7425f7;
+        const FINGERPRINT_APU_PROBE: u64 = 0xe83244a5491484db;
 
         let mut nrom = Nes::from_rom(&rendering_rom()).unwrap();
         for input in inputs_for(60) {
@@ -1040,12 +1096,21 @@ mod tests {
         for input in inputs_for(60) {
             probe.run_frame(input);
         }
+        // frame IRQ、`$4015`、DMC（IRQ 與抓取樣本暫停 CPU）、各聲道的計數器。
+        let mut apu = Nes::from_rom(&crate::test_support::apu_probe_rom(
+            crate::test_support::ApuProbe::DEFAULT,
+        ))
+        .unwrap();
+        for input in inputs_for(60) {
+            apu.run_frame(input);
+        }
         let actual = (
             CORE_BEHAVIOR_VERSION,
             STATE_FORMAT_VERSION,
             nrom.state_hash(),
             mmc1.state_hash(),
             probe.state_hash(),
+            apu.state_hash(),
         );
         assert_eq!(
             actual,
@@ -1054,10 +1119,128 @@ mod tests {
                 PINNED_STATE_FORMAT_VERSION,
                 FINGERPRINT_NROM,
                 FINGERPRINT_MMC1,
-                FINGERPRINT_DUMMY_READ
+                FINGERPRINT_DUMMY_READ,
+                FINGERPRINT_APU_PROBE
             ),
             "模擬行為改變：請確認是預期的，遞增版本號並更新指紋（見測試文件）"
         );
+    }
+
+    /// APU 探針對它用到的每個功能都敏感：改變 frame counter 模式、IRQ 抑制、有沒有確認
+    /// `$4015`、有沒有 DMC，最後的狀態雜湊都不同（否則行為指紋抓不到那部分的退步）。
+    #[test]
+    fn apu_probe_hash_depends_on_each_apu_feature_it_exercises() {
+        use crate::test_support::{ApuProbe, apu_probe_rom};
+        let hash = |probe: ApuProbe| {
+            let mut nes = Nes::from_rom(&apu_probe_rom(probe)).unwrap();
+            for input in inputs_for(60) {
+                nes.run_frame(input);
+            }
+            nes.state_hash()
+        };
+        let base = ApuProbe::DEFAULT;
+        let hashes = [
+            hash(base),
+            hash(ApuProbe {
+                frame_counter: 0x40, // 抑制 frame IRQ
+                ..base
+            }),
+            hash(ApuProbe {
+                frame_counter: 0x80, // 5 步模式（沒有 frame IRQ）
+                ..base
+            }),
+            hash(ApuProbe {
+                ack_frame_irq: false, // 不讀 $4015 → frame IRQ 旗標不會清
+                ..base
+            }),
+            hash(ApuProbe { dmc: false, ..base }),
+        ];
+        for i in 0..hashes.len() {
+            for j in i + 1..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "變體 {i} 與 {j} 的狀態雜湊相同");
+            }
+        }
+    }
+
+    /// 輸出（畫面與音訊）開關：同樣的輸入跑 N 幀，開與關的 `state_hash` 必須逐幀相同。
+    /// 涵蓋會依賴渲染結果的狀態（sprite 0 hit 的 ROM）與 APU（IRQ、DMC）。
+    #[test]
+    fn output_switch_does_not_change_the_state_hash() {
+        use crate::test_support::{ApuProbe, apu_probe_rom};
+        let roms: [(&str, Vec<u8>); 5] = [
+            ("rendering", rendering_rom()),
+            ("mmc1", mmc1_churn_rom()),
+            ("dummy read", crate::test_support::dummy_read_probe_rom()),
+            ("apu probe", apu_probe_rom(ApuProbe::DEFAULT)),
+            ("sprite 0 split", sprite0_split_rom()),
+        ];
+        for (name, rom) in roms {
+            let mut on = Nes::from_rom(&rom).unwrap();
+            let mut off = Nes::from_rom(&rom).unwrap();
+            let mut toggled = Nes::from_rom(&rom).unwrap();
+            off.set_output_enabled(false);
+            assert!(on.output_enabled() && !off.output_enabled());
+            for (frame, input) in inputs_for(60).into_iter().enumerate() {
+                // toggled：第 20–39 幀關閉，其餘開啟。
+                toggled.set_output_enabled(!(20..40).contains(&frame));
+                on.run_frame(input);
+                off.run_frame(input);
+                toggled.run_frame(input);
+                assert_eq!(on.state_hash(), off.state_hash(), "{name}：第 {frame} 幀");
+                assert_eq!(
+                    on.state_hash(),
+                    toggled.state_hash(),
+                    "{name}：切換，第 {frame} 幀"
+                );
+            }
+            let (mut from_on, mut from_off) = (Vec::new(), Vec::new());
+            on.drain_audio(&mut from_on);
+            off.drain_audio(&mut from_off);
+            assert!(!from_on.is_empty(), "{name}：開啟時有音訊");
+            assert!(from_off.is_empty(), "{name}：關閉時沒有音訊");
+        }
+
+        // 關閉時不寫 framebuffer（維持關閉當下的內容），開啟時每幀都重畫。
+        // （`from_rom` 的 reset 序列已經畫了第 0 條掃描線，所以基準是關閉當下的畫面。）
+        let mut on = Nes::from_rom(&rendering_rom()).unwrap();
+        let mut off = Nes::from_rom(&rendering_rom()).unwrap();
+        off.set_output_enabled(false);
+        let at_switch = off.frame_buffer().as_bytes().to_vec();
+        for input in inputs_for(10) {
+            on.run_frame(input);
+            off.run_frame(input);
+        }
+        assert_ne!(on.frame_buffer().as_bytes(), &at_switch[..]);
+        assert_eq!(off.frame_buffer().as_bytes(), &at_switch[..]);
+    }
+
+    /// 輸出設定（開關、取樣率、聲道遮罩）不進存檔：`load_state` 之後保留目前的設定，
+    /// 但清掉濾波器與尚未取走的取樣。
+    #[test]
+    fn load_state_keeps_output_settings_and_resets_the_audio_signal() {
+        let rom = crate::test_support::apu_probe_rom(crate::test_support::ApuProbe::DEFAULT);
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        for _ in 0..10 {
+            nes.run_frame([Buttons::empty(); 2]);
+        }
+        let saved = nes.save_state();
+        nes.set_audio_sample_rate(44_100.0);
+        nes.set_audio_channel_mask(apu::CHANNEL_TRIANGLE | apu::CHANNEL_NOISE);
+        nes.run_frame([Buttons::empty(); 2]);
+        assert!(nes.cpu.bus().apu.buffered_samples() > 0);
+
+        nes.load_state(&saved).unwrap();
+        assert_eq!(nes.audio_sample_rate(), 44_100.0);
+        assert_eq!(
+            nes.audio_channel_mask(),
+            apu::CHANNEL_TRIANGLE | apu::CHANNEL_NOISE
+        );
+        assert!(nes.output_enabled());
+        assert_eq!(nes.cpu.bus().apu.buffered_samples(), 0);
+
+        nes.set_output_enabled(false);
+        nes.load_state(&saved).unwrap();
+        assert!(!nes.output_enabled(), "關閉狀態也保留");
     }
 
     /// 一個會不斷改寫 mapper 暫存器的 MMC1 程式：無窮迴圈 `INC $00; LDA $00; STA $E000`，

@@ -11,7 +11,12 @@
 //!    JMP），渲染關閉：比較接近真實遊戲程式碼會用到的指令組合。
 //! 3. `test_support::rendering_rom()`：開啟背景 + 精靈渲染、每幀一次 NMI，
 //!    OAM 裡有 60 個精靈擠在同幾條掃描線（sprite 評估的壞情況）。
-//! 4. 命令列給的 ROM（選用）：例如公開 test ROM 或自己合法取得的遊戲。
+//! 4. `test_support::apu_probe_rom()`：四個聲道都在發聲、frame IRQ 與 DMC IRQ 不斷觸發、
+//!    DMC 持續抓取樣本（APU 的壞情況）。
+//! 5. 命令列給的 ROM（選用）：例如公開 test ROM 或自己合法取得的遊戲。
+//!
+//! 每個情境都量兩次：**輸出開啟**（畫面 + 音訊混音、降頻、濾波，每幀取走取樣，跟 GUI 一樣）
+//! 與**輸出關閉**（`Nes::set_output_enabled(false)`，只推進模擬狀態；rollback 重跑幀用）。
 
 use std::time::Instant;
 
@@ -35,26 +40,34 @@ fn bench(name: &str, prg: &[u8; 0x8000]) {
 }
 
 fn bench_rom(name: &str, rom: &[u8]) {
-    let mut nes = Nes::from_rom(rom).expect("valid rom");
-    let input = [Buttons::empty(), Buttons::empty()];
-
-    for _ in 0..WARMUP_FRAMES {
-        nes.run_frame(input);
-    }
-
-    let start = Instant::now();
-    for _ in 0..BENCH_FRAMES {
-        nes.run_frame(input);
-    }
-    let elapsed = start.elapsed();
-
     println!("[{name}]");
-    println!("  {BENCH_FRAMES} frames in {elapsed:?}");
-    println!("  平均每幀: {:?}", elapsed / BENCH_FRAMES);
-    println!(
-        "  換算 fps 上限（純 CPU 工作量，不含 GUI/VSync）: {:.0}",
-        BENCH_FRAMES as f64 / elapsed.as_secs_f64()
-    );
+    for output in [true, false] {
+        let mut nes = Nes::from_rom(rom).expect("valid rom");
+        nes.set_output_enabled(output);
+        let input = [Buttons::empty(), Buttons::empty()];
+        let mut audio = Vec::new();
+
+        for _ in 0..WARMUP_FRAMES {
+            nes.run_frame(input);
+            audio.clear();
+            nes.drain_audio(&mut audio);
+        }
+
+        let start = Instant::now();
+        for _ in 0..BENCH_FRAMES {
+            nes.run_frame(input);
+            audio.clear();
+            nes.drain_audio(&mut audio);
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "  輸出{}：每幀 {:>9.1?}（{BENCH_FRAMES} 幀 {elapsed:?}；fps 上限 {:.0}）",
+            if output { "開啟" } else { "關閉" },
+            elapsed / BENCH_FRAMES,
+            BENCH_FRAMES as f64 / elapsed.as_secs_f64()
+        );
+    }
 }
 
 fn main() {
@@ -81,6 +94,11 @@ fn main() {
     bench_rom(
         "rendering_rom（背景 + 精靈 + NMI）",
         &nes_core::test_support::rendering_rom(),
+    );
+
+    bench_rom(
+        "apu_probe_rom（四聲道 + frame IRQ + DMC IRQ 與抓取）",
+        &nes_core::test_support::apu_probe_rom(nes_core::test_support::ApuProbe::DEFAULT),
     );
 
     if let Some(path) = std::env::args().nth(1) {

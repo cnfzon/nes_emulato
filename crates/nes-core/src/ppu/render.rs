@@ -40,18 +40,26 @@ impl Ppu {
         self.sprite0_hit_dot = 0;
         self.overflow_pending = false;
 
-        let colors = self.color_table();
+        // 輸出關閉時不寫 framebuffer，其餘判斷（sprite 0 hit、overflow）完全照舊。
+        let output = self.output_enabled;
+        let colors = if output {
+            self.color_table()
+        } else {
+            [[0u8; 4]; 32]
+        };
         let show_bg = self.mask & 0x08 != 0;
         let show_sprites = self.mask & 0x10 != 0;
 
         if !show_bg && !show_sprites {
             // 渲染關閉：整條線是背景色（$3F00）。
-            let backdrop = colors[0];
-            self.frame_buffer
-                .row_mut(line as usize)
-                .as_chunks_mut::<4>()
-                .0
-                .fill(backdrop);
+            if output {
+                let backdrop = colors[0];
+                self.frame_buffer
+                    .row_mut(line as usize)
+                    .as_chunks_mut::<4>()
+                    .0
+                    .fill(backdrop);
+            }
             return;
         }
 
@@ -68,19 +76,23 @@ impl Ppu {
         self.evaluate_sprites(line, cart, show_sprites, &mut sprites);
 
         let mut hit_x = None;
-        let row = self.frame_buffer.row_mut(line as usize);
-        for x in 0..WIDTH {
-            let bg = background[x];
-            let sp = sprites.index[x];
-            let chosen = if sp != 0 && (bg == 0 || !sprites.behind[x]) {
-                sp
-            } else {
-                bg
-            };
-            if hit_x.is_none() && sprites.is_sprite0[x] && bg != 0 && x != 255 {
-                hit_x = Some(x);
+        if output {
+            let row = self.frame_buffer.row_mut(line as usize);
+            for x in 0..WIDTH {
+                let bg = background[x];
+                let sp = sprites.index[x];
+                let chosen = if sp != 0 && (bg == 0 || !sprites.behind[x]) {
+                    sp
+                } else {
+                    bg
+                };
+                if hit_x.is_none() && sprites.is_sprite0[x] && bg != 0 && x != 255 {
+                    hit_x = Some(x);
+                }
+                row[x * 4..x * 4 + 4].copy_from_slice(&colors[chosen as usize]);
             }
-            row[x * 4..x * 4 + 4].copy_from_slice(&colors[chosen as usize]);
+        } else {
+            hit_x = (0..WIDTH - 1).find(|&x| sprites.is_sprite0[x] && background[x] != 0);
         }
         if let Some(x) = hit_x {
             // 像素 x 在 dot x + 1 輸出。

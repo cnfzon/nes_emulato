@@ -8,7 +8,7 @@
 
 | 課程主題 | 對應模組 / 機制 | 說明 |
 |---|---|---|
-| **(1) 作業系統與應用程式的關係**：多執行緒、檔案 I/O、timing | `nes-app/src/emu.rs`（emu 執行緒，60.0988Hz 固定步進）、`nes-app/src/main.rs`（`thread::spawn` + `crossbeam-channel` + `triple_buffer` 跨執行緒通訊）、`nes-app/src/app.rs`（用 `rfd`／`std::fs::read` 做檔案 I/O） | UI 執行緒與 Emu 執行緒分離，避免模擬迴圈的 timing 被 GUI 重繪卡住；反之也避免 GUI 被模擬迴圈的 sleep 卡住。 |
+| **(1) 作業系統與應用程式的關係**：多執行緒、檔案 I/O、timing | `nes-app/src/emu.rs`（emu 執行緒，60.0988Hz 固定步進）、`nes-app/src/main.rs`（`thread::spawn` + `crossbeam-channel` + `triple_buffer` 跨執行緒通訊）、`nes-app/src/app.rs`（用 `rfd`／`std::fs::read` 做檔案 I/O）、`nes-app/src/audio.rs`（系統音訊執行緒、lock-free 環形緩衝區、動態速率控制；見 §17.9） | UI 執行緒與 Emu 執行緒分離，避免模擬迴圈的 timing 被 GUI 重繪卡住；反之也避免 GUI 被模擬迴圈的 sleep 卡住。 |
 | **(2) 視窗環境** | `nes-app`（`eframe`/`egui`） | 選單列、遊戲畫面 texture、Debugger 側邊面板、狀態列、鍵盤輸入映射。 |
 | **(3) 網路環境** | `nes-net`（`protocol.rs` 封包格式、`transport.rs` UDP 傳輸層、`session.rs` rollback 排程） | 用 `std::net::UdpSocket`（non-blocking）+ 手刻協定，不用 async runtime，理由見 §5。 |
 | **(4) 整合設計** | `Nes::run_frame` 作為 `nes-core` / `nes-net` / `nes-app` 三者的交會點 | `nes-app` 的 emu 執行緒把「網路層排出的指令」（`nes-net::Request`）套用在 `nes-core::Nes` 上；GUI 只透過 channel 跟 emu 執行緒溝通，三個子系統彼此不直接耦合。 |
@@ -42,12 +42,17 @@ graph TB
         Nes["Nes (nes-core)"]
         Loop["60.0988Hz 固定步進迴圈<br/>(sleep + accumulator 補償)"]
     end
+    subgraph Audio["系統音訊執行緒 (cpal callback)"]
+        Cb["fill_output<br/>(無配置、無鎖)"]
+    end
 
     App -- "EmuCommand\n(crossbeam-channel)" --> Loop
     Loop -- "EmuEvent\n(crossbeam-channel)" --> App
     Loop -- "FrameBuffer\n(triple_buffer, 無鎖)" --> App
     Loop -- "Option&lt;DebugSnapshot&gt;\n(triple_buffer, 無鎖)" --> App
     Loop --> Nes
+    Loop -- "f32 取樣 + 暫停旗標<br/>(lock-free 環形緩衝區)" --> Cb
+    Cb -- "填充量 / underrun 計數<br/>(原子變數)" --> Loop
 ```
 
 emu 執行緒與 UI 執行緒之間目前有 5 條獨立通道，方向、型別、用途、背壓策略
@@ -55,11 +60,15 @@ emu 執行緒與 UI 執行緒之間目前有 5 條獨立通道，方向、型別
 
 | 通道 | 型別 | 方向 | 用途 | 背壓策略 |
 |---|---|---|---|---|
-| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`SetDebugViews`／`StepInstruction`／`StepFrame`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
+| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`SetDebugViews`／`StepInstruction`／`StepFrame`／`SetAudioChannelMask`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
 | 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`／`FrameAdvanced`／`TraceWritten`，每則都要送達 | unbounded：`FpsReport` 每秒 1 則、`FrameAdvanced` 每幀 1 則（UI 每次重繪都會 `try_iter()` 清空），不會累積成問題 |
 | 畫面 | `triple_buffer::Input/Output<FrameBuffer>` | Emu → UI | 每幀畫好的 `FrameBuffer` | `triple_buffer`：只在乎「最新一張」，UI 沒讀不會擋住 emu 寫入，也不會無限堆積 |
 | Debug 快照 | `triple_buffer::Input/Output<Option<DebugSnapshot>>` | Emu → UI | Debugger 面板顯示的 CPU/PPU/APU 狀態；`None` 代表「尚未收到任何快照」，跟真實模擬狀態（即使欄位剛好是 0）明確區分 | `triple_buffer`：同 FrameBuffer；另外用 `EmuCommand::SetDebugEnabled` 讓 emu 執行緒只在面板開啟時才產生快照，面板關閉時零成本 |
 | PPU 影像 | `triple_buffer::Input/Output<Option<PpuViews>>` | Emu → UI | Debugger 的 pattern table（2 張 128×128）與 nametable（4 張 256×240），約 1.1MB／份 | `triple_buffer`；而且 **預設不產生**：只有面板開著且目前分頁是 Pattern/Nametable 時，UI 才送 `EmuCommand::SetDebugViews(Some(調色盤))`，emu 執行緒執行中每 3 幀更新一次，暫停時單步/讀檔後立即更新；離開分頁就送 `None`，之後零成本 |
+
+除了上面 5 條，emu 執行緒與**系統的音訊執行緒**之間還有第 6 條：核心產生的取樣經
+`AudioShared` 的環形緩衝區交給 cpal 的 callback，暫停旗標、主音量、填充量、underrun 計數都是
+原子變數，callback 內不上鎖、不配置記憶體（設計與理由見 §17.9）。
 
 - **為什麼 emu 執行緒跟 UI 執行緒分開？** GUI 重繪（尤其是開啟 debugger 面板、
   拖動視窗）耗時不固定，如果模擬迴圈跟 UI 畫在同一個執行緒，模擬的 timing
@@ -220,6 +229,9 @@ Rollback 與 desync 偵測完全依賴「同樣的初始狀態 + 同樣的輸入
    （v/fine X/PPUCTRL/PPUMASK/OAM/調色盤）與卡帶 CHR 決定，沒有浮點運算、沒有
    時間或亂數。調色盤（`ppu/palette.rs`）是整數查表。`Ppu::frame_buffer` 是
    「輸出」而不是「狀態」，不進 save state（見 §8）。
+
+7. **浮點數只允許出現在音訊輸出管線**（`apu/output.rs`：混音、降頻、濾波）。APU 的模擬狀態全部是
+   整數；輸出管線與 `Ppu::frame_buffer` 同地位，不進 save state、不參與 `state_hash`（§17.8）。
 
 以下三個測試（`crates/nes-core/src/lib.rs` 的 `tests` module）直接驗證了規則
 5、6 帶來的性質：
@@ -456,9 +468,13 @@ Debugger 開著時，狀態列直接用同一份快照的 `frame_count`，因此
   subset 為常用繁體字以縮小執行檔，並確認 OFL 對修改後字型的命名規定
   （OFL-1.1 對「Modified Version」的 Reserved Font Name 限制，以及 subset
   後是否必須改名）。決定於第 0 步：目前保留完整字型，不做 subset。
-- **下一階段是 Phase 3.5（APU 與音訊輸出），不是 Phase 4。** APU 會再改變一次模擬行為，
-  必須遞增 `CORE_BEHAVIOR_VERSION`（目前為 2），並在 Phase 4 的 replay 格式與 netplay
-  握手出現之前完成。
+- **Phase 3.5（APU 與音訊輸出）已完成，模擬核心正式凍結**：`CORE_BEHAVIOR_VERSION` = 3、
+  `STATE_FORMAT_VERSION` = 2（§15.4、§17）。下一階段是 Phase 4（replay、netplay、rollback）。
+- **效能候選：APU 延遲 catch-up（不在 Phase 4 之前處理，之後隨時可做；判斷見 §15.6）。**
+  目前 `Bus::advance` 每條指令兩次都推進 APU，即使 APU 閒置也要付「每次 chunk 迴圈」的固定成本
+  （§14.6：約 +150 µs／幀）。做法是把 APU 要追的 cycle 累積起來，只在「暫存器存取」、「CPU 可見的
+  事件（frame IRQ 旗標、DMC 抓取／IRQ）到期」與幀邊界才追上；`save_state`／`debug_snapshot` 前先追上。
+  Phase 3.5 曾試過「聽不到的聲道用算術批次前進」，因為 APU 每次只被推進 2–3 個 cycle，反而更慢，已還原（§17.2）。
 - **實體手把（gilrs）：決定先不加，留到 Phase 5 再評估。** 需要新增依賴，屆時要先說明用途、
   授權與替代方案，經同意才加。在此之前雙人只有鍵盤（見 `nes-app/src/input.rs`）。
 - **耗時上升：決定先接受，不隔離成因。** Phase 3.1 起 `run_frame` 每幀約多 70 µs（§14.6），
@@ -696,6 +712,96 @@ bank 切換、mirroring、PRG-RAM 測試）。用到 mapper 的只有上面列�
 每條指令多一次判斷）；「全部 NOP」情境根本沒有索引定址，所以這是每條指令的固定成本，不是 dummy read
 本身。沒有另外把這個成本隔離出來驗證，也不能排除一部分是機器負載。絕對值約為幀預算的 2–4%。
 
+**Phase 3.5**（`bench_run_frame`，5 輪、與 Phase 3.1 的建置在同一台機器上交錯執行；表中是 5 輪的中位數，
+括號是範圍）。「輸出關閉」＝ `Nes::set_output_enabled(false)`（不寫 framebuffer、不混音、不產生取樣；
+rollback 重跑幀用）；「輸出開啟」＝ 畫面 + 混音／降頻／濾波，且每幀取走取樣（跟 GUI 一樣）。
+
+| 情境 | Phase 3.1（無 APU） | Phase 3.5 輸出關閉 | Phase 3.5 輸出開啟 |
+|---|---|---|---|
+| 全部 NOP、渲染關閉 | 353 µs（346–420） | 526 µs（507–669） | 736 µs（621–782） |
+| LDA/STA/INX/CPX/BNE 迴圈 | 354 µs（353–357） | 511 µs（483–522） | 656 µs（643–700） |
+| `rendering_rom`（背景 + 精靈 + NMI） | 559 µs（550–565） | 696 µs（682–715） | 951 µs（887–982） |
+| `apu_probe_rom`（四聲道、IRQ、DMC） | —（新） | 463 µs（452–468） | 525 µs（516–590） |
+
+- 最壞情況（`rendering_rom`、輸出開啟）約 0.95 ms／幀，是 60Hz 幀預算（16.64 ms）的 5.7%。
+- **APU 的固定成本約 +150–170 µs／幀**（全部 NOP：353 → 526）：`Bus::advance` 每條指令兩次進入 APU 的
+  chunk 迴圈。這是「輸出關閉」的值，不含混音；`rendering_rom` 的輸出關閉比輸出開啟少約 250 µs，
+  其中一部分是 PPU 少寫 framebuffer，一部分是少了混音（每個 chunk 的電平積分）與每個輸出取樣的三個
+  濾波器。**沒有另外把兩者隔離量測**，所以「多少來自混音、多少來自 framebuffer」是推論。
+- 「全部 NOP」的 APU 是預設狀態（計時器週期 0），chunk 幾乎每個 cycle 都要停一下，比真實遊戲
+  （週期通常是幾十到幾百）更壞；`apu_probe_rom` 比較接近實際。
+- 這些數字有機器雜訊（範圍欄），只有量級可信。
+
+### 14.7 Phase 3.5 測試結果（APU 與中斷）
+
+`roms/nes-test-roms/` 新增取得 `apu_test`、`blargg_apu_2005.07.30`、`apu_reset`、
+`cpu_interrupts_v2`（同一個 GitHub 合集、同一個 commit，見 `ATTRIBUTION.md`）。以下是
+`nes-test blargg <rom>`（release，`--max-frames 9000`）的**實際執行結果**；「前」是 Phase 3.1
+的核心（APU 是 stub）用同一支腳本跑出來的。
+
+#### 14.7.1 APU
+
+| ROM | 前 | 後 | 說明 |
+|---|---|---|---|
+| `apu_test/rom_singles/1-len_ctr` … `6-irq_flag_timing`（6 個） | 失敗 | **通過** | 長度計數器、長度表、frame IRQ 旗標、jitter、長度時序、IRQ 旗標時序 |
+| `apu_test/rom_singles/7-dmc_basics` | 失敗 | **通過** | |
+| `apu_test/rom_singles/8-dmc_rates` | 逾時 | **通過** | 16 種 DMC 取樣率（在 DMC 暫停 4 cycle 的假設下） |
+| `apu_test/apu_test.nes`（合集） | 失敗 | **通過**（296 幀，「All 8 tests passed」） | |
+| `blargg_apu_2005.07.30` 01–08、10、11（10 個） | 失敗 | **通過** | 長度計數器、frame IRQ、jitter、mode 0／1 的長度時序、IRQ 時序、halt／reload 時序 |
+| `blargg_apu_2005.07.30/09.reset_timing` | 失敗 | **通過** | 需要「reset 後 frame counter 已走了 9–12 cycle」（§17.7）；第一版只走了 4，回報「第四步太晚」 |
+| `apu_reset` 6 個 | 5 失敗、1 通過 | **6 通過** | `4015_cleared`、`4017_timing`（量到 delay 11）、`4017_written`、`irq_flag_cleared`、`len_ctrs_enabled`、`works_immediately` |
+
+**APU 共 26 項（apu_test 單檔 8 + 合集 1 + blargg_apu 11 + apu_reset 6；合集與單檔測同樣的內容）
+全部通過，沒有預期失敗項目。**
+
+#### 14.7.2 CPU 中斷（`cpu_interrupts_v2`）
+
+| ROM | 前 | 後 | 說明 |
+|---|---|---|---|
+| `1-cli_latency`（12 個子項） | 失敗 | **通過** | CLI／SEI／PLP 的延遲、RTI 立即生效、未確認的 IRQ 不會讓主程式停擺（§17.6） |
+| `2-nmi_and_brk` | 失敗 | **失敗（預期）** | NMI 在 BRK 的 7 個 cycle 序列中間到達時，硬體會「劫持」向量（NMI 向量、B 旗標仍為 1）。instruction-level 的中斷序列是一個不可分割的步驟，沒有「序列進行到第幾個 cycle」，無法重現 |
+| `3-nmi_and_irq` | 失敗 | **失敗（預期）** | 同上（NMI 與 IRQ 序列的重疊） |
+| `4-irq_and_dma` | 失敗 | **失敗（預期）** | IRQ 偵測與 OAM／DMC DMA 的 cycle 對齊（DMA 期間 CPU 停住，偵測點的位置取決於 DMA 落在哪個 cycle）。我們的 DMA 是「指令之後插入固定 cycle 數」（§17.5） |
+| `5-branch_delays_irq` | 逾時 | **失敗（預期）** | 「成立且不跨頁的分支」會讓 IRQ 偵測晚一條指令（分支的額外 cycle 沒有偵測）。取樣點被固定在「指令倒數第二個 cycle」，沒有為分支特別處理 |
+| `cpu_interrupts.nes`（合集） | 失敗 | **失敗（預期）** | 依序執行，第 2 項失敗即停止 |
+
+這四個失敗的共同原因都是 **instruction-level 沒有「指令內部的 cycle 時間軸」**，沒有為了讓它們通過而
+硬湊特例。**注意：每一項的具體原因是依測試的 readme 與輸出「推論」的（BRK／NMI／IRQ 序列的劫持、DMA 的
+cycle 對齊、分支的偵測延遲），沒有逐項用除錯器驗證過。**
+
+#### 14.7.3 既有項目（不得退步）與破壞性實驗
+
+**ROM 清單對帳（Phase 3.1 的 48 個 vs. 本階段 47 個）**：差異是 `scrolltest/scroll.nes`——§14.3 記錄過它，但
+CLAUDE.md 的清單漏列，所以依清單只跑出 47 個。它沒有 `$6000` 協定也沒有畫面文字（是給人看的捲動示範），
+`nes-test blargg` 只能回報「無簽章、判讀 Unknown」（退出碼 1，**不代表失敗**）；它的驗證是黃金畫面
+（`tests/golden_frames.rs` 已含 `scrolltest/scroll.nes`，200 幀雜湊 `0xf012bec60dd7a3ba`，本階段測試通過，
+與 Phase 3.1 相同）。已補進 CLAUDE.md 的清單並註明判定方式。另外 `roms/nes-test-roms/dmc_tests/`
+（4 個 ROM：`buffer_retained`、`latency`、`status`、`status_irq`）是 Phase 3.5 取得 APU 測試 ROM 時多拉的，
+**沒有自動判定**：無 `$6000` 簽章、畫面是空白灰底（截圖確認；合集的 `test_roms.xml` 對其中 `status`、`status_irq` 記了同一個 Nestopia 畫面雜湊，與本專案的雜湊算法不同，無法比對），
+所以**無法判定通過與否，沒有列入清單、也沒有宣稱通過**。
+
+**既有 47 個 ROM**（`instr_test-v5` 16 單檔 + `official_only` + `all_instrs`、`ppu_vbl_nmi` 10 單檔 + 合集、
+`oam_read`、`ppu_read_buffer`、`sprite_hit_tests_2005.10.05` 11 個、`blargg_ppu_tests_2005.09.15b` 5 個），
+用同一支腳本在 APU 前後（前＝以 git HEAD 封存另外建置的 Phase 3.1 核心）各跑一次，以退出碼逐項比對：
+**結果與 Phase 3.1 完全相同（0 項變化；通過 39／失敗 8，失敗的 8 個就是 §14.2、§14.3 記錄的預期失敗）**。
+加上 nestest 共 48 項。nestest：8991 行通過，`--strict` 也通過（見 §17.11）。
+SingleStepTests：官方 1,510,000／1,510,000、非官方穩定 870,000／870,000、JAM 120,000／120,000，
+另有的匯流排存取比對閘門也通過——與 Phase 3.1 相同。
+
+**破壞性實驗（實際執行）**：一次破壞一個 APU／IRQ 行為（編譯前改原始碼、跑 `cargo test -p nes-core --lib`、
+還原），共 16 種。**指紋測試偵測到 13 種**：frame IRQ 永遠不設、讀 `$4015` 不清旗標、frame counter 晚
+1 cycle、DMC 暫停 4→3、寫 `$4015` 不清 DMC IRQ、包絡線起始衰減、sweep negate 的補數差異、noise 短模式
+回授位元、triangle 序列步進、`$4017` 生效延遲不分奇偶、存取前不先跑一個 cycle、讀 `$4015` 也更新
+open bus、IRQ 偵測改到指令之後。**指紋測試沒偵測到 3 種**（由單元測試偵測到 2 種）：
+長度表某一項錯（`length_counter_counts_down_...` 偵測；探針只用到索引 1 與 3 且 pulse 2 的長度會歸零）、
+CLI／SEI／PLP 不延遲（3 個 CPU 單元測試偵測；探針的主迴圈沒有在 IRQ 等待時執行這三條指令）、
+**DMC 啟用延遲不分奇偶（當時沒有任何測試偵測到；差 1 個 cycle 的抓取時間點）**。
+還原後全部測試通過。**收尾補強**：新增 `dmc_start_delay_is_two_cycles_on_even_writes_and_three_on_odd_writes`
+（在指定的寫入奇偶下啟用 DMC，驗證 `start_delay` 為 2／3、且抓取分別發生在第 3／4 次 `tick(1)`），
+再次做同一個破壞（奇偶都取 2），**新測試失敗（偵測到）**、指紋測試仍不會失敗（指紋 ROM 沒有在會影響的時間點
+啟用 DMC），還原後全部通過。這個實驗也抓到探針本身的缺陷（第一版把 `$4015` 啟用寫在長度載入之後，所有
+長度計數器都是 0，聲道全靜音），已修正並重新釘住雜湊。
+
 ## 15. 會改變模擬結果的修改（判定規則與版本號）
 
 Rollback、replay、netplay 都要求「相同 ROM + 相同輸入序列，任何時候重播都得到相同結果」。
@@ -703,8 +809,8 @@ Phase 3 起用兩個版本號把這個保證變成可檢查的規則（常數在
 
 | 版本號 | 意義 | 目前值 |
 |---|---|---|
-| `STATE_FORMAT_VERSION` | 存檔的**格式結構**：欄位、順序、型別、header 佈局 | 1 |
-| `CORE_BEHAVIOR_VERSION` | **模擬行為**：同樣的 ROM 與輸入，狀態或畫面會不會不同 | 1 |
+| `STATE_FORMAT_VERSION` | 存檔的**格式結構**：欄位、順序、型別、header 佈局 | 2 |
+| `CORE_BEHAVIOR_VERSION` | **模擬行為**：同樣的 ROM 與輸入，狀態或畫面會不會不同 | 3 |
 
 ### 15.1 判定規則
 
@@ -718,6 +824,8 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 - PPU：任何暫存器行為、時序、渲染（含調色盤數值、sprite 評估、優先順序）、NMI／vblank
   時機、open bus／I/O latch 的值。
 - Bus：open bus、OAM DMA 時序、搖桿讀取與輸入鎖定時機、`run_frame` 的幀邊界。
+- APU：任何暫存器行為、計時（frame counter、計時器週期、長度計數器的延遲寫入）、DMC 的取樣抓取
+  與暫停 CPU 的 cycle 數、IRQ 來源；CPU 的 IRQ 偵測（時間點、I 旗標遮蔽規則）。
 - Mapper：任何暫存器的行為、mirroring、PRG-RAM 啟用規則、bank 換算；**開機初值**
   （RAM、PPU、mapper 暫存器）。
 - 修正一個「原本算錯」的行為也一樣：對舊版來說結果就是變了。
@@ -725,6 +833,9 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 不會（不需要遞增）：
 
 - 純重構，且輸出逐位元相同（由黃金畫面與行為指紋測試證明）。
+- **音訊輸出管線**（混音公式、降頻、濾波器、取樣率、聲道遮罩、輸出開關）：輸出，不進 `state_hash`
+  （§17.8）。改它不影響 rollback，但要注意「輸出開關開／關的 `state_hash` 必須相同」這條不變式
+  （測試 `output_switch_does_not_change_the_state_hash`）。
 - Debugger／trace／`peek`／`debug_snapshot`／`debug_ppu_views` 這類唯讀輸出。
 - GUI、網路、`nes-test` 的修改；效能優化（同樣要靠上述測試證明輸出相同）。
 - **新增 mapper**：只讓原本載入失敗的 ROM 能載入，不影響既有 ROM。（`Mapper` 的變體只能
@@ -745,8 +856,11 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 ### 15.3 怎麼確保沒有人忘記遞增
 
 - `behavior_fingerprint_is_pinned_to_the_version_numbers`（`nes-core` 的 lib 測試）：把兩個
-  版本號與「兩份合成 ROM（NROM 渲染、MMC1 不斷切 bank）在固定輸入下跑 60 幀的 `state_hash`」
-  釘在一起。模擬行為或存檔格式一變，狀態雜湊就變、測試失敗。
+  版本號與「四份合成 ROM（NROM 渲染、MMC1 不斷切 bank、索引定址 dummy read 探針、**APU 探針**）在固定
+  輸入下跑 60 幀的 `state_hash`」釘在一起。模擬行為或存檔格式一變，狀態雜湊就變、測試失敗。
+  APU 探針（`test_support::apu_probe_rom`）會用到 frame IRQ、`$4015`（讀取清旗標）、DMC IRQ 與
+  抓取樣本暫停、兩個 sweep、noise 短模式、四個聲道的長度與包絡線；它對 APU 行為是否敏感，用
+  「破壞性實驗」驗證過（§14.7.3）。
 - `golden_frame_hash_of_rendering_rom` 與 `tests/golden_frames.rs`：釘住畫面輸出。
 - 測試失敗時的流程：(1) 確認變動是預期的；(2) 依 §15.1 遞增對應的版本號；(3) 同時更新
   指紋測試裡的常數（版本號與雜湊）與黃金雜湊；(4) 在 §15.4 補一列紀錄。
@@ -758,20 +872,42 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 |---|---|
 | 1 | Phase 3 凍結：分段 catch-up、mapper 0/1/2/3（含 MMC1 的 RMW 連續寫入規則）、`$9C/$9E/$AB`。Phase 3 之前沒有版本號；Phase 2 的存檔與此版不相容 |
 | 2 | Phase 3.1：索引定址的 dummy read（§13.1）、RMW 對所有位址都寫兩次（舊值、新值）。會改變任何有跨頁索引讀取／對 I/O 暫存器做 RMW 的程式的結果（例：`ppu_read_buffer` 由失敗變通過）。`STATE_FORMAT_VERSION` 不變（佈局沒改），但 header 內容含版本號，所以所有狀態雜湊都變了 |
+| 3 | Phase 3.5：**APU**（五個聲道、frame counter、`$4015`、frame／DMC IRQ、DMC 抓取樣本暫停 CPU 4 cycle）、CPU 的 level-triggered IRQ 與 CLI/SEI/PLP 的延遲遮蔽、`$4015` 讀取不更新 open bus、reset 時 APU 的狀態（§17）。**這是核心的最後一次行為變更**，之後 Phase 4 的 replay／netplay 以此版本為準 |
 
 | `STATE_FORMAT_VERSION` | 內容 |
 |---|---|
 | 1 | 8 bytes header + postcard(`Nes`)；`Mapper` 變體順序 Nrom、Mmc1、Uxrom、Cnrom；`Mirroring` 變體順序 Horizontal、Vertical、FourScreen、SingleScreenLower、SingleScreenUpper |
+| 2 | Phase 3.5：`Apu` 由「原始暫存器 byte」換成完整的聲道／frame counter 狀態（`apu/mod.rs`、`apu/channels.rs`）；`Cpu` 多了 `irq_sample`、`irq_masked` 兩個欄位。輸出管線（`Apu::out`）標了 `#[serde(skip)]`，`Ppu::output_enabled` 也是，所以不在存檔裡 |
 
 ### 15.5 Phase 4 的銜接
 
 - **replay 格式**：檔頭記錄 `CORE_BEHAVIOR_VERSION` 與 ROM 的 `rom_hash`（§8.2），重播前比對；
-  版本不同就拒絕（或明確警告「結果不保證相同」），不默默重播。
+  版本不同就拒絕（或明確警告「結果不保證相同」），不默默重播。**replay 的內容是「開機狀態 + 輸入序列」，
+  不包含存檔**（§15.6）。
 - **netplay 握手**：雙方交換 `CORE_BEHAVIOR_VERSION` 與 `rom_hash`，任一不符就拒絕連線。
   這比事後靠 `state_hash` 偵測到 desync 更早、訊息也更明確。desync 偵測仍保留。
 - 這兩者沿用同一個 `CORE_BEHAVIOR_VERSION`，不另建協定版本；`STATE_FORMAT_VERSION` 只影響
   本機存檔與 rollback 內部的存讀檔，不必送到對方。（netplay 雙方各自用自己的存檔格式做
   rollback，只交換輸入與雜湊。）
+
+### 15.6 replay、netplay 與存檔格式的關係（規則）
+
+- **replay ＝ 開機狀態 + 輸入序列**。「開機狀態」就是 `Nes::from_rom`（由 ROM 與核心的程式碼決定，
+  不是一份資料）；輸入序列是每幀兩個搖桿的按鍵。**replay 不得包含存檔**（`save_state` 的位元組）：
+  一旦 replay 內嵌存檔，`STATE_FORMAT_VERSION` 就會變成 replay 相容性的一部分，任何存檔格式的調整
+  都會讓舊 replay 失效。**這是規則，不是建議**：Phase 4 的 replay 格式實作與審查都要遵守。
+- **netplay 只交換輸入**（加上握手時的 `CORE_BEHAVIOR_VERSION` 與 `rom_hash`、與 desync 偵測用的
+  `state_hash`）。存檔只用在各自本機的 rollback，不送給對方。
+- 因此：
+  - **存檔格式的改變只需遞增 `STATE_FORMAT_VERSION`**，不影響 replay 與 netplay 的相容性；
+  - **只有 `CORE_BEHAVIOR_VERSION` 的改變才會使 replay 失效**（同一份輸入序列會算出不同結果）。
+- **延遲 catch-up（§12）與這條規則的關係**：它只改變「APU 何時被追上」，只要每個 CPU 可見的結果
+  （暫存器讀值、IRQ、DMC 暫停、畫面、RAM）逐位元不變，就**不需要**遞增 `CORE_BEHAVIOR_VERSION`；
+  但若它把「尚未追上的 cycle 數」放進存檔，就要遞增 `STATE_FORMAT_VERSION`，且目前釘住的行為指紋
+  （`state_hash` 是對存檔位元組雜湊）會因格式而改變。**注意**：現有的指紋測試無法區分「行為變了」與「只有
+  存檔格式變了」，所以動手前要先加一個**與存檔格式無關的行為指紋**（例如：每幀結束時 CPU 暫存器、RAM、
+  framebuffer 雜湊、APU 輸出取樣雜湊），用它證明行為沒變，才能只遞增 `STATE_FORMAT_VERSION`。
+  （這一點修正了 Phase 3.5 初版 §12 的說法——當時寫「屬於行為版本的變更」，那只在行為真的改變時才成立。）
 
 ## 16. Mapper
 
@@ -893,3 +1029,207 @@ AND。**本專案不模擬**，寫入值直接生效。
   `$C000` 跟著切換，UxROM 合成測試與 2 個既有測試失敗。復原後 mapper.rs 與備份逐位元相同、全數通過。
 - 不模擬 bus conflict（§16.5），所以測試 ROM 直接寫 `$8000`，沒有刻意配合 ROM 內容。
 
+## 17. APU 與音訊輸出（Phase 3.5）
+
+### 17.1 範圍與檔案
+
+- `nes-core/src/apu/mod.rs`：`Apu`（暫存器分派、frame counter、事件驅動的步進、DMC 抓取、reset、
+  存檔驗證、Debugger 摘要）；`channels.rs`：長度計數器、包絡線、Pulse／Triangle／Noise／DMC；
+  `output.rs`：混音、降頻、濾波（輸出，不進存檔）；`tests.rs`：測試。
+- CPU 的 IRQ 偵測在 `cpu/mod.rs` 的 `Cpu::step`；匯流排上的 APU 存取在 `bus.rs`。
+- 實作依據 NESdev wiki 的 APU 各頁（APU、APU Frame Counter、APU Length Counter、APU Envelope、
+  APU Sweep、APU Pulse／Triangle／Noise／DMC、APU Mixer、CPU interrupts）。**frame counter 的逐 cycle
+  時序與長度計數器的延遲寫入，是對照 blargg 的 APU 測試 ROM 與公開的逐 cycle 模擬器（Mesen）的行為
+  慣例校準的**——沒有複製其程式碼（`ATTRIBUTION.md`）。
+- 模擬狀態**只用整數**；浮點數只在 `output.rs`。
+
+### 17.2 時序模型
+
+APU 由 `Bus::advance` 驅動，與 PPU 一樣採分段 catch-up（§13.1）：`Cpu::step` 在指令執行前追上 `N − 1`
+個 cycle、執行後補最後 1 個。
+
+- **存取前先跑一個 cycle**（`Apu::sync`）：讀寫 APU 暫存器之前，APU 額外多跑 1 個 cycle（記在
+  `ahead`，後面那個 cycle 的 `step` 就跳過）。逐 cycle 的模擬器裡「寫入發生時，APU 已經處理過該 cycle」，
+  frame counter 的步驟 cycle 數（7457、14913、……）與 blargg 測試的時序都是照這個約定校準的；分段
+  catch-up 的「最後一個 cycle 才存取」比它早 1 個 cycle，所以要補這一步。拿掉它，指紋會變（§14.7.3）。
+  測試 `apu_cycle_count_stays_in_step_with_the_bus_across_register_accesses` 驗證 APU 的 cycle 計數與
+  `Bus::total_cycles` 始終一致。
+- **事件驅動**：每個計時器都記錄「距離下一次步進還有幾個 CPU cycle」（`cnt`），`Apu::step` 一次跳到
+  最近的事件（frame counter 下一步、任一計時器到期、`$4017` 生效延遲、DMC 啟用延遲、待生效的長度計數器
+  寫入），兩個事件之間狀態不變，所以整段區間的混音電平是常數。**與「逐 cycle」等價**：測試
+  `chunked_stepping_is_equivalent_to_stepping_one_cycle_at_a_time` 用偽隨機的暫存器寫入與長度，比對
+  `step(n)` 與 n 次 `step(1)` 的完整狀態（輸出開／關都測）。
+- 試過但**已還原**的優化：聽不到（靜音或輸出關閉）的聲道用算術批次前進。`Bus::advance` 每次只給 APU
+  2–3 個 cycle，chunk 本來就被指令切碎，多出來的判斷讓每幀反而慢約 100 µs。真正的優化是延遲 catch-up
+  （§12），會改變存檔內容，留給 Phase 4 之前決定。
+
+### 17.3 frame counter
+
+`$4017` bit 7 選 4 步／5 步模式，bit 6 是 IRQ 抑制。步驟發生的 cycle（自重啟起算，NTSC）：
+4 步 `7457、14913、22371、29828、29829、29830`，5 步 `7457、14913、22371、29829、37281、37282`；
+動作依序是 quarter（包絡線、linear counter）、half（quarter + 長度計數器 + sweep）、quarter、（無）、
+half、（無）。4 步模式的第 4–6 步（29828–29830）都會設 frame IRQ 旗標（未抑制時）。
+
+- **寫入 `$4017` 的生效延遲**：寫入之後 3 個 cycle（寫入落在偶數 CPU cycle）或 4 個（奇數）才重啟計數器；
+  5 步模式在生效時立即做一次 half-frame 時脈。IRQ 抑制位元**立即**生效（並清旗標）。
+- **同時時脈的抑制**（`block`）：一次 frame 時脈之後 2 個 cycle 內不再有第二次，避免 `$4017` 的立即時脈
+  與自然時脈重複。
+- 讀 `$4015` 清 frame IRQ 旗標（`read_status`）；`peek` 不清（Debugger／trace 用）。
+
+### 17.4 各聲道
+
+- **長度計數器**：載入值表 `LENGTH_TABLE`；停用聲道（`$4015`）時立即清零、且忽略載入。**halt 旗標與
+  新的長度都延遲一個 cycle 生效**（`new_halt`／`reload`），而且若那個 cycle 剛好被 frame counter 減過一次，
+  這次載入被忽略（blargg 的 `len_halt_timing`、`len_reload_timing`）。
+- **Pulse**：duty 波形、包絡線、sweep、11 bit 計時器（每 `2 × (t + 1)` CPU cycle 步進序列器）。**sweep
+  negate 的差異**：pulse 1 用 1 的補數（`period − (period >> shift) − 1`），pulse 2 用 2 的補數；
+  週期 < 8 或目標週期 > `$7FF` 都靜音（與 sweep 是否啟用無關）。
+- **Triangle**：linear counter（reload flag、control）、長度計數器、32 步序列；兩個計數器都非零才前進。
+  週期 < 2（超音波）且正在跑時輸出序列平均值 8，避免爆音（輸出處理，不改變狀態）。
+- **Noise**：15 bit LFSR（長模式週期 32767、短模式 93），NTSC 週期表，包絡線、長度計數器。
+- **DMC**：見 §17.5。
+
+### 17.5 DMC 與 CPU 暫停
+
+- 輸出單元每 `DMC_RATE_TABLE[rate]` 個 CPU cycle 處理 1 個 bit；8 個 bit 用完換緩衝區裡的下一個 byte，
+  緩衝區因此變空就向記憶體抓下一個 byte（`$C000–$FFFF`，位址在 `$FFFF` 之後繞回 `$8000`）。取樣結束時：
+  loop 則重新開始，否則 IRQ 致能就設 DMC IRQ 旗標。`$4011` 直接載入輸出電平；寫 `$4015` 清 DMC IRQ。
+  `$4015` 啟用一個已經跑完的取樣時，DMA 在 2–3 個 cycle 之後（依寫入 cycle 的奇偶）才開始。
+- **抓取樣本使 CPU 暫停固定 `DMC_STALL_CYCLES` = 4 個 cycle**。硬體是 3–4 個（依 CPU 正在執行讀或寫、
+  是否與 OAM DMA 重疊而定，重疊時更少）。**誤差**：每次抓取最多多算 1 個 cycle；DMC 最快每 432 個
+  cycle 抓一次，最壞每秒多暫停約 4000 個 cycle（約 0.2%）。抓取的時間點也只到「一條指令內」的精度。
+  暫停期間 PPU 與 APU 照常前進（`Bus::tick` 補上，暫停期間又觸發的抓取會繼續補）。
+- **不模擬** DMC DMA 與 `$4016`／`$2007` 讀取重疊時的副作用（重複讀取造成搖桿多移位、PPU 位址多前進）。
+  理由：那是硬體 bug，需要知道 DMA 落在 CPU 哪個 cycle；寫得小心的遊戲會加上重讀來繞過。若日後改成
+  cycle-level CPU 再補。`apu_test/8-dmc_rates` 與 `7-dmc_basics` 在這個近似下通過；`cpu_interrupts_v2/
+  4-irq_and_dma` 需要這個精度而失敗（§14.7.2）。
+
+### 17.6 CPU 的 IRQ：level-triggered、I 旗標遮蔽、CLI／SEI／PLP 的延遲
+
+- **IRQ 線**（`Bus::irq_line`）＝ 所有來源的 OR：APU 的 frame IRQ 旗標、DMC IRQ 旗標（日後 mapper 的 IRQ
+  也接在這裡）。旗標一直是高的，只要 I = 0，就會一直服務（處理常式沒確認的話）。
+- **偵測時間點**：硬體在每條指令**倒數第二個 cycle 結束時**取樣 IRQ 線。`Cpu::step` 在「追上 `N − 1`
+  個 cycle 之後、執行指令之前」取樣（`irq_sample`）：指令自己在最後一個 cycle 造成的變化（寫 `$4015`／
+  `$4017`、讀 `$4015` 清旗標）趕不上這次取樣。取樣結果在**下一次** `step` 開頭使用。
+- **I 旗標的遮蔽**（`irq_masked`）：多數指令就是指令之後的 I；**CLI、SEI、PLP 改變 I 旗標的時間點是它們
+  的最後一個 cycle，晚於偵測**，所以偵測用的是**指令之前**的 I：
+  - `CLI`：I 清掉，但 IRQ 要等下一條指令執行完才會被服務（「CLI 之後恰好執行一條指令」）；
+  - `SEI`：一個已經在等的 IRQ 仍會在 SEI 之後被服務一次；
+  - `PLP`：同 SEI／CLI（取決於彈出的 I）；
+  - `RTI`：在倒數第二個 cycle 之前就還原了 I，**立即生效**（測試 `1-cli_latency` 的第 10、12 項）；
+  - BRK／IRQ／NMI 序列自己設 I，服務之後處理常式的第一條指令一定先執行。
+  這只影響**遮蔽**，不影響 I 旗標本身的值（CLI 後 PHP，推到堆疊的 I 是 0）。
+- 服務 IRQ：7 cycle，push PC 與 P（B = 0）、設 I、跳到 `$FFFE`。NMI 優先於 IRQ。
+- 測試：`cli_delays_a_pending_irq_by_one_instruction`、`sei_does_not_stop_...`、`plp_that_sets_i_...`、
+  `irq_line_is_level_triggered_...`、`an_irq_is_not_taken_while_the_i_flag_is_set`、
+  `frame_irq_reaches_the_cpu_through_the_real_apu`（真實 frame IRQ 在 29800–29860 cycle 之間進入處理常式），
+  以及外部的 `cpu_interrupts_v2/1-cli_latency`。
+- **限制**：BRK／NMI／IRQ 序列是不可分割的一步（沒有「NMI 劫持 BRK 向量」）；成立的分支不會延遲偵測；
+  取樣點固定在倒數第二個 cycle，DMA 期間不重新取樣。這些是 §14.7.2 那四個預期失敗的原因。
+
+### 17.7 開機與 reset
+
+硬體在第一條指令之前 9–12 個 cycle 就已經當作「寫過 `$4015 = 0`、`$4017`」：冷開機寫 `$00`，按 reset 則
+重寫最後一次寫入的模式（IRQ 抑制位元不保留）。實作：`Apu::reset(soft)` 停用所有聲道、清 frame／DMC IRQ、
+frame counter 從 0 開始（模式：冷開機 4 步、reset 沿用），之後 CPU 的 reset 序列的 7 個 cycle 走完，計數器
+已走 7 個 cycle（≈ 寫入後 10 個 cycle）。各聲道的計時器、序列器、DMC 輸出電平不受影響。
+`Nes::reset` 依序呼叫 PPU、APU、CPU 的 reset。
+
+### 17.8 存檔、驗證與「輸出不進存檔」
+
+- **進存檔**：五個聲道的全部暫存器與計數器、frame counter（含待生效的 `$4017` 寫入與 `block`）、frame IRQ
+  旗標、APU 的 cycle 計數（判斷寫入奇偶）、`ahead`、尚未補上的 DMC 暫停 cycle；`Cpu` 的 `irq_sample`、
+  `irq_masked`。`STATE_FORMAT_VERSION` 2。
+- **驗證**（`Apu::is_structurally_valid`，`load_state` 用）：序列位置、週期、計數器、DMC 位址／長度／剩餘
+  bit 數、frame counter 的步驟與「cycle 還沒到下一個步驟」的不變式都在硬體範圍內，否則 `StateError::Corrupt`
+  （測試 `tampered_apu_state_is_rejected_by_load_state`，7 種竄改）。所有計時器的 `cnt` 都保證 ≥ 1，
+  所以不會有減法溢位。
+- **輸出不進存檔**：`Apu::out`（`AudioOut`）與 `Ppu::output_enabled` 是 `#[serde(skip)]`。`Nes::load_state`
+  把「設定」（輸出開關、取樣率、聲道遮罩）從目前的實例帶到讀進來的實例，並**重設濾波器與尚未取走的取樣**
+  （測試 `load_state_keeps_output_settings_and_resets_the_audio_signal`）。
+
+### 17.9 輸出管線與 `nes-app` 的音訊
+
+**核心的輸出管線**（`apu/output.rs`，唯一允許浮點數的地方）：
+
+1. **混音**：NESdev 的非線性公式（查表版）：`pulse_out = 95.52 / (8128 / (p1 + p2) + 100)`、
+   `tnd_out = 163.67 / (24329 / (3t + 2n + d) + 100)`，兩者相加（以 `const fn` 在編譯期算好）。
+2. **降頻**：APU 以 CPU 速率工作，輸出取樣是「那段時間內混音電平的時間平均」（box filter）；因為事件
+   之間電平不變，`integrate(level, cycles)` 一次餵一段。
+3. **濾波**：90 Hz 與 442 Hz 兩個一階 high-pass、14 kHz 一階 low-pass（真實 NES 的類比輸出級），在輸出
+   取樣率上以一階 IIR 實作。
+- API：`Nes::drain_audio`、`set_audio_sample_rate(hz)`（夾在 8k–192k，只重算係數、不清狀態，方便動態
+  速率控制頻繁微調）、`set_output_enabled`、`set_audio_channel_mask`（各聲道獨立靜音）。沒人取走的取樣
+  最多保留 2^17 個（超過丟最舊的）。
+- **輸出開關**：關閉時不混音、不產生取樣，PPU 不寫 framebuffer，但 sprite 0 hit、overflow 的判斷照常
+  （它們是狀態）。不變式：開／關的 `state_hash` 逐幀相同，包含中途切換
+  （`output_switch_does_not_change_the_state_hash`，涵蓋會依賴渲染結果的 sprite 0 分割 ROM 與 APU 探針）。
+
+**`nes-app` 的音訊**（`nes-app/src/audio.rs`）：
+
+- **架構**：emu 執行緒每幀把 `drain_audio` 的取樣推進 `AudioShared` 的環形緩衝區；cpal 的 callback（系統音訊
+  執行緒）取樣。**模擬的節拍仍由 emu 執行緒掌控，不改成由音訊驅動**。`cpal::Stream` 留在 UI 執行緒
+  （`AudioOutput`），emu 執行緒只持有 `Arc<AudioShared>`。
+- **環形緩衝區用 [`rtrb`](https://crates.io/crates/rtrb)**（0.4，MIT OR Apache-2.0；單一生產者、單一消費者、
+  wait-free）。`Producer` 由 emu 執行緒獨占（`AudioProducer`），`Consumer` 由 cpal callback 獨占
+  （`CallbackState`）：各自擁有一端，型別系統就保證只有一個生產者、一個消費者。共享的只有原子旗標與計數
+  （暫停、音量、underrun、丟棄、flush 請求、填充量的近似值）。**callback 內沒有配置記憶體、沒有鎖**：
+  只有 `pop`、原子讀寫與寫入裝置給的緩衝區。
+  - **為什麼用 rtrb、不自製**：無鎖資料結構的正確性很難用測試證明（測試只能碰到「跑到的交錯」，
+    抓不到罕見的記憶體序問題）；而且**本階段自製版本已經出過一次競態**：emu 執行緒清空緩衝區時寫了
+    只該由 callback 寫的 `tail`，與 callback 同時更新 `tail` 就可能讓「已用量」算成負數（wrapping 之後變成
+    極大值）。這個錯是我事後檢視程式碼才發現的，當時的測試沒有抓到。與其自己維護這種程式，不如用一個被廣泛使用、
+    有文件化的記憶體序保證的 crate。自製版本（`RingBuffer`）與它的測試已刪除。
+  - **清空只能由消費者做**：生產者要清空（載入 ROM）只能發「請求」（`flush_generation`），由 callback 在
+    下一次執行時執行；暫停時 callback 也自己清。
+  - 測試：`producer_and_consumer_agree_across_threads`（兩條執行緒 20 萬個取樣依序一致、不丟）、
+    `samples_stay_in_order_when_the_ring_wraps_around`（不規則批次、多次繞過尾端）、其餘 callback 與
+    動態速率控制的測試都改成走同一組 API。
+- **動態速率控制** `RateController`：每幀依（指數平滑後的）緩衝區填充量，在 **±0.5%** 內調整核心的輸出
+  取樣率：比目標多就降低（少產生取樣）、少就提高。比例控制器，緩衝區偏離目標 25% 就用滿上限，時間常數
+  約 2.5 秒。增益太低會讓漂移接近 0.5% 時穩態誤差大到跑乾（第一版就是這樣，模擬測試抓到）。它吸收的是
+  emu 計時器與音訊裝置時脈之間**最多 ±0.5%** 的長期漂移，不是短暫卡頓。
+- **目標延遲 ≈ 50 ms**：callback 累積到目標量才開始播放（prebuffer），跑乾就靜音並重新累積（只算一次
+  underrun，而不是每個 callback 都算）；開始播放有 512 個取樣的淡入。緩衝上限是目標的 3 倍（150 ms），
+  emu 執行緒被卡住又補幀時多出來的取樣丟掉（`dropped`），延遲不會永久累積。
+- **暫停靜音**：暫停時 callback 輸出靜音並丟掉殘留取樣；暫停中單步／讀檔產生的取樣直接丟掉；繼續時重新
+  累積。音量與靜音以每個取樣一階平滑（避免拖動滑桿的拉鍊雜音）。
+- **沒有音訊裝置**：`AudioOutput::start` 不 panic，回傳「無裝置」狀態與提示；程式照常執行，emu 執行緒把
+  取樣丟掉。選單「Audio」顯示提示，狀態列顯示「音訊：無裝置（無聲）」。
+- **UI**：選單 Audio（靜音、主音量、裝置名稱與取樣率）；狀態列顯示緩衝毫秒數與累計 underrun；Debugger
+  的 **APU 分頁**（各聲道獨立靜音勾選、frame counter 模式／步驟／IRQ 旗標、五個聲道的暫存器與計數器、
+  換算後的頻率、緩衝區進度條、underrun／丟棄取樣數、目前輸出取樣率與相對裝置的調整百分比）。
+- **驗證**：純數值的單元測試涵蓋 callback（prebuffer、underrun、暫停、flush、音量、i16／u16 格式）與
+  動態速率控制（10 分鐘模擬、±0.3% 的時脈漂移：緩衝 21–52 ms、0 underrun、0 丟取樣；對照組沒有速率
+  控制時同樣的漂移會塞滿緩衝區）。`nes-app --audio-selftest` 在**真實裝置**上跑 12 秒（音量 0，不出聲）：
+  WASAPI 48 kHz，緩衝 44.9–62.0 ms（平均 51.8）、0 underrun、速率調整 −0.010%（自製環形緩衝區版）；
+  換成 rtrb 之後重跑：45.0–62.2 ms（平均 51.9）、0 underrun、+0.009%。**耳朵才能確認的項目**
+  （音高、節奏、爆音）見 `docs/manual-test-phase3_5.md`，沒有宣稱驗證過。
+
+### 17.10 Debugger／trace 的顯示約定
+
+`Bus::peek` 是無副作用的讀取：`peek(0x4015)` 回傳狀態（bit 5 取 open bus）但**不清** frame IRQ 旗標。
+
+### 17.11 trace 對 `$4000–$4015` 固定顯示 `FF` 的顯示慣例
+
+- **慣例**：`Cpu::trace()` 與 `DebugSnapshot::cpu_disassembly` 的反組譯裡，運算元位址落在 `$4000–$4015`
+  （含索引定址算出的有效位址）時，`= xx`（該位址目前的內容）一律顯示 `FF`（`Cpu::trace_value`）。
+  其他位址仍用 `Bus::peek`。
+- **理由**：
+  1. **參考資料就是這樣**：nestest.log（Nintendulator 產生）在這些位址一律標 `= FF`，出現在第 8981、8983、
+     8985、8987、8989 行（`STA $4015`、`STA $4004–$4007`）。`nestest --strict` 要與參考 log 逐字比對，
+     不顯示 `FF` 就會在第 8981 行失敗。
+  2. **技術上也說得通**：`$4000–$4014` 是唯寫暫存器，沒有東西可讀（真實硬體讀到 open bus）；`$4015` 雖然
+     可讀，但**讀取有副作用**（清 frame IRQ 旗標），trace 是「不得改變狀態」的觀察操作（§11），不能真的讀。
+     顯示 `FF` 表示「這裡沒有可安全顯示的值」。
+- **範圍與限制**：**只影響顯示**，`Bus::peek`（`peek(0x4015)` 回傳狀態位元、不清旗標）與模擬結果不變。
+  這是沿用參考 log 的約定，**不是硬體行為**；Debugger 的 APU 分頁才是看 APU 真實狀態的地方。
+- **驗證**：`nestest`（8991 行）與 `nestest --strict`（8991 行）皆通過。
+
+### 17.12 已知限制（Phase 3.5 結束時）
+
+- instruction-level 造成的預期失敗：`cpu_interrupts_v2` 2–5（§14.7.2）。
+- DMC 暫停固定 4 cycle、不模擬與 `$4016`／`$2007` 的重疊（§17.5）。
+- 只有 NTSC（週期表與 CPU 時脈）。
+- 效能：APU 每幀約 +150 µs 固定成本（§14.6），延遲 catch-up 留待評估（§12）。
+- 沒有以真實遊戲驗證音質；沒有處理音訊裝置熱拔除（cpal 的錯誤只寫 log，需要重開程式）。

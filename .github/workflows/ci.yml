@@ -21,6 +21,8 @@ jobs:
 
       # 套件清單取自 eframe 0.36.2 官方 README「To use on Linux, first run:」
       # (https://docs.rs/crate/eframe/0.36.2 / crates.io 上的 README)。
+      # libasound2-dev：cpal（音訊輸出）的 Linux 後端 ALSA 需要（cpal 的 README
+      # 「Linux」章節：需要 ALSA 開發標頭與 pkg-config）。Windows 用 WASAPI，不需要額外套件。
       # rfd 0.17.2 預設用 xdg-portal（D-Bus）後端，不需要額外的 build-time
       # 系統套件；只有停用 xdg-portal、改用 `gtk3` feature 時才需要
       # libgtk-3-dev（見 rfd 的 crate 文件「Linux & BSD backends」章節），
@@ -30,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev \
-            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libasound2-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
