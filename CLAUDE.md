@@ -31,6 +31,10 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
 - **核心自 Phase 3.5 起凍結**：Phase 4（replay／netplay／rollback）以 `CORE_BEHAVIOR_VERSION` 為相容性依據，
   之後任何行為變更都要先向使用者說明其對 replay／netplay 相容性的影響，再遞增版本號。
 - **`run_frame` 路徑上不得 panic**（含 `unwrap`／`expect`／越界索引／算術溢位）；異常情況要用確定的方式處理。
+- **行為指紋（`Nes::behavior_fingerprint`）的欄位規格在 `docs/architecture.md` §18.2**：新增任何影響模擬的狀態
+  欄位，必須同時在對應的 `fingerprint` 方法寫入並更新該規格（`every_serialized_state_field_is_covered_by_the_fingerprint`
+  會擋下遺漏）。規格改變會讓舊 replay 的檢查點失效，視同「會改變模擬結果的修改」，須遞增 `CORE_BEHAVIOR_VERSION`。
+  只有存檔格式改變時，**不得**更新行為指紋的釘值（`fingerprint_is_pinned_for_synthetic_roms`），只遞增 `STATE_FORMAT_VERSION`。
 - `Nes::step_instruction` 會打破以幀為單位的決定性，只能在暫停時使用，netplay 進行中不得呼叫。
 - **任何會改變模擬結果的修改（CPU／PPU／Bus／mapper 的行為、時序、開機初值）都必須遞增
   `CORE_BEHAVIOR_VERSION`**；存檔序列化佈局改變則遞增 `STATE_FORMAT_VERSION`。判定規則見
@@ -39,8 +43,8 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
 
 ## 測試基準與階段驗收
 
-- **目前基準（Phase 3.5 結束）：279 通過 + 2 忽略**：nes-app 28、nes-core（lib）222 + 2 ignored、
-  nes-core `golden_frames` 1、nes-net 9、`transport_roundtrip` 1、nes-test 18。
+- **目前基準（Phase 4a 結束）：332 通過 + 2 忽略**：nes-app 37、nes-core（lib）254 + 2 ignored、
+  nes-core `golden_frames` 1、nes-net 9、`transport_roundtrip` 1、nes-test 30。
 - 每個階段結束時，以 `cargo test --workspace` 的**實際輸出**逐一列出每個執行檔的測試數量。**數量只能增加**；若有測試被移除或被 cfg 排除，必須說明理由。
 - 每個階段的驗收指令（全部要跑並回報結果）：
   1. `cargo build --workspace`

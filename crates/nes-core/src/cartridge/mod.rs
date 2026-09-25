@@ -6,6 +6,7 @@ pub mod mapper;
 pub use mapper::{Cnrom, DebugRow, Mapper, Mmc1, Nrom, Uxrom};
 
 use crate::error::RomError;
+pub use crate::rom_id::RomId;
 
 pub const PRG_BANK_SIZE: usize = 16 * 1024;
 pub const CHR_BANK_SIZE: usize = 8 * 1024;
@@ -50,7 +51,7 @@ pub struct Cartridge {
     /// 靜態 PRG-ROM 資料。**不**進 save state（`#[serde(skip)]`）：同一份
     /// ROM 的內容永遠不變，每次 rollback 存讀檔都重複序列化它既浪費空間又
     /// 拖慢速度。讀檔（`Nes::load_state`）之後由目前已載入的 ROM 接回來，
-    /// 用 `rom_hash` 確保接回來的是同一份 ROM。
+    /// 用 `rom_id` 確保接回來的是同一份 ROM。
     #[serde(skip)]
     pub prg_rom: Vec<u8>,
     /// 靜態 CHR-ROM 資料，理由同 `prg_rom`。CHR 為 RAM
@@ -68,17 +69,25 @@ pub struct Cartridge {
 
     pub mapper: Mapper,
 
-    /// `xxh3_64(prg_rom ++ chr_rom)`。因為 `prg_rom`/`chr_rom` 不進存檔，
-    /// `load_state` 靠這個雜湊確認存檔真的屬於「目前已載入的這份 ROM」，
-    /// 不符合就拒絕讀檔（見 [`crate::error::StateError::RomMismatch`]），
-    /// 避免把別的遊戲的存檔套進來後讀到對不上的垃圾資料。
-    pub rom_hash: u64,
+    /// 整個 ROM 檔案（含 header）的 xxh3-128（Phase 4a 起取代只涵蓋 PRG + CHR 的 `rom_hash`）。
+    /// 因為 `prg_rom`/`chr_rom` 不進存檔，`load_state` 靠它確認存檔真的屬於「目前已載入的
+    /// 這份 ROM」，不符合就拒絕讀檔（見 [`crate::error::StateError::RomMismatch`]），避免把別的
+    /// 遊戲的存檔套進來後讀到對不上的垃圾資料。replay 與 netplay 握手也用它。
+    pub rom_id: RomId,
 }
 
 impl Cartridge {
     /// 解析一份 iNES ROM 檔案的原始位元組。
     pub fn from_ines(bytes: &[u8]) -> Result<Self, RomError> {
         ines::parse(bytes)
+    }
+
+    /// 行為指紋（`docs/architecture.md` §18.2）：mapper 暫存器、CHR-RAM、PRG-RAM。
+    /// 排除靜態的 PRG-ROM／CHR-ROM 與 iNES header 中繼資料（由 `rom_id` 識別）。
+    pub(crate) fn fingerprint(&self, h: &mut crate::fingerprint::Fp) {
+        self.mapper.fingerprint(h);
+        h.bytes(&self.chr_ram);
+        h.bytes(&self.prg_ram);
     }
 
     /// 讀取 CPU 位址空間 `$8000..=$FFFF` 範圍內的一個 byte。

@@ -16,6 +16,13 @@
 > [`docs/manual-test-phase2.md`](docs/manual-test-phase2.md)、
 > [`docs/manual-test-phase3.md`](docs/manual-test-phase3.md)、
 > [`docs/manual-test-phase3_5.md`](docs/manual-test-phase3_5.md)。
+>
+> **Phase 4a（決定性基礎設施）**：`run_frame` 改收 `FrameInput { p1, p2, reset }`（reset 是輸入的一部分）；
+> 與存檔格式無關的行為指紋 `Nes::behavior_fingerprint`；ROM 識別碼 `rom_id`（整個檔案的 xxh3-128）；
+> replay（開機狀態 + 每幀輸入 + 指紋檢查點）可在 GUI 錄製／播放／驗證、用 `nes-test replay verify` 驗證；
+> 雙實例逐幀比對工具與 `diff-state` 供 4b／4c 的 desync 除錯使用。模擬行為**沒有改變**
+> （`CORE_BEHAVIOR_VERSION` 仍是 3；只有存檔格式升到 3）。規格見 `docs/architecture.md` §18，
+> 需要 GUI 確認的項目見 [`docs/manual-test-phase4a.md`](docs/manual-test-phase4a.md)。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
@@ -63,7 +70,15 @@ cargo run --release -p nes-test -- blargg roms/nes-test-roms/instr_test-v5/rom_s
 cargo run --release -p nes-test -- screenshot path/to/rom.nes out.png --frames 120
 cargo run --release -p nes-test -- golden path/to/rom.nes --frames 120
 
-# run_frame 效能（CPU + PPU + APU 合計；輸出開啟與關閉各量一次）
+# replay：檢視、驗證全部檢查點（結束碼 0 = 通過）、產生偽隨機輸入的 replay
+cargo run --release -p nes-test -- replay info recording.replay
+cargo run --release -p nes-test -- replay verify path/to/rom.nes recording.replay
+cargo run --release -p nes-test -- replay generate path/to/rom.nes demo.replay --frames 3600 --reset-at 1800
+
+# 逐欄位比對兩份存檔（GUI：File → Save State to File...；CLI：save-state）
+cargo run --release -p nes-test -- diff-state a.state b.state
+
+# run_frame 效能（CPU + PPU + APU 合計；輸出開啟與關閉各量一次；也量行為指紋的耗時）
 cargo run --release -p nes-core --features testing --example bench_run_frame
 
 # 音訊診斷：不開視窗、音量 0（不出聲），在真實音訊裝置上跑 12 秒並印出緩衝區／underrun 統計
@@ -78,7 +93,10 @@ cargo run --release -p nes-app -- --audio-selftest
 | B / A | Z / X | F / G |
 | Select / Start | 右 Shift / Enter | R / T |
 
-F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
+F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。選單 **Emulation → Reset**（soft reset）；選單 **Replay**：
+錄製（會先重新開機）／停止並儲存／播放（1x、2x、最快，播放時鍵盤輸入被忽略、逐幀驗證檢查點）。**錄製與播放
+replay 期間停用**讀取存檔（F9）、單步指令、Trace 與載入別的 ROM（它們會破壞「從開機狀態依輸入序列執行」的
+前提）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
 各聲道獨立靜音、暫存器與計數器、音訊緩衝區填充量與累計 underrun。
 
 ## 交付與效能量測

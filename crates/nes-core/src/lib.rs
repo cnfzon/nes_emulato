@@ -14,10 +14,21 @@ pub mod bus;
 pub mod cartridge;
 pub mod cpu;
 pub mod debug;
+/// 雙實例逐幀比對行為指紋的測試工具（`cargo test` 或 `testing` feature 才編譯）。
+#[cfg(any(test, feature = "testing"))]
+pub mod dual;
 pub mod error;
+mod fingerprint;
+#[cfg(test)]
+mod fingerprint_tests;
 pub mod frame;
+pub mod input;
 pub mod joypad;
 pub mod ppu;
+pub mod replay;
+#[cfg(test)]
+mod replay_tests;
+pub mod rom_id;
 pub mod state;
 /// 測試用的迷你組譯器與合成 ROM（`cargo test` 或 `testing` feature 才編譯）。
 #[cfg(any(test, feature = "testing"))]
@@ -29,7 +40,10 @@ pub use cpu::{Cpu, StatusFlags};
 pub use debug::{DebugSnapshot, PpuImage, PpuViews};
 pub use error::{RomError, StateError};
 pub use frame::FrameBuffer;
+pub use input::FrameInput;
 pub use joypad::{Buttons, Joypad};
+pub use replay::{Replay, ReplayError, ReplayMismatch, ReplayPlayer, ReplayRecorder};
+pub use rom_id::RomId;
 pub use state::{CORE_BEHAVIOR_VERSION, STATE_FORMAT_VERSION, STATE_MAGIC, StateHeader};
 
 /// 一台完整的 NES 主機。
@@ -83,16 +97,26 @@ impl Nes {
     ///
     /// **輸入在這一幀開始時鎖定**：整幀期間搖桿讀到的按鍵狀態不變。
     ///
+    /// `input.reset` 為 `true` 時，先在這一幀開始前執行 soft reset（[`Nes::reset`]：
+    /// CPU／PPU／APU 的 reset 訊號，RAM 與卡帶內容不變），再鎖定按鍵並跑這一幀。`reset` 是
+    /// 輸入的一部分，所以 replay 與 netplay 交換 [`FrameInput`] 就能重現 reset。只在
+    /// `reset == true` 時才有任何差別，所以不影響既有（沒有 reset 的）輸入序列的結果。
+    /// 參數是 `impl Into<FrameInput>`：舊式的 `[Buttons; 2]` 等同於「沒有 reset」。
+    ///
     /// 由外部（GUI / netplay 迴圈）每幀呼叫一次並傳入雙人輸入，而不是靠
     /// `Nes` 自己起執行緒或呼叫 callback —— 這樣 rollback 才能在任意一幀
     /// 暫停、讀檔、用不同輸入重跑，行為完全可預期。
     ///
     /// 這個方法在任何 ROM 內容下都不會 panic：所有記憶體存取都在硬體位址空間
     /// 內取模，CPU 卡死（JAM）時仍會每步推進 2 cycles，所以 PPU 一定會走完一幀。
-    pub fn run_frame(&mut self, input: [Buttons; 2]) -> &FrameBuffer {
+    pub fn run_frame(&mut self, input: impl Into<FrameInput>) -> &FrameBuffer {
+        let input = input.into();
+        if input.reset {
+            self.reset();
+        }
         let bus = self.cpu.bus_mut();
-        bus.joypads[0].state = input[0];
-        bus.joypads[1].state = input[1];
+        bus.joypads[0].state = input.p1;
+        bus.joypads[1].state = input.p2;
         // 單步除錯可能已經讓 PPU 越過 vblank 起點；這裡重新開始計一幀。
         bus.ppu.clear_frame_done();
 
@@ -161,7 +185,7 @@ impl Nes {
     /// 2. 檢查解碼出來的內部欄位長度是否符合硬體規格（RAM/VRAM/OAM/
     ///    CHR-RAM/PRG-RAM）；不符合代表存檔損毀或被竄改，回傳
     ///    [`StateError::Corrupt`]。
-    /// 3. 比對 `rom_hash` 是否跟目前已載入的 ROM 相符；不符合代表這份存檔
+    /// 3. 比對 `rom_id` 是否跟目前已載入的 ROM 相符；不符合代表這份存檔
     ///    屬於另一個遊戲，回傳 [`StateError::RomMismatch`]。
     /// 4. 因為 `prg_rom`/`chr_rom` 不進存檔（`#[serde(skip)]`），從 `self`
     ///    目前持有的 ROM 資料接回解碼出來的 `Nes`，再整個取代 `self`。
@@ -169,13 +193,10 @@ impl Nes {
         let mut decoded: Nes = state::decode(bytes)?;
         decoded.validate_structure()?;
 
-        let expected_hash = self.cpu.bus().cartridge.rom_hash;
-        let found_hash = decoded.cpu.bus().cartridge.rom_hash;
-        if expected_hash != found_hash {
-            return Err(StateError::RomMismatch {
-                expected: expected_hash,
-                found: found_hash,
-            });
+        let expected = self.cpu.bus().cartridge.rom_id;
+        let found = decoded.cpu.bus().cartridge.rom_id;
+        if expected != found {
+            return Err(StateError::RomMismatch { expected, found });
         }
 
         let prg_rom = self.cpu.bus().cartridge.prg_rom.clone();
@@ -236,6 +257,35 @@ impl Nes {
         xxhash_rust::xxh3::xxh3_64(&self.save_state())
     }
 
+    /// 與存檔格式**無關**的行為指紋（xxh3-64）。
+    ///
+    /// 依固定順序把所有會影響模擬結果的狀態欄位的**數值**寫進雜湊器（不經過 serde 或任何序列化
+    /// 格式），涵蓋 CPU、RAM、PPU、mapper（含 CHR-RAM／PRG-RAM）、APU、搖桿；排除 framebuffer
+    /// 與音訊輸出管線，所以輸出開關不影響它。欄位規格見 `docs/architecture.md` §18.2。
+    ///
+    /// 與 [`Nes::state_hash`] 的差別：`state_hash` 是存檔位元組的雜湊，存檔格式一改就變；
+    /// 這個指紋只在模擬行為改變時才會變。replay 檢查點、netplay 的 desync 偵測都應該用它。
+    pub fn behavior_fingerprint(&self) -> u64 {
+        let mut h = fingerprint::Fp::new();
+        h.u64(self.frame_count);
+        self.cpu.fingerprint(&mut h);
+        h.finish()
+    }
+
+    /// 目前是不是剛開機的狀態（`from_rom` 之後、什麼都還沒執行）。replay 只允許從這個狀態開始
+    /// 錄製與重播。
+    ///
+    /// 判定：已完成 0 幀，且 CPU 只走過開機 reset 序列的 7 個 cycle（PPU 因此在第 0 條掃描線的
+    /// dot 21）。cycle 數只會隨執行增加，所以這個條件只有 `from_rom` 的結果（或恰好存在這個時間
+    /// 點的存檔，內容相同）才滿足；`reset()` 會再加 7 個 cycle，因此不算開機狀態。
+    pub fn is_power_on_state(&self) -> bool {
+        let bus = self.cpu.bus();
+        self.frame_count == 0
+            && bus.total_cycles() == 7
+            && bus.ppu.frame == 0
+            && bus.ppu_dot() == (0, 21)
+    }
+
     /// 給 GUI Debugger 面板看的唯讀摘要。
     pub fn debug_snapshot(&self) -> DebugSnapshot {
         let bus = self.cpu.bus();
@@ -291,6 +341,11 @@ impl Nes {
     /// 目前載入的 ROM 中繼資料。
     pub fn rom_info(&self) -> &RomInfo {
         &self.cpu.bus().cartridge.info
+    }
+
+    /// 目前載入的 ROM 的識別碼（整個檔案的 xxh3-128）。
+    pub fn rom_id(&self) -> RomId {
+        self.cpu.bus().cartridge.rom_id
     }
 
     /// 執行「一條」CPU 指令（不是一整幀），回傳這條指令花的 cycle 數。
@@ -970,7 +1025,7 @@ mod tests {
     // ---- Phase 3：存檔版本、mapper、行為指紋 -------------------------------------
 
     use crate::state::{CORE_BEHAVIOR_VERSION, HEADER_LEN, STATE_FORMAT_VERSION, STATE_MAGIC};
-    use crate::test_support::{CHR_MARK, PRG_MARK, build_mapper_rom};
+    use crate::test_support::{CHR_MARK, PRG_MARK, build_mapper_rom, mmc1_churn_rom};
 
     /// 一份什麼都不做的 mapper 測試 ROM（程式碼只有一個無窮迴圈）。
     fn idle_mapper_rom(mapper: u8, prg_banks: usize, chr_banks_8k: usize) -> Vec<u8> {
@@ -1071,18 +1126,21 @@ mod tests {
         assert!(matches!(nes.load_state(&[]), Err(StateError::Decode(_))));
     }
 
-    /// 行為指紋：把 `CORE_BEHAVIOR_VERSION` 與「合成 ROM 在固定輸入下的狀態雜湊」綁在一起。
+    /// 行為指紋（存檔位元組版）：把 `CORE_BEHAVIOR_VERSION`、`STATE_FORMAT_VERSION` 與「合成 ROM 在
+    /// 固定輸入下的狀態雜湊」綁在一起。它**同時**對行為與存檔格式敏感；與存檔格式無關的版本是
+    /// `fingerprint_tests` 的 `fingerprint_is_pinned_for_synthetic_roms`（Phase 4a 由 STATE_FORMAT_VERSION
+    /// 2 → 3 時，這裡的雜湊全變、而那邊的釘值一個都沒動）。
     /// 這個測試失敗代表模擬結果（狀態或存檔格式）變了：確認變動是預期的之後，
     /// **必須同時**遞增 `CORE_BEHAVIOR_VERSION`（或 `STATE_FORMAT_VERSION`）並更新這裡的
     /// 兩個常數。判定規則見 `docs/architecture.md` §15。
     #[test]
     fn behavior_fingerprint_is_pinned_to_the_version_numbers() {
         const PINNED_CORE_BEHAVIOR_VERSION: u16 = 3;
-        const PINNED_STATE_FORMAT_VERSION: u16 = 2;
-        const FINGERPRINT_NROM: u64 = 0xcbf95010461fa807;
-        const FINGERPRINT_MMC1: u64 = 0xde9bf3d88ee097c0;
-        const FINGERPRINT_DUMMY_READ: u64 = 0x7ede5740dc7425f7;
-        const FINGERPRINT_APU_PROBE: u64 = 0xe83244a5491484db;
+        const PINNED_STATE_FORMAT_VERSION: u16 = 3;
+        const FINGERPRINT_NROM: u64 = 0x6082a6b348925141;
+        const FINGERPRINT_MMC1: u64 = 0x7811821ffa5d9db8;
+        const FINGERPRINT_DUMMY_READ: u64 = 0x0765e09a8c13e2d9;
+        const FINGERPRINT_APU_PROBE: u64 = 0x86da2ec860330d88;
 
         let mut nrom = Nes::from_rom(&rendering_rom()).unwrap();
         for input in inputs_for(60) {
@@ -1241,15 +1299,6 @@ mod tests {
         nes.set_output_enabled(false);
         nes.load_state(&saved).unwrap();
         assert!(!nes.output_enabled(), "關閉狀態也保留");
-    }
-
-    /// 一個會不斷改寫 mapper 暫存器的 MMC1 程式：無窮迴圈 `INC $00; LDA $00; STA $E000`，
-    /// 讓 5 次寫入一輪地載入 PRG bank 暫存器，bank 值隨計數器變化。
-    fn mmc1_churn_rom() -> Vec<u8> {
-        let mut code = Asm::new(0xE000);
-        let l = code.pc();
-        code.inc_abs(0x0000).lda_abs(0x0000).sta_abs(0xE000).jmp(l);
-        build_mapper_rom(1, 8, 2, &code, &[])
     }
 
     #[test]
@@ -1536,5 +1585,103 @@ mod tests {
     fn cnrom_synthetic_rom_passes_the_blargg_protocol() {
         let (code, text) = run_blargg_rom(&crate::test_support::cnrom_test_rom());
         assert_eq!((code, text.as_str()), (0, "CNROM: Passed"));
+    }
+
+    // ---- Phase 4a：FrameInput 與 reset --------------------------------------------
+
+    /// `reset: true` 的那一幀 ＝ 先呼叫 `Nes::reset()` 再跑這一幀；RAM 與程式的進度保留，
+    /// 程式從 reset 向量重新開始（開機次數 `$10` 遞增、幀計數 `$11` 不歸零）。
+    #[test]
+    fn reset_input_is_a_soft_reset_before_the_frame() {
+        let rom = crate::test_support::input_probe_rom();
+        let pad = FrameInput::new(Buttons::A | Buttons::START, Buttons::B);
+        let mut via_input = Nes::from_rom(&rom).unwrap();
+        let mut via_call = Nes::from_rom(&rom).unwrap();
+        for _ in 0..20 {
+            via_input.run_frame(pad);
+            via_call.run_frame(pad);
+        }
+        assert_eq!(via_input.peek(0x0010), 1, "冷開機只跑過一次 reset 處理常式");
+        let frames_before = via_input.peek(0x0011);
+        assert!(frames_before >= 18);
+
+        via_input.run_frame(pad.with_reset());
+        via_call.reset();
+        via_call.run_frame(pad);
+
+        assert_eq!(
+            via_input.peek(0x0010),
+            2,
+            "reset 讓程式從 reset 向量重新開始"
+        );
+        assert!(via_input.peek(0x0011) >= frames_before, "RAM 保留");
+        assert_eq!(via_input.state_hash(), via_call.state_hash());
+        assert_eq!(
+            via_input.behavior_fingerprint(),
+            via_call.behavior_fingerprint()
+        );
+        // 之後兩者繼續一致。
+        for _ in 0..10 {
+            via_input.run_frame(pad);
+            via_call.run_frame(pad);
+        }
+        assert_eq!(via_input.state_hash(), via_call.state_hash());
+    }
+
+    /// 沒有 reset 的輸入序列不受影響：`[Buttons; 2]`、`FrameInput::new`、`reset: false` 三種寫法
+    /// 結果逐位元相同（這也是行為指紋不必改變的原因）。
+    #[test]
+    fn inputs_without_reset_are_unaffected_by_the_frame_input_type() {
+        let rom = crate::test_support::input_probe_rom();
+        let mut a = Nes::from_rom(&rom).unwrap();
+        let mut b = Nes::from_rom(&rom).unwrap();
+        let mut c = Nes::from_rom(&rom).unwrap();
+        for input in inputs_for(40) {
+            a.run_frame(input);
+            b.run_frame(FrameInput::new(input[0], input[1]));
+            c.run_frame(FrameInput {
+                p1: input[0],
+                p2: input[1],
+                reset: false,
+            });
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert_eq!(a.state_hash(), c.state_hash());
+    }
+
+    #[test]
+    fn power_on_state_is_only_the_state_right_after_from_rom() {
+        let rom = crate::test_support::input_probe_rom();
+        let mut nes = Nes::from_rom(&rom).unwrap();
+        assert!(nes.is_power_on_state());
+        // 存檔讀回同一個時間點的狀態，仍是開機狀態（內容與開機相同）。
+        let saved = nes.save_state();
+        nes.load_state(&saved).unwrap();
+        assert!(nes.is_power_on_state());
+
+        let mut stepped = nes.clone();
+        stepped.step_instruction();
+        assert!(!stepped.is_power_on_state(), "單步之後不是");
+        nes.run_frame(FrameInput::NONE);
+        assert!(!nes.is_power_on_state(), "跑過一幀之後不是");
+        nes.run_frame(FrameInput::NONE.with_reset());
+        assert!(!nes.is_power_on_state(), "reset 不等於重新開機");
+    }
+
+    #[test]
+    fn rom_id_covers_the_whole_file_and_is_kept_in_the_save_state() {
+        let rom = test_rom();
+        let nes = Nes::from_rom(&rom).unwrap();
+        assert_eq!(nes.rom_id(), RomId::of_file(&rom));
+        // 只改 header 的 mirroring 位元：PRG／CHR 完全相同，但是是不同的 ROM。
+        let mut other = rom.clone();
+        other[6] ^= 0x01;
+        let other_nes = Nes::from_rom(&other).unwrap();
+        assert_ne!(nes.rom_id(), other_nes.rom_id());
+        let mut target = Nes::from_rom(&rom).unwrap();
+        assert!(matches!(
+            target.load_state(&other_nes.save_state()),
+            Err(StateError::RomMismatch { .. })
+        ));
     }
 }

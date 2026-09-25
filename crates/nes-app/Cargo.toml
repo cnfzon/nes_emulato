@@ -19,3 +19,7 @@ nes-net = { version = "0.1.0", path = "../nes-net" }
 rfd = "0.17.2"
 rtrb = "0.4.0"
 triple_buffer = "9"
+
+[dev-dependencies]
+# 測試用的合成 ROM（對輸入與 reset 敏感）在 `nes_core::test_support`，需要 `testing` feature。
+nes-core = { version = "0.1.0", path = "../nes-core", features = ["testing"] }

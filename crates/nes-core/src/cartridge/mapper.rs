@@ -23,6 +23,7 @@
 //! 驗收 ROM 依賴它。已知風險：極少數靠 bus conflict 取值的遊戲會表現不同。
 
 use super::{CHR_BANK_SIZE, Mirroring, PRG_BANK_SIZE};
+use crate::fingerprint::Fp;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Mapper {
@@ -36,6 +37,25 @@ pub enum Mapper {
 pub type DebugRow = (String, String);
 
 impl Mapper {
+    /// 行為指紋（`docs/architecture.md` §18.2）：mapper 編號，接著是該 mapper 的所有暫存器。
+    /// `Nrom::prg_banks` 是由 header 決定的靜態設定，不是暫存器，不納入。
+    pub(crate) fn fingerprint(&self, h: &mut Fp) {
+        h.u8(self.id());
+        match self {
+            Mapper::Nrom(_) => {}
+            Mapper::Mmc1(m) => {
+                h.u8(m.shift);
+                h.u8(m.shift_count);
+                h.u8(m.control);
+                h.u8(m.chr0);
+                h.u8(m.chr1);
+                h.u8(m.prg);
+            }
+            Mapper::Uxrom(m) => h.u8(m.bank),
+            Mapper::Cnrom(m) => h.u8(m.chr_bank),
+        }
+    }
+
     /// iNES mapper 編號。
     pub fn id(&self) -> u8 {
         match self {

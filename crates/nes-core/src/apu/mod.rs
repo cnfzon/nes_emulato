@@ -31,6 +31,7 @@ pub use output::{
 
 use crate::cartridge::Cartridge;
 use crate::debug::{ApuDebug, DmcDebug, NoiseDebug, PulseDebug, TriangleDebug};
+use crate::fingerprint::Fp;
 
 /// DMC 抓一個 byte 時 CPU 被暫停的 cycle 數。
 ///
@@ -71,6 +72,18 @@ pub struct FrameCounter {
     /// 剛用過一次 frame 時脈之後的兩個 cycle 內，不會再有第二次（避免 `$4017` 立即時脈
     /// 與自然時脈重複）。
     block: u8,
+}
+
+impl FrameCounter {
+    fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.mode5);
+        h.bool(self.inhibit_irq);
+        h.u8(self.step);
+        h.u32(self.cycle);
+        h.u8(self.write_delay);
+        h.bool(self.new_mode5);
+        h.u8(self.block);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -125,6 +138,21 @@ impl Apu {
         };
         apu.reset(false);
         apu
+    }
+
+    /// 行為指紋（`docs/architecture.md` §18.2）。排除 `out`（輸出管線）。
+    pub(crate) fn fingerprint(&self, h: &mut Fp) {
+        for pulse in &self.pulse {
+            pulse.fingerprint(h);
+        }
+        self.triangle.fingerprint(h);
+        self.noise.fingerprint(h);
+        self.dmc.fingerprint(h);
+        self.frame.fingerprint(h);
+        h.bool(self.frame_irq);
+        h.u64(self.cycles);
+        h.u8(self.ahead);
+        h.u32(self.dmc_stall);
     }
 
     /// reset：冷開機（`soft = false`）或按下 reset 鍵（`soft = true`）。

@@ -24,7 +24,7 @@ fn new_test_cpu() -> Cpu {
         chr_ram: Vec::new(),
         prg_ram: vec![0u8; PRG_RAM_SIZE],
         mapper: Mapper::Nrom(Nrom::new(2)),
-        rom_hash: 0,
+        rom_id: crate::cartridge::RomId::default(),
     };
     Cpu::new(Bus::new(cart))
 }

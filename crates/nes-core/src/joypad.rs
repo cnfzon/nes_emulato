@@ -36,6 +36,13 @@ pub struct Joypad {
 }
 
 impl Joypad {
+    /// 行為指紋（`docs/architecture.md` §18.2）。
+    pub(crate) fn fingerprint(&self, h: &mut crate::fingerprint::Fp) {
+        h.u8(self.state.bits());
+        h.bool(self.strobe);
+        h.u8(self.shift);
+    }
+
     /// 寫入 `$4016` bit0。strobe 為高（或剛從高拉低）時重載移位暫存器。
     pub fn write_strobe(&mut self, strobe: bool) {
         if strobe || self.strobe {

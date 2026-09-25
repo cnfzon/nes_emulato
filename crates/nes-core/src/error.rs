@@ -40,9 +40,12 @@ pub enum StateError {
     #[error("存檔資料已損毀：內部欄位長度與預期不符")]
     Corrupt,
 
-    /// 存檔屬於另一份 ROM（`rom_hash` 對不上目前已載入的 ROM）。
-    #[error("存檔屬於不同的 ROM（目前 ROM 雜湊 {expected:#018x}，存檔雜湊 {found:#018x}）")]
-    RomMismatch { expected: u64, found: u64 },
+    /// 存檔屬於另一份 ROM（`rom_id` 對不上目前已載入的 ROM）。
+    #[error("存檔屬於不同的 ROM（目前 ROM {}，存檔的 ROM {}）", expected.short(), found.short())]
+    RomMismatch {
+        expected: crate::rom_id::RomId,
+        found: crate::rom_id::RomId,
+    },
 
     /// 存檔開頭的 magic 或兩個版本號（格式結構／模擬行為）任一不符。版本不同的
     /// 存檔即使能解碼，重播出來的結果也不保證與當初相同，所以一律拒絕。

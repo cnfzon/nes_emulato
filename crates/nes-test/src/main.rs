@@ -5,10 +5,15 @@
 //! - `blargg <rom>`：跑 blargg 測試 ROM（`$6000` 結果協定）並回報結果。
 //! - `screenshot <rom> <out.png>`：跑 N 幀後把畫面存成 PNG（視覺除錯用）。
 //! - `golden <rom>`：跑 N 幀後印出畫面雜湊（黃金畫面測試用）。
+//! - `replay info|verify|generate`：replay 檔案的檢視、驗證（全部檢查點）與產生（Phase 4a）。
+//! - `diff-state <a> <b>`：逐欄位比對兩份存檔，找出 desync 從哪個欄位開始。
+//! - `save-state <rom> <out>`：跑到指定幀（可依 replay 輸入）後寫出存檔，供 `diff-state` 使用。
 
 mod blargg;
+mod diff_state;
 mod nestest_log;
 mod png;
+mod replay_cmd;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -55,6 +60,25 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         frames: u64,
     },
+    /// replay 檔案：檢視 header、驗證檢查點、依偽隨機腳本產生。
+    Replay {
+        #[command(subcommand)]
+        command: ReplayCommand,
+    },
+    /// 解碼兩份存檔，逐欄位比對並列出不同的欄位（大型陣列只列索引範圍）。
+    /// 結束碼：相同 0、有差異 1、無法讀取／解碼 2。
+    DiffState { a: PathBuf, b: PathBuf },
+    /// 從開機跑到指定幀數後把存檔寫成檔案（可依 replay 的輸入），供 `diff-state` 使用。
+    SaveState {
+        rom: PathBuf,
+        out: PathBuf,
+        /// 依這份 replay 的輸入跑；沒有給就不按任何鍵。
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// 跑幾幀（有 replay 時預設跑完全部；沒有時預設 0＝開機狀態）。
+        #[arg(long)]
+        frames: Option<u32>,
+    },
     /// 執行 blargg 測試 ROM（`$6000` 結果協定）並回報 pass/fail。
     Blargg {
         rom: PathBuf,
@@ -64,6 +88,31 @@ enum Command {
         /// 結束時一併印出畫面（nametable 0）上的文字。
         #[arg(long)]
         screen: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReplayCommand {
+    /// 顯示 replay 的 header、總幀數、reset 次數與檢查點數量。
+    Info { replay: PathBuf },
+    /// 從開機依 replay 的輸入重播（關閉輸出以加速），驗證全部檢查點。失敗時結束碼非 0，
+    /// 並回報第一個不符的檢查點與分歧可能開始的幀範圍。
+    Verify { rom: PathBuf, replay: PathBuf },
+    /// 從開機依偽隨機的雙人輸入腳本錄一份 replay（測試與效能量測用）。
+    Generate {
+        rom: PathBuf,
+        out: PathBuf,
+        #[arg(long, default_value_t = 3600)]
+        frames: u32,
+        /// 亂數種子（同樣的種子與 ROM 得到同樣的 replay）。
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// 檢查點間隔（幀）。
+        #[arg(long, default_value_t = nes_core::replay::DEFAULT_CHECKPOINT_INTERVAL)]
+        interval: u16,
+        /// 在這些幀（1 起算）按 reset，可重複指定。
+        #[arg(long = "reset-at")]
+        reset_at: Vec<u32>,
     },
 }
 
@@ -86,6 +135,25 @@ fn main() -> ExitCode {
             scale,
         } => cmd_screenshot(&rom, &out, frames, scale),
         Command::Golden { rom, frames } => cmd_golden(&rom, frames),
+        Command::Replay { command } => match command {
+            ReplayCommand::Info { replay } => replay_cmd::info(&replay),
+            ReplayCommand::Verify { rom, replay } => replay_cmd::verify(&rom, &replay),
+            ReplayCommand::Generate {
+                rom,
+                out,
+                frames,
+                seed,
+                interval,
+                reset_at,
+            } => replay_cmd::generate(&rom, &out, frames, seed, interval, &reset_at),
+        },
+        Command::DiffState { a, b } => replay_cmd::diff_state(&a, &b),
+        Command::SaveState {
+            rom,
+            out,
+            replay,
+            frames,
+        } => replay_cmd::save_state(&rom, &out, replay.as_deref(), frames),
     }
 }
 
@@ -228,6 +296,11 @@ fn cmd_info(path: &Path) -> ExitCode {
                 "CHR-ROM: {} x 8KB = {} bytes",
                 info.chr_rom_banks,
                 cart.chr_rom.len()
+            );
+            println!(
+                "rom_id: {}（前 16 字元 {}；整個檔案的 xxh3-128）",
+                cart.rom_id,
+                cart.rom_id.short()
             );
             println!("Mapper: {}", info.mapper_id);
             println!("Mirroring: {:?}", info.mirroring);

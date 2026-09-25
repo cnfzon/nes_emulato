@@ -36,6 +36,7 @@ pub use flags::StatusFlags;
 pub use opcodes::{AddrMode, Mnemonic, OPCODES, OpcodeInfo};
 
 use crate::bus::Bus;
+use crate::fingerprint::Fp;
 
 pub const STACK_BASE: u16 = 0x0100;
 pub const RESET_VECTOR: u16 = 0xFFFC;
@@ -91,6 +92,20 @@ impl Cpu {
 
     pub fn bus_mut(&mut self) -> &mut Bus {
         &mut self.bus
+    }
+
+    /// 行為指紋（`docs/architecture.md` §18.2）：暫存器、旗標、IRQ 偵測狀態，接著是整條匯流排。
+    pub(crate) fn fingerprint(&self, h: &mut Fp) {
+        h.u8(self.a);
+        h.u8(self.x);
+        h.u8(self.y);
+        h.u8(self.sp);
+        h.u16(self.pc);
+        h.u8(self.status.bits());
+        h.bool(self.jammed);
+        h.bool(self.irq_sample);
+        h.bool(self.irq_masked);
+        self.bus.fingerprint(h);
     }
 
     /// 冷開機／重置：SP=$FD、P=$24、PC 從 `$FFFC` 讀取，耗時 7 cycles。

@@ -9,6 +9,8 @@
 //! （`cnt`），到 0 時步進並以「週期」重新載入。這讓 `Apu` 可以一次跳到「下一個會發生
 //! 事件的 cycle」（事件驅動），而不必每個 cycle 都逐一走過。
 
+use crate::fingerprint::Fp;
+
 /// 長度計數器的載入值表（`$4003` 等暫存器的 bit 3–7 當索引）。
 pub const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
@@ -51,6 +53,14 @@ pub struct LengthCounter {
 }
 
 impl LengthCounter {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.u8(self.counter);
+        h.bool(self.halt);
+        h.bool(self.new_halt);
+        h.u8(self.reload);
+        h.u8(self.previous);
+    }
+
     /// 寫 halt 旗標（延遲一個 cycle 生效）。
     pub fn write_halt(&mut self, halt: bool) {
         self.new_halt = halt;
@@ -104,6 +114,15 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.looping);
+        h.bool(self.constant);
+        h.u8(self.volume);
+        h.bool(self.start);
+        h.u8(self.divider);
+        h.u8(self.decay);
+    }
+
     pub fn write(&mut self, value: u8) {
         self.looping = value & 0x20 != 0;
         self.constant = value & 0x10 != 0;
@@ -170,6 +189,23 @@ pub struct Pulse {
 }
 
 impl Pulse {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.ones_complement);
+        h.bool(self.enabled);
+        h.u8(self.duty);
+        self.envelope.fingerprint(h);
+        self.length.fingerprint(h);
+        h.bool(self.sweep_enabled);
+        h.u8(self.sweep_period);
+        h.bool(self.sweep_negate);
+        h.u8(self.sweep_shift);
+        h.bool(self.sweep_reload);
+        h.u8(self.sweep_divider);
+        h.u16(self.timer_period);
+        h.u32(self.cnt);
+        h.u8(self.seq);
+    }
+
     pub fn new(ones_complement: bool) -> Self {
         Self {
             ones_complement,
@@ -304,6 +340,18 @@ impl Default for Triangle {
 }
 
 impl Triangle {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.enabled);
+        h.bool(self.control);
+        h.u8(self.linear_reload_value);
+        h.u8(self.linear_counter);
+        h.bool(self.linear_reload_flag);
+        self.length.fingerprint(h);
+        h.u16(self.timer_period);
+        h.u32(self.cnt);
+        h.u8(self.seq);
+    }
+
     pub fn new() -> Self {
         Self {
             enabled: false,
@@ -405,6 +453,16 @@ impl Default for Noise {
 }
 
 impl Noise {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.enabled);
+        self.envelope.fingerprint(h);
+        self.length.fingerprint(h);
+        h.bool(self.mode);
+        h.u8(self.period_index);
+        h.u32(self.cnt);
+        h.u16(self.shift);
+    }
+
     pub fn new() -> Self {
         Self {
             enabled: false,
@@ -507,6 +565,25 @@ impl Default for Dmc {
 }
 
 impl Dmc {
+    pub(super) fn fingerprint(&self, h: &mut Fp) {
+        h.bool(self.irq_enabled);
+        h.bool(self.looping);
+        h.u8(self.rate_index);
+        h.u32(self.cnt);
+        h.u16(self.sample_addr);
+        h.u16(self.sample_length);
+        h.u16(self.current_addr);
+        h.u16(self.bytes_remaining);
+        h.u8(self.read_buffer);
+        h.bool(self.buffer_empty);
+        h.u8(self.shift_register);
+        h.u8(self.bits_remaining);
+        h.bool(self.silence);
+        h.u8(self.output_level);
+        h.bool(self.irq_flag);
+        h.u8(self.start_delay);
+    }
+
     pub fn new() -> Self {
         Self {
             irq_enabled: false,

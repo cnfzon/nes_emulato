@@ -35,6 +35,12 @@ impl Asm {
         self.emit(&[opcode, addr as u8, (addr >> 8) as u8])
     }
 
+    pub fn clc(&mut self) -> &mut Self {
+        self.emit(&[0x18])
+    }
+    pub fn adc_abs(&mut self, addr: u16) -> &mut Self {
+        self.abs(0x6D, addr)
+    }
     pub fn cmp_imm(&mut self, v: u8) -> &mut Self {
         self.emit(&[0xC9, v])
     }
@@ -252,6 +258,65 @@ pub fn build_mapper_rom(
     rom.extend(prg);
     rom.extend(chr);
     rom
+}
+
+/// 一個會不斷改寫 mapper 暫存器的 MMC1 程式：無窮迴圈 `INC $00; LDA $00; STA $E000`，
+/// 讓 5 次寫入一輪地載入 PRG bank 暫存器，bank 值隨計數器變化。
+pub fn mmc1_churn_rom() -> Vec<u8> {
+    let mut code = Asm::new(0xE000);
+    let l = code.pc();
+    code.inc_abs(0x0000).lda_abs(0x0000).sta_abs(0xE000).jmp(l);
+    build_mapper_rom(1, 8, 2, &code, &[])
+}
+
+/// 「狀態隨輸入與 reset 改變」的合成 ROM（replay／指紋的測試用）。
+///
+/// - reset 處理常式：`INC $10`（開機／reset 的次數；RAM 在 soft reset 後保留，所以 reset 會讓它
+///   遞增，冷開機是 1），開 NMI，進入無窮迴圈。
+/// - NMI 處理常式（每幀一次）：strobe 搖桿、把玩家 1 的 8 個按鍵位元讀進 `$0200..$0207`、玩家 2
+///   的讀進 `$0208..$020F`，並把每個位元累加進 `$12`（玩家 1）與 `$13`（玩家 2），所以按過什麼鍵會
+///   一直留在 RAM 裡；`INC $11`（自開機起的幀數，reset 不會清），再把 A 鍵寫進水平捲動
+///   （`$2005` 兩次）、把玩家 1 的 Start 鍵寫進 DMC 輸出電平（`$4011`）。
+///
+/// 所以任何一幀的輸入或 reset 不同，之後的 RAM、PPU 暫存器與 APU 狀態都不同。
+pub fn input_probe_rom() -> Vec<u8> {
+    const NMI_ADDR: u16 = 0x8100;
+    let mut a = Asm::new(0x8000);
+    a.sei().cld().ldx_imm(0xFF).txs();
+    a.inc_abs(0x0010);
+    a.lda_imm(0x80).sta_abs(0x2000);
+    let forever = a.pc();
+    a.jmp(forever);
+
+    let mut nmi = Asm::new(NMI_ADDR);
+    nmi.lda_imm(1).sta_abs(0x4016).lda_imm(0).sta_abs(0x4016);
+    for (port, dest, sum) in [(0x4016u16, 0x0200u16, 0x0012u16), (0x4017, 0x0208, 0x0013)] {
+        nmi.ldx_imm(0);
+        let l = nmi.pc();
+        nmi.lda_abs(port)
+            .and_imm(1)
+            .sta_abs_x(dest)
+            .clc()
+            .adc_abs(sum)
+            .sta_abs(sum)
+            .inx()
+            .cpx_imm(8)
+            .bne(l);
+    }
+    nmi.inc_abs(0x0011);
+    nmi.lda_abs(0x0200).sta_abs(0x2005);
+    nmi.lda_abs(0x0208).sta_abs(0x2005);
+    nmi.lda_abs(0x0203).sta_abs(0x4011);
+    nmi.rti();
+
+    build_nrom(
+        &a,
+        0x8000,
+        Some(NMI_ADDR),
+        &[(NMI_ADDR, &nmi.bytes)],
+        &test_chr(),
+        false,
+    )
 }
 
 // ---- mapper 合成測試 ROM（blargg `$6000` 協定）----------------------------------

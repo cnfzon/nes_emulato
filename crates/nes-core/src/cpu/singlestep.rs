@@ -79,7 +79,7 @@ fn dummy_cartridge() -> Cartridge {
         chr_ram: Vec::new(),
         prg_ram: vec![0u8; PRG_RAM_SIZE],
         mapper: Mapper::Nrom(Nrom::new(1)),
-        rom_hash: 0,
+        rom_id: crate::cartridge::RomId::default(),
     }
 }
 

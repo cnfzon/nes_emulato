@@ -24,6 +24,7 @@
 
 use crate::apu::Apu;
 use crate::cartridge::Cartridge;
+use crate::fingerprint::Fp;
 use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 
@@ -134,6 +135,21 @@ impl Bus {
     #[cfg(not(test))]
     fn test_flat_ram_write(&mut self, _addr: u16, _value: u8) -> bool {
         false
+    }
+
+    /// 行為指紋（`docs/architecture.md` §18.2）：匯流排自己的狀態、RAM、搖桿、PPU、APU、卡帶。
+    pub(crate) fn fingerprint(&self, h: &mut Fp) {
+        h.u64(self.total_cycles);
+        h.u8(self.open_bus);
+        h.bool(self.pending_oam_dma.is_some());
+        h.u8(self.pending_oam_dma.unwrap_or(0));
+        h.bytes(&self.ram);
+        for pad in &self.joypads {
+            pad.fingerprint(h);
+        }
+        self.ppu.fingerprint(h);
+        self.apu.fingerprint(h);
+        self.cartridge.fingerprint(h);
     }
 
     /// 讀取 CPU 位址空間中的一個 byte（**有**副作用：更新 `open_bus`；讀
@@ -393,7 +409,7 @@ mod tests {
             chr_ram: Vec::new(),
             prg_ram: vec![0u8; crate::cartridge::PRG_RAM_SIZE],
             mapper: Mapper::Nrom(Nrom::new(1)),
-            rom_hash: 0,
+            rom_id: crate::cartridge::RomId::default(),
         }
     }
 

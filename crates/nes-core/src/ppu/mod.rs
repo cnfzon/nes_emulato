@@ -37,6 +37,7 @@ mod views;
 pub use palette::{SYSTEM_PALETTE, to_rgba};
 
 use crate::cartridge::{Cartridge, Mirroring};
+use crate::fingerprint::Fp;
 use crate::frame::FrameBuffer;
 
 /// PPUCTRL bit7：vblank 時觸發 NMI。
@@ -168,6 +169,34 @@ impl Default for Ppu {
 }
 
 impl Ppu {
+    /// 行為指紋（`docs/architecture.md` §18.2）。排除 `frame_buffer` 與 `output_enabled`（輸出）。
+    pub(crate) fn fingerprint(&self, h: &mut Fp) {
+        h.u8(self.ctrl);
+        h.u8(self.mask);
+        h.u8(self.status);
+        h.u8(self.oam_addr);
+        h.u16(self.v);
+        h.u16(self.t);
+        h.u8(self.fine_x);
+        h.bool(self.w);
+        h.u8(self.data_buffer);
+        h.u8(self.io_latch);
+        h.bytes(&self.oam);
+        h.bytes(&self.vram);
+        h.bytes(&self.palette);
+        h.u16(self.scanline);
+        h.u16(self.cycle);
+        h.u64(self.frame);
+        h.bool(self.odd_frame);
+        h.bool(self.nmi_line);
+        h.bool(self.nmi_pending);
+        h.bool(self.nmi_delay);
+        h.bool(self.frame_done);
+        h.u16(self.sprite0_hit_dot);
+        h.bool(self.overflow_pending);
+        h.u8(self.prefetch_incs);
+    }
+
     /// 檢查（從存檔還原的）內部欄位是否都在硬體可能出現的範圍內。存檔損毀或被
     /// 竄改時這些欄位可能是任意值，之後的時序/渲染邏輯不該因此 panic。
     pub(crate) fn is_structurally_valid(&self) -> bool {

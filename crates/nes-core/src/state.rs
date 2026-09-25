@@ -30,8 +30,10 @@ use crate::error::StateError;
 
 /// 存檔開頭的 magic bytes。
 pub const STATE_MAGIC: [u8; 4] = *b"NESS";
-/// 存檔的格式結構版本；見模組文件。Phase 3.5 加入 APU 與 CPU 的 IRQ 偵測欄位，遞增為 2。
-pub const STATE_FORMAT_VERSION: u16 = 2;
+/// 存檔的格式結構版本；見模組文件。Phase 3.5 加入 APU 與 CPU 的 IRQ 偵測欄位，遞增為 2；
+/// Phase 4a 把 `Cartridge::rom_hash`（u64，只涵蓋 PRG + CHR）換成 `rom_id`（xxh3-128，整個檔案），
+/// 遞增為 3（只有格式改變，`CORE_BEHAVIOR_VERSION` 不變）。
+pub const STATE_FORMAT_VERSION: u16 = 3;
 /// 模擬行為版本；見模組文件。Phase 3 凍結核心時定為 1；Phase 3.1（索引定址 dummy read、
 /// RMW 一律寫兩次）遞增為 2；Phase 3.5（APU、level-triggered IRQ、DMC 暫停 CPU）遞增為 3。
 /// 這是核心最後一次行為變更：之後 Phase 4 的 replay 與 netplay 都以這個版本為準。

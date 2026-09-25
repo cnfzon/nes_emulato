@@ -15,6 +15,9 @@
 //!    DMC 持續抓取樣本（APU 的壞情況）。
 //! 5. 命令列給的 ROM（選用）：例如公開 test ROM 或自己合法取得的遊戲。
 //!
+//! 另外量 `Nes::behavior_fingerprint`（與存檔格式無關的行為指紋）與 `Nes::state_hash`（存檔位元組的雜湊）
+//! 的單次耗時，見 `bench_fingerprint`。
+//!
 //! 每個情境都量兩次：**輸出開啟**（畫面 + 音訊混音、降頻、濾波，每幀取走取樣，跟 GUI 一樣）
 //! 與**輸出關閉**（`Nes::set_output_enabled(false)`，只推進模擬狀態；rollback 重跑幀用）。
 
@@ -70,6 +73,30 @@ fn bench_rom(name: &str, rom: &[u8]) {
     }
 }
 
+/// 指紋的單次耗時：`behavior_fingerprint`（直接把欄位數值寫進 xxh3）對照 `state_hash`
+/// （先 postcard 序列化整個 `Nes` 成位元組、再雜湊）。
+fn bench_fingerprint(name: &str, rom: &[u8]) {
+    const ITERATIONS: u32 = 20_000;
+    let mut nes = Nes::from_rom(rom).expect("valid rom");
+    for _ in 0..WARMUP_FRAMES {
+        nes.run_frame([Buttons::empty(); 2]);
+    }
+    let mut sink = 0u64; // 避免編譯器把結果整個最佳化掉
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        sink = sink.wrapping_add(std::hint::black_box(&nes).behavior_fingerprint());
+    }
+    let fingerprint = start.elapsed() / ITERATIONS;
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        sink = sink.wrapping_add(std::hint::black_box(&nes).state_hash());
+    }
+    let state_hash = start.elapsed() / ITERATIONS;
+    println!(
+        "[{name}] behavior_fingerprint {fingerprint:>9.1?}／次；state_hash {state_hash:>9.1?}／次（sink {sink:#x}）"
+    );
+}
+
 fn main() {
     let mut all_nop = [0xEAu8; 0x8000];
     all_nop[0x7FFC] = 0x00;
@@ -100,6 +127,17 @@ fn main() {
         "apu_probe_rom（四聲道 + frame IRQ + DMC IRQ 與抓取）",
         &nes_core::test_support::apu_probe_rom(nes_core::test_support::ApuProbe::DEFAULT),
     );
+
+    println!("--- 行為指紋耗時（每次呼叫）---");
+    bench_fingerprint("rendering_rom", &nes_core::test_support::rendering_rom());
+    bench_fingerprint(
+        "apu_probe_rom",
+        &nes_core::test_support::apu_probe_rom(nes_core::test_support::ApuProbe::DEFAULT),
+    );
+    if let Some(path) = std::env::args().nth(1) {
+        let rom = std::fs::read(&path).expect("讀取 ROM 失敗");
+        bench_fingerprint(&format!("ROM: {path}"), &rom);
+    }
 
     if let Some(path) = std::env::args().nth(1) {
         let rom = std::fs::read(&path).expect("讀取 ROM 失敗");

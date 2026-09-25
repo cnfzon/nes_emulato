@@ -6,7 +6,18 @@
 
 use std::path::PathBuf;
 
-use nes_core::{Buttons, RomInfo};
+use nes_core::{Buttons, ReplayMismatch, RomId, RomInfo};
+
+/// replay 播放速度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackSpeed {
+    /// 正常速度（60.0988 Hz，有聲音）。
+    X1,
+    /// 兩倍速（靜音）。
+    X2,
+    /// 盡可能快（靜音；畫面只更新每個時間片的第一幀）。
+    Max,
+}
 
 /// UI 執行緒送給 Emu 執行緒的指令。
 pub enum EmuCommand {
@@ -15,7 +26,21 @@ pub enum EmuCommand {
     Pause,
     Resume,
     SaveState,
+    /// 讀取記憶體中的存檔。錄製或播放 replay 時會被拒絕（會破壞「從開機狀態依輸入序列執行」）。
     LoadState,
+    /// soft reset（Emulation 選單的 Reset）。**不是**直接改動 `Nes`：它變成下一幀 `FrameInput`
+    /// 的 `reset` 旗標，所以錄製時會被記進 replay。播放 replay 時忽略。
+    Reset,
+    /// 重新開機（power-on）並開始錄製 replay。
+    StartRecording,
+    /// 結束錄製，回報 [`EmuEvent::RecordingFinished`]（replay 的位元組）。
+    StopRecording,
+    /// 從 replay 的位元組開始播放：重新開機、依 replay 的輸入逐幀執行並驗證檢查點。
+    StartReplay(Vec<u8>),
+    StopReplay,
+    SetPlaybackSpeed(PlaybackSpeed),
+    /// 把目前狀態的存檔位元組交給 UI（存成檔案，供 `nes-test diff-state` 使用）。
+    ExportState,
     /// 開關 Debugger 面板要看的 `DebugSnapshot` 產生（見 `emu.rs` 的
     /// `debug_input`）。只在面板真的打開時才產生快照，避免面板關閉時
     /// 白白浪費每幀一次的複製成本。
@@ -48,10 +73,44 @@ pub enum EmuCommand {
     Barrier(crossbeam_channel::Sender<()>),
 }
 
+/// 錄製／播放的狀態（狀態列用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Idle,
+    Recording {
+        frames: u32,
+    },
+    Playing {
+        frame: u32,
+        total: u32,
+        /// 已驗證通過的檢查點數。
+        verified: u32,
+        checkpoints: u32,
+    },
+    /// 播放完成，全部檢查點相符。
+    Finished {
+        total: u32,
+        checkpoints: u32,
+    },
+    /// 檢查點不符：播放已停止並暫停。
+    Mismatch(ReplayMismatch),
+}
+
 /// Emu 執行緒回報給 UI 執行緒的事件。
 #[derive(Debug)]
 pub enum EmuEvent {
-    RomLoaded(RomInfo),
+    RomLoaded(RomInfo, RomId),
+    /// 錄製／播放的狀態改變（錄製與播放中每幀都會送）。
+    Session(SessionStatus),
+    /// emu 執行緒自己改變了暫停狀態（播放完成或檢查點不符時會自動暫停）。
+    Paused(bool),
+    /// 錄製結束：完整的 replay 位元組，由 UI 存成檔案（emu 執行緒不做檔案 I/O）。
+    RecordingFinished {
+        bytes: Vec<u8>,
+        frames: u32,
+    },
+    /// `ExportState` 的結果。
+    StateExported(Vec<u8>),
     Error(String),
     /// 每秒一次的 FPS 統計（只有 FPS；幀數請用 [`EmuEvent::FrameAdvanced`]，
     /// 否則幀數只會每秒更新一次，跟 Debugger 快照對不上）。

@@ -8,7 +8,23 @@ cargo run -p nes-test -- nestest <rom.nes> <log.txt> [--strict]
 cargo run -p nes-test -- blargg <rom.nes> [--max-frames N] [--screen]
 cargo run -p nes-test -- screenshot <rom.nes> <out.png> [--frames N] [--scale S]
 cargo run -p nes-test -- golden <rom.nes> [--frames N]
+cargo run -p nes-test -- replay info <replay>
+cargo run -p nes-test -- replay verify <rom.nes> <replay>
+cargo run -p nes-test -- replay generate <rom.nes> <out.replay> [--frames N] [--seed S] [--interval K] [--reset-at F]...
+cargo run -p nes-test -- diff-state <a.state> <b.state>
+cargo run -p nes-test -- save-state <rom.nes> <out.state> [--replay <replay>] [--frames N]
 ```
+
+Phase 4a 的 replay 與除錯工具（規格見 [`docs/architecture.md`](../../docs/architecture.md) §18）：
+
+- `info` 也會印出 ROM 的 `rom_id`（整個檔案的 xxh3-128；前 16 字元是 UI／CLI 的顯示用）。
+- `replay info`：header、總幀數、reset 次數與位置、檢查點數量。
+- `replay verify`：從開機依 replay 的輸入重播（關閉輸出以加速），驗證全部檢查點。通過 → 結束碼 0；不符、
+  版本或 ROM 不符、檔案損毀 → 非 0，並回報第一個不符的檢查點與「分歧可能開始的幀範圍」。
+- `replay generate`：依偽隨機的雙人輸入腳本錄一份 replay（測試與效能量測用；真正的 replay 由 GUI 錄製）。
+- `diff-state`：逐欄位比對兩份存檔，輸出 `路徑: 左 vs 右`（例如 `ppu.v: 0x2104 vs 0x2105`）；大型陣列只列出
+  不同的索引範圍。結束碼：相同 0、有差異 1、無法讀取／解碼 2。
+- `save-state`：跑到指定幀數（可依 replay 的輸入）後寫出存檔，用來產生 `diff-state` 的比對對象。
 
 `nestest` 會從 nestest.nes 的 automation entry point（`$C000`）開始，逐指令
 跟 `log.txt` 比對 PC、指令 bytes、A/X/Y/P/SP、CYC、PPU dot；預設不比對反組譯

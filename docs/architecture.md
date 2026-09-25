@@ -267,7 +267,7 @@ pub chr_rom: Vec<u8>,
 常序列化。連帶地，[`Nes::state_hash`] 因為是對 `save_state()` 的輸出做
 xxh3-64，也自動不包含 ROM bytes，只反映「真正會變的狀態」。
 
-### 8.2 `rom_hash`：確保讀檔時接回「同一份」ROM
+### 8.2 `rom_id`：確保讀檔時接回「同一份」ROM
 
 因為 `prg_rom`/`chr_rom` 被跳過，`load_state` 讀回資料後必須從目前記憶體裡
 已經載入的 ROM 把這兩個欄位接回去——但如果存檔其實是另一款遊戲存的
@@ -275,19 +275,25 @@ xxh3-64，也自動不包含 ROM bytes，只反映「真正會變的狀態」。
 資料跟存檔裡的 CPU/PPU 狀態完全對不上，會直接跑出垃圾畫面或亂七八糟的
 行為，而且不會有任何錯誤訊息。
 
-`Cartridge` 因此多存一個 `rom_hash: u64` 欄位（`xxh3_64(prg_rom ++
-chr_rom)`，在 `ines::parse` 解析時算好），`Nes::load_state` 讀檔時比對存檔
-裡的 `rom_hash` 跟目前已載入 ROM 的 `rom_hash`：
+`Cartridge` 因此存一個 `rom_id: RomId`（`rom_id.rs`）：**對整個 ROM 檔案（含 iNES header 與
+trainer）計算的 xxh3-128**，在 `ines::parse` 解析時算好；`Nes::load_state` 讀檔時比對存檔裡的
+`rom_id` 跟目前已載入 ROM 的 `rom_id`：
 
 ```rust
-let expected_hash = self.cpu.bus().cartridge.rom_hash;
-let found_hash = decoded.cpu.bus().cartridge.rom_hash;
-if expected_hash != found_hash {
-    return Err(StateError::RomMismatch { expected: expected_hash, found: found_hash });
+let expected = self.cpu.bus().cartridge.rom_id;
+let found = decoded.cpu.bus().cartridge.rom_id;
+if expected != found {
+    return Err(StateError::RomMismatch { expected, found });
 }
 ```
 
 不符合就回傳 `StateError::RomMismatch`，拒絕讀檔，而不是接上錯的 ROM 繼續跑。
+
+**Phase 4a 之前**這個欄位是 `rom_hash: u64`，只涵蓋 `PRG ++ CHR`。換成整個檔案的 128 位元雜湊有兩個理由：
+(1) header 的 mapper／mirroring 位元不同就是不同的卡帶（舊版會把它們當成同一份 ROM）；(2) replay 與 netplay
+握手都要用它確認「雙方載入的是同一份檔案」，128 位元讓碰撞在實務上不可能。位元組表示採 xxHash 的 canonical
+形式（高 64 位元在前的 big-endian），與 `xxh128sum` 印出的十六進位字串相同，可用外部工具核對；UI 與 CLI 顯示
+前 16 個十六進位字元（`RomId::short`）。這個改變讓 `STATE_FORMAT_VERSION` 由 2 升到 3（§15.4）。
 
 ### 8.3 結構驗證：拒絕長度被竄改的資料
 
@@ -317,7 +323,7 @@ flowchart TD
     A -->|Err| E1["StateError::Decode"]
     A -->|Ok decoded: Nes| B["validate_structure()"]
     B -->|不符合| E2["StateError::Corrupt"]
-    B -->|符合| C{"rom_hash 相符?"}
+    B -->|符合| C{"rom_id 相符?"}
     C -->|否| E3["StateError::RomMismatch"]
     C -->|是| D["從 self 現有的 Cartridge\n接回 prg_rom / chr_rom"]
     D --> F["*self = decoded"]
@@ -809,7 +815,7 @@ Phase 3 起用兩個版本號把這個保證變成可檢查的規則（常數在
 
 | 版本號 | 意義 | 目前值 |
 |---|---|---|
-| `STATE_FORMAT_VERSION` | 存檔的**格式結構**：欄位、順序、型別、header 佈局 | 2 |
+| `STATE_FORMAT_VERSION` | 存檔的**格式結構**：欄位、順序、型別、header 佈局 | 3 |
 | `CORE_BEHAVIOR_VERSION` | **模擬行為**：同樣的 ROM 與輸入，狀態或畫面會不會不同 | 3 |
 
 ### 15.1 判定規則
@@ -829,6 +835,8 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 - Mapper：任何暫存器的行為、mirroring、PRG-RAM 啟用規則、bank 換算；**開機初值**
   （RAM、PPU、mapper 暫存器）。
 - 修正一個「原本算錯」的行為也一樣：對舊版來說結果就是變了。
+- **行為指紋的欄位規格**（§18.2）：新增、刪除或重排寫入的欄位，或改變雜湊方式。replay 的檢查點與 desync 偵測比對的
+  就是這個指紋，規格一變，舊 replay 的檢查點全部驗證失敗，等同於 replay 相容性中斷。
 
 不會（不需要遞增）：
 
@@ -861,6 +869,11 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
   APU 探針（`test_support::apu_probe_rom`）會用到 frame IRQ、`$4015`（讀取清旗標）、DMC IRQ 與
   抓取樣本暫停、兩個 sweep、noise 短模式、四個聲道的長度與包絡線；它對 APU 行為是否敏感，用
   「破壞性實驗」驗證過（§14.7.3）。
+- **與存檔格式無關的行為指紋**（Phase 4a，§18.2）：`fingerprint_tests` 的
+  `fingerprint_is_pinned_for_synthetic_roms` 釘住五份合成 ROM（含一次 soft reset）的 `Nes::behavior_fingerprint`。
+  它不經過 serde，所以**只有模擬行為改變才會動**；上面那個 `state_hash` 版對行為與存檔格式都敏感。兩者的失敗組合
+  可以分辨原因：兩者都失敗 ＝ 行為變了（遞增 `CORE_BEHAVIOR_VERSION`）；只有 `state_hash` 版失敗 ＝ 只有存檔格式
+  變了（遞增 `STATE_FORMAT_VERSION`，行為指紋的釘值**不得**更新）。Phase 4a 的 2 → 3 升版就是後者的實例（§18.4）。
 - `golden_frame_hash_of_rendering_rom` 與 `tests/golden_frames.rs`：釘住畫面輸出。
 - 測試失敗時的流程：(1) 確認變動是預期的；(2) 依 §15.1 遞增對應的版本號；(3) 同時更新
   指紋測試裡的常數（版本號與雜湊）與黃金雜湊；(4) 在 §15.4 補一列紀錄。
@@ -878,14 +891,16 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 |---|---|
 | 1 | 8 bytes header + postcard(`Nes`)；`Mapper` 變體順序 Nrom、Mmc1、Uxrom、Cnrom；`Mirroring` 變體順序 Horizontal、Vertical、FourScreen、SingleScreenLower、SingleScreenUpper |
 | 2 | Phase 3.5：`Apu` 由「原始暫存器 byte」換成完整的聲道／frame counter 狀態（`apu/mod.rs`、`apu/channels.rs`）；`Cpu` 多了 `irq_sample`、`irq_masked` 兩個欄位。輸出管線（`Apu::out`）標了 `#[serde(skip)]`，`Ppu::output_enabled` 也是，所以不在存檔裡 |
+| 3 | Phase 4a：`Cartridge::rom_hash`（u64，只涵蓋 PRG + CHR）換成 `rom_id`（xxh3-128，整個 ROM 檔案，`[u8; 16]`）。**只有格式改變，`CORE_BEHAVIOR_VERSION` 不變**（模擬行為沒有任何改變：行為指紋的釘值與黃金畫面都逐位元不變，§18.4）；存檔位元組與 `state_hash` 因此全部改變 |
 
 ### 15.5 Phase 4 的銜接
 
-- **replay 格式**：檔頭記錄 `CORE_BEHAVIOR_VERSION` 與 ROM 的 `rom_hash`（§8.2），重播前比對；
-  版本不同就拒絕（或明確警告「結果不保證相同」），不默默重播。**replay 的內容是「開機狀態 + 輸入序列」，
-  不包含存檔**（§15.6）。
-- **netplay 握手**：雙方交換 `CORE_BEHAVIOR_VERSION` 與 `rom_hash`，任一不符就拒絕連線。
-  這比事後靠 `state_hash` 偵測到 desync 更早、訊息也更明確。desync 偵測仍保留。
+- **replay 格式**（Phase 4a 已實作，§18.3）：檔頭記錄 `CORE_BEHAVIOR_VERSION` 與 ROM 的 `rom_id`（§8.2），重播前比對；
+  版本不同就拒絕（不默默重播）。**replay 的內容是「開機狀態 + 輸入序列 + 行為指紋檢查點」，不包含存檔**（§15.6）。
+- **netplay 握手**（4b 起）：雙方交換 `CORE_BEHAVIOR_VERSION` 與 `rom_id`，任一不符就拒絕連線。
+  （`nes-net` 目前的協定骨架還寫著 `rom_hash: u64`，是 Phase 0 的佔位，4b 實作握手時要改成 `rom_id`。）
+  這比事後靠指紋偵測到 desync 更早、訊息也更明確。desync 偵測仍保留，**用 `Nes::behavior_fingerprint`（§18.2）
+  而不是 `state_hash`**：前者與存檔格式無關，雙方即使存檔格式版本不同（各自的 rollback 用各自的格式）也能比對。
 - 這兩者沿用同一個 `CORE_BEHAVIOR_VERSION`，不另建協定版本；`STATE_FORMAT_VERSION` 只影響
   本機存檔與 rollback 內部的存讀檔，不必送到對方。（netplay 雙方各自用自己的存檔格式做
   rollback，只交換輸入與雜湊。）
@@ -904,10 +919,11 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 - **延遲 catch-up（§12）與這條規則的關係**：它只改變「APU 何時被追上」，只要每個 CPU 可見的結果
   （暫存器讀值、IRQ、DMC 暫停、畫面、RAM）逐位元不變，就**不需要**遞增 `CORE_BEHAVIOR_VERSION`；
   但若它把「尚未追上的 cycle 數」放進存檔，就要遞增 `STATE_FORMAT_VERSION`，且目前釘住的行為指紋
-  （`state_hash` 是對存檔位元組雜湊）會因格式而改變。**注意**：現有的指紋測試無法區分「行為變了」與「只有
+  （`state_hash` 是對存檔位元組雜湊）會因格式而改變。**注意**（Phase 4a 之前的狀況，現已解決，見下）：當時的指紋測試無法區分「行為變了」與「只有
   存檔格式變了」，所以動手前要先加一個**與存檔格式無關的行為指紋**（例如：每幀結束時 CPU 暫存器、RAM、
   framebuffer 雜湊、APU 輸出取樣雜湊），用它證明行為沒變，才能只遞增 `STATE_FORMAT_VERSION`。
   （這一點修正了 Phase 3.5 初版 §12 的說法——當時寫「屬於行為版本的變更」，那只在行為真的改變時才成立。）
+  **Phase 4a 已補上這個與存檔格式無關的行為指紋**（§18.2）：現在可以用它證明「行為沒變」，只遞增 `STATE_FORMAT_VERSION`。
 
 ## 16. Mapper
 
@@ -1233,3 +1249,243 @@ frame counter 從 0 開始（模式：冷開機 4 步、reset 沿用），之後
 - 只有 NTSC（週期表與 CPU 時脈）。
 - 效能：APU 每幀約 +150 µs 固定成本（§14.6），延遲 catch-up 留待評估（§12）。
 - 沒有以真實遊戲驗證音質；沒有處理音訊裝置熱拔除（cpal 的錯誤只寫 log，需要重開程式）。
+
+## 18. Phase 4a：決定性基礎設施（輸入抽象、行為指紋、replay、除錯工具）
+
+Phase 4 要做 netplay（4b lockstep、4c rollback）。netplay 最難的是 desync 除錯：找出兩端從哪一幀、因為什麼開始分歧。
+本階段**完全不碰網路**，只在單機上把「輸入序列 → 完全相同的結果」做到可錄製、可重播、可驗證、可比對。replay 就是離線版的
+netplay：4b、4c 的正確性會歸約到這裡驗證過的 replay 正確性。**本階段沒有改變模擬行為**：`CORE_BEHAVIOR_VERSION` 維持 3
+（證據見 §18.4）；只有存檔格式因 `rom_id` 而遞增（`STATE_FORMAT_VERSION` 2 → 3，§15.4）。
+
+### 18.1 檔案與 API 一覽
+
+| 內容 | 位置 |
+|---|---|
+| `FrameInput { p1, p2, reset }`、`Nes::run_frame(impl Into<FrameInput>)` | `nes-core/src/input.rs`、`lib.rs` |
+| `Nes::behavior_fingerprint`、`Nes::is_power_on_state`、`Nes::rom_id` | `lib.rs`、`fingerprint.rs`（雜湊器）、各模組的 `fingerprint` 方法 |
+| `RomId`（整個檔案的 xxh3-128） | `nes-core/src/rom_id.rs` |
+| `Replay`（編碼／解碼）、`ReplayRecorder`、`ReplayPlayer`、`replay::verify` | `nes-core/src/replay.rs` |
+| 雙實例測試工具（`testing` feature） | `nes-core/src/dual.rs` |
+| 合成 ROM：`input_probe_rom`（對輸入與 reset 敏感） | `nes-core/src/test_support.rs` |
+| GUI：Reset、錄製、播放、速度、存成 `.state` | `nes-app/src/{app,emu,commands}.rs` |
+| CLI：`replay info/verify/generate`、`diff-state`、`save-state` | `nes-test/src/{main,replay_cmd,diff_state}.rs` |
+
+**`run_frame` 的簽名**是 `fn run_frame(&mut self, input: impl Into<FrameInput>)`：接受 `FrameInput`，也接受舊式的
+`[Buttons; 2]`（`From<[Buttons; 2]>`，等同 `reset: false`）。這是刻意的：既有的上百個測試呼叫點不必改，而且證明了
+「沒有 reset 的輸入序列不受影響」（測試 `inputs_without_reset_are_unaffected_by_the_frame_input_type`）。
+
+### 18.2 行為指紋（`Nes::behavior_fingerprint() -> u64`）的完整欄位規格
+
+**用途**：replay 的檢查點、netplay 的 desync 偵測、雙實例比對。**與 `state_hash` 的差別**：`state_hash` 是 `save_state()`
+位元組的雜湊，存檔格式一改就變；指紋**不經過 serde、postcard 或任何序列化格式**，只把狀態欄位的「數值」依下列固定順序寫進
+xxh3-64（`xxhash_rust::xxh3::Xxh3Default`，seed 0，串流式 `update`），所以存檔格式改變時它不會變，只有模擬行為改變才會變。
+
+**編碼規則**（`fingerprint.rs` 的 `Fp`）：整數以固定寬度 little-endian 寫入（`u8` 1 位元組、`u16` 2、`u32` 4、`u64` 8）；
+`bool` 寫成 1 個位元組（0/1）；可變長度的資料（RAM、VRAM…）以 `u32`（little-endian）長度為前綴、後接原始位元組；
+`Option<u8>` 寫成「有沒有值（bool）」加「值（`None` 時為 0）」。
+
+**寫入順序**（每一列依序寫入；括號內是型別）：
+
+| # | 區段 | 欄位（依序） |
+|---|---|---|
+| 1 | `Nes` | `frame_count`（u64） |
+| 2 | CPU | `a`、`x`、`y`、`sp`（各 u8）、`pc`（u16）、`status`（P 暫存器的位元，u8）、`jammed`（bool）、`irq_sample`（bool）、`irq_masked`（bool） |
+| 3 | 匯流排 | `total_cycles`（u64）、`open_bus`（u8）、`pending_oam_dma` 有無（bool）＋值（u8）、**RAM**（2048 位元組，長度前綴） |
+| 4 | 搖桿 ×2（玩家 1、玩家 2） | `state`（按鍵位元，u8）、`strobe`（bool）、`shift`（移位暫存器，u8） |
+| 5 | PPU | `ctrl`、`mask`、`status`、`oam_addr`（各 u8）、`v`（u16）、`t`（u16）、`fine_x`（u8）、`w`（bool）、`data_buffer`（u8）、`io_latch`（u8）、**OAM**（256 位元組）、**VRAM**（2048）、**調色盤**（32）、`scanline`（u16）、`cycle`（u16）、`frame`（u64）、`odd_frame`（bool）、`nmi_line`、`nmi_pending`、`nmi_delay`、`frame_done`（各 bool）、`sprite0_hit_dot`（u16）、`overflow_pending`（bool）、`prefetch_incs`（u8） |
+| 6 | APU：pulse 1、pulse 2 | 每個：`ones_complement`、`enabled`（bool）、`duty`（u8）、**包絡線**〔`looping`、`constant`（bool）、`volume`（u8）、`start`（bool）、`divider`、`decay`（u8）〕、**長度計數器**〔`counter`（u8）、`halt`、`new_halt`（bool）、`reload`、`previous`（u8）〕、`sweep_enabled`（bool）、`sweep_period`（u8）、`sweep_negate`（bool）、`sweep_shift`（u8）、`sweep_reload`（bool）、`sweep_divider`（u8）、`timer_period`（u16）、`cnt`（u32）、`seq`（u8） |
+| 7 | APU：triangle | `enabled`、`control`（bool）、`linear_reload_value`、`linear_counter`（u8）、`linear_reload_flag`（bool）、長度計數器（同上）、`timer_period`（u16）、`cnt`（u32）、`seq`（u8） |
+| 8 | APU：noise | `enabled`（bool）、包絡線、長度計數器（同上）、`mode`（bool）、`period_index`（u8）、`cnt`（u32）、`shift`（u16） |
+| 9 | APU：DMC | `irq_enabled`、`looping`（bool）、`rate_index`（u8）、`cnt`（u32）、`sample_addr`、`sample_length`、`current_addr`、`bytes_remaining`（各 u16）、`read_buffer`（u8）、`buffer_empty`（bool）、`shift_register`、`bits_remaining`（u8）、`silence`（bool）、`output_level`（u8）、`irq_flag`（bool）、`start_delay`（u8） |
+| 10 | APU：frame counter 與其餘 | frame counter：`mode5`、`inhibit_irq`（bool）、`step`（u8）、`cycle`（u32）、`write_delay`（u8）、`new_mode5`（bool）、`block`（u8）；然後 `frame_irq`（bool）、`cycles`（u64）、`ahead`（u8）、`dmc_stall`（u32） |
+| 11 | 卡帶 | mapper 編號（u8），接著該 mapper 的暫存器：NROM 無；MMC1：`shift`、`shift_count`、`control`、`chr0`、`chr1`、`prg`（各 u8）；UxROM：`bank`（u8）；CNROM：`chr_bank`（u8）。然後 **CHR-RAM**（有 CHR-RAM 的卡帶 8192 位元組，否則長度 0）、**PRG-RAM**（8192） |
+
+表列的區段順序就是實際的寫入順序（第 6–10 列合起來是 `Apu::fingerprint`：pulse 1、pulse 2、triangle、noise、DMC、frame counter、
+`frame_irq`、`cycles`、`ahead`、`dmc_stall`）。
+
+**排除（刻意不納入）**：
+- **framebuffer 與音訊輸出管線**（`Ppu::frame_buffer`、`Ppu::output_enabled`、`Apu::out`）：它們是輸出。rollback 重跑幀時會關閉輸出，
+  若指紋包含輸出，開關輸出就會讓指紋不同。測試 `fingerprint_is_independent_of_the_output_switch`：開、關、逐幀切換，
+  指紋逐幀相同。
+- **靜態的卡帶資料**：PRG-ROM、CHR-ROM、iNES header 中繼資料（`RomInfo`）、NROM 由 header 決定的 bank 數——它們在模擬中不會改變，
+  由 `rom_id` 識別。
+- 除錯用的旁路（`#[cfg(test)]` 的 flat RAM 與存取記錄）。
+
+**維護規則（必須遵守）**：
+1. 新增任何會影響模擬結果的狀態欄位，必須**同時**：(a) 在對應的 `fingerprint` 方法寫入、(b) 更新上面的規格表。
+2. `every_serialized_state_field_is_covered_by_the_fingerprint` 會逐一竄改存檔（serde）裡的**每個**欄位，漏掉的欄位讓測試失敗
+   並列出欄位路徑——所以不可能默默漏掉；新增的靜態欄位（不該進指紋的）要加進該測試的 `STATIC_PREFIXES` 並在這裡說明理由。
+3. 改變規格（增減、重排欄位、改雜湊方式）會讓舊 replay 的檢查點全部失效，依 §15.1 視為「會改變模擬結果的修改」，須遞增
+   `CORE_BEHAVIOR_VERSION` 並重新釘住（`fingerprint_is_pinned_for_synthetic_roms`、golden replay）。
+
+**測試（`crates/nes-core/src/fingerprint_tests.rs`）**：
+
+| 項目 | 測試 | 內容 |
+|---|---|---|
+| a | `fingerprint_survives_save_and_load` | 存檔 → 讀檔後指紋不變（含「一幀中間」的狀態、讀進一個已經走到別處的實例） |
+| b | `fingerprint_is_independent_of_the_output_switch` | 輸出開／關／逐幀切換，跑相同輸入 80 幀，六份合成 ROM，指紋逐幀相同 |
+| c | `tampering_one_field_per_category_changes_the_fingerprint` | 依類別各竄改一個欄位（CPU、RAM、PPU、mapper、CHR-RAM／PRG-RAM、APU、搖桿，共 30 項），指紋都改變 |
+| c′ | `every_serialized_state_field_is_covered_by_the_fingerprint` | **自動的完整性檢查**：對六種合成 ROM 的存檔，把每個欄位（大型陣列取頭／尾／中間）竄改一次，共 1152 個欄位（每個 ROM 約 190 個），指紋都必須改變 |
+| d | `fingerprint_is_pinned_for_synthetic_roms` | 五份合成 ROM（NROM 渲染、MMC1、索引定址 dummy read、APU 探針、輸入探針＋一次 soft reset）在固定輸入下 60 幀的指紋 |
+| e | `fingerprint_does_not_depend_on_the_serialization_format` | 見 §18.4 |
+
+### 18.3 Replay 檔案格式（`nes-core/src/replay.rs`）
+
+**只處理位元組，不做檔案 I/O**（呼叫端負責讀寫）。位元組佈局是明確定義的，全部 **little-endian**，不依賴 Rust struct 的記憶體佈局：
+
+```text
+offset  size  欄位
+0       4     magic "NESR"（0x4E 0x45 0x53 0x52）
+4       2     replay 格式版本（REPLAY_FORMAT_VERSION，目前 1）
+6       2     CORE_BEHAVIOR_VERSION（錄製時的核心行為版本）
+8       16    rom_id（整個 ROM 檔案的 xxh3-128，canonical 位元組，見 §8.2）
+24      4     總幀數（u32）
+28      2     檢查點間隔（u16，幀，預設 60，必須 ≥ 1）
+30      4     輸入段數 N（u32）
+34      7×N   輸入段（RLE）：
+                +0  p1 按鍵（u8，Buttons 位元：A=1 B=2 Select=4 Start=8 上=16 下=32 左=64 右=128）
+                +1  p2 按鍵（u8）
+                +2  旗標（u8）：bit0 = 這一幀開始前 reset；其餘位元必須為 0
+                +3  重複次數（u32，≥ 1）
+34+7N   4     檢查點數 M（u32）
+..      12×M  檢查點：+0 幀號（u32）、+4 行為指紋（u64）
+```
+
+檔案結尾就是最後一個檢查點，**不得有多餘的位元組**。輸入段的重複次數總和必須等於總幀數；檢查點的幀號必須嚴格遞增且 ≤ 總幀數。
+
+**語意**：
+- **起點永遠是開機狀態**（`Nes::from_rom` 的結果；`Nes::is_power_on_state`）。**replay 不含存檔**（§15.6 的規則）：存檔格式的改變
+  不會使 replay 失效，只有 `CORE_BEHAVIOR_VERSION` 改變才會。
+- **幀號約定**：「第 `n` 幀」＝ 第 `n` 次 `run_frame`（1 起算）；「第 `n` 幀的檢查點」＝ 第 `n` 次 `run_frame` 之後的指紋（`n = 0` 是開機
+  狀態）；第 `n` 幀使用的輸入是輸入串流的第 `n − 1` 筆（0 起算）。
+- **檢查點的位置**：第 0 幀（開機狀態）、每 `checkpoint_interval` 幀、最後一幀（若不是間隔的整數倍就補上）。
+- **RLE**：相鄰且相同的 `FrameInput`（含 reset 旗標）合併成一段；`reset` 是輸入的一部分，所以 reset 一定在自己那一幀的輸入段裡。
+  典型的雙人 replay 每段平均約 16 幀（Spacegulls 隨機腳本 10000 幀 → 624 段，檔案 6422 位元組）。
+- **`ReplayRecorder`**：`new(&nes, interval)` 只接受開機狀態（否則 `NotPowerOn`）；每跑完一幀呼叫 `record_frame(input, &nes)`，內部檢查
+  `nes.frame_count()` 剛好比已記錄的幀數多 1——**有幀沒有記錄（例如錄製中偷偷讀檔、多跑一幀）會被偵測到**（`OutOfSync`）；
+  `finish(&nes)` 補最後一個檢查點並回傳 `Replay`。
+- **`ReplayPlayer`**：`new(replay, &nes)` 拒絕版本不符（`CoreVersionMismatch`）、`rom_id` 不符（`RomMismatch`，訊息含雙方 `rom_id` 前 16 字元）、
+  非開機狀態（`NotPowerOn`），並先驗證第 0 幀的檢查點；`step(&mut nes)` 用 replay 的輸入跑一幀並驗證該幀的檢查點。
+- **`replay::verify(rom, &replay)`**：從 ROM 開機、**關閉輸出**（不畫畫面、不混音以加速；輸出不影響指紋）、跑完全部幀。
+- **解碼器（`Replay::decode`）對任意位元組都不 panic**：長度先檢查再配置（標頭宣稱「40 億個輸入段」不會造成巨量配置，直接回傳
+  `Truncated`）；接受的位元組一定是規範形式（`decode` 後 `encode` 得到同樣的位元組）。
+
+**驗證失敗的回報（`ReplayMismatch`）**：第一個不符的檢查點的幀號 `frame`、上一個相符的檢查點的幀號 `last_good_frame`，以及
+`suspect_frames()`＝ **分歧可能開始的幀範圍** `last_good_frame + 1 ..= frame`（第 0 幀就不符則是 `0..=0`）。
+意義：兩個檢查點之間只有這些幀的輸入與執行可能造成分歧。檢查點間隔越小範圍越窄（間隔 1 時是單一幀）。
+
+**測試（`replay_tests.rs`，19 個）**：錄製後重播通過（含 reset）；**golden replay**（合成 ROM、300 幀、雙人操作＋一次 reset：釘住
+6 個檢查點指紋、編碼後 901 位元組的長度與 xxh3）；只能從開機狀態錄製；未記錄的幀被偵測；空錄製與檢查點邊界；輸出開／關播放
+結果相同；版本／ROM 不符的可讀錯誤；**竄改輸入 → 分歧範圍包含該幀**（第 2、30、59、60、61、120、149、151、200、299、300 幀、
+玩家 2、拿掉／多加 reset）；密集檢查點把範圍縮到單一幀；檢查點被竄改時的範圍；解碼器的隨機／截斷／單一位元組突變模糊測試
+（固定種子 xorshift：20000 個隨機輸入、有效檔案的每個截斷長度與每個位置的 8 種突變、5000 個多位置突變；每個截斷長度都必須被拒絕）；各種錯誤檔案的分類；位元組佈局釘住。
+
+### 18.4 「與格式無關」的佐證與行為沒變的證據
+
+**測試 e（`fingerprint_does_not_depend_on_the_serialization_format`）**：把整台 `Nes` 換成**完全不同的序列化格式**——serde_json 的文字，
+而不是 postcard 的位元組——往返一次，指紋不變（六份合成 ROM），且往返後再存成 postcard 與原本的位元組完全相同。這證明指紋是
+狀態「數值」的函數，不是任何編碼結果。
+
+**這證明到的程度**：指紋不依賴存檔的編碼（postcard／header／欄位在存檔裡的順序）。**沒有證明的部分**：
+1. 無法證明「將來新增的欄位一定被納入」——那由 c′ 的自動完整性檢查（＋維護規則）負責；
+2. 指紋是手寫的欄位順序，所以它依賴「規格」（§18.2）而不是 struct 佈局：重排 struct 的欄位不會改變它，但改寫入順序會（由 d 的釘值抓到）；
+3. 它只能證明「相同」，不能證明「正確」——指紋相同只表示兩份狀態的（被納入的）欄位相同。
+
+**歷史性的實證（本階段實際發生）**：釘值 d 是在 `STATE_FORMAT_VERSION` 還是 2（存檔含 `rom_hash: u64`）時記錄的；接著把它換成
+`rom_id` 並升到 3，存檔位元組與 `state_hash` 全部改變（`behavior_fingerprint_is_pinned_to_the_version_numbers` 的四個雜湊都變了，
+依 §15.3 更新常數並升版），而 d 的**五個釘值一個都沒有動**，黃金畫面（`golden_frame_hash_of_rendering_rom`、`tests/golden_frames.rs`）
+也逐位元不變。這就是「只有格式變、行為沒變」的直接證據，所以 `CORE_BEHAVIOR_VERSION` 維持 3。
+
+### 18.5 `FrameInput` 與 soft reset
+
+`FrameInput { p1: Buttons, p2: Buttons, reset: bool }`。`reset` 在該幀**開始前**執行 `Nes::reset()`（NESdev wiki 的 reset 行為，實作與 Phase 2／3.5 相同：CPU 依 `Cpu::reset`
+——SP=$FD、P=$24、PC 取自 `$FFFC`、耗 7 cycles、不清 A/X/Y，PPU 清 PPUCTRL／PPUMASK 與寫入 latch 等、APU 依 §17.7；
+**RAM、VRAM、OAM、卡帶內容與 mapper 暫存器保留**），再鎖定按鍵並跑這一幀。`Nes::reset()` 在 Phase 2 就已存在（開機之外的 reset 訊號），
+Phase 4a 沒有改動它，只是讓 `run_frame` 能經由輸入觸發：**只有 `reset == true` 時才有任何差別，不影響任何既有輸入序列的結果**
+（`inputs_without_reset_are_unaffected_by_the_frame_input_type`，以及行為指紋釘值不變）。`reset_input_is_a_soft_reset_before_the_frame`
+驗證「`reset: true` 的那一幀 ＝ 先呼叫 `Nes::reset()` 再跑這一幀」，並用輸入探針 ROM 確認 RAM 保留、程式從 reset 向量重新開始。
+
+**不是開機**：`reset()` 之後 `is_power_on_state()` 為 `false`（CPU 又多走 7 個 cycle），所以 replay 不能從 reset 之後的狀態開始。
+
+### 18.6 雙實例測試工具（`nes-core/src/dual.rs`，`testing` feature）
+
+給 4b／4c 的 `nes-net` 測試用，比對「連線兩端」與「離線重播」是否逐幀相同：
+
+- `run_both(rom, &inputs) -> Option<Divergence>`：兩個剛開機的實例吃同樣的輸入，回傳第一個指紋不同的幀。
+- `DualRunner`：兩個實例各吃**各自**的輸入（`step(input_a, input_b)`）；`from_instances` 可接手已存在（例如剛 `load_state` 過）的實例；
+  `set_output(a, b)` 分別開關輸出（rollback 重跑幀關閉輸出）；一旦出現分歧，回傳值固定為**第一個**分歧。
+- `fingerprint_trace(&mut nes, inputs) -> Vec<u64>` ＋ `first_divergence(&a, &b)`：兩端各自獨立跑（甚至在不同執行緒／行程），事後比對；
+  離線重播用 `replay.inputs()` 餵同一個函式。軌跡在檢查點的幀上等於 replay 記錄的指紋（測試 `independent_traces_can_be_compared_afterwards`）。
+- `Divergence { frame, a, b }` 的 `frame` 是「已完成的 `run_frame` 次數」（第 1 幀＝第一次 `run_frame` 之後）。
+- 已驗證的性質（`replay_tests.rs`）：同輸入永不分歧；不同輸入回報**恰好**是輸入開始不同的那一幀；輸出開關（逐幀切換）不造成分歧；
+  rollback 預演——在第 120 幀存檔、往前跑 40 幀、讀檔、**關閉輸出**用同樣的輸入重跑，逐幀指紋與不中斷的軌跡一致。
+
+### 18.7 `nes-app`：錄製、播放與被停用的功能
+
+**執行緒模型不變**：UI 執行緒只送 `EmuCommand`、收 `EmuEvent`；replay 的編碼、播放與驗證都在 emu 執行緒（`emu.rs` 的 `Emu`），檔案 I/O
+（rfd 對話框、`fs::write`）在 UI 執行緒。所有幀（計時器驅動或單步）都經過 `Emu::run_one_frame`，所以錄製一定記錄得到每一幀；**reset 只透過
+`FrameInput` 傳遞**（`EmuCommand::Reset` 只是設下一幀的 `reset` 旗標，暫停中排隊、下一幀才生效）。
+
+**選單**：`Emulation → Reset`（soft reset）；新選單 `Replay`：`Start Recording (重新開機)`、`Stop and Save Recording...`（rfd 存 `.replay`）、
+`Play Replay...`、`Stop Replay`、播放速度 `1x / 2x（靜音）/ 最快（靜音）`；`File → Save State to File...`（存成 `.state`，供
+`nes-test diff-state`）、`File → Save Recording As...`（使用者取消了存檔對話框時，錄好的 replay 保留在記憶體，可再存）。
+
+**開始錄製一定重新開機**（power-on），因為 replay 的起點是開機狀態：emu 執行緒用保存的 ROM 位元組重新 `Nes::from_rom`。選單項目的 tooltip 與說明文字
+明講這件事。
+
+**錄製與播放期間停用**（會破壞「從開機狀態依輸入序列執行」的前提）：讀取記憶體中的存檔（F9 與選單）、單步一條指令、trace、載入別的 ROM、
+（錄製時）開始另一份錄製或播放。**UI 與 emu 執行緒兩層都擋**：UI 把選單／按鈕設成 disabled 並附 tooltip 與說明文字（Debugger 面板顯示黃色說明），
+F9 快捷鍵則直接送 `LoadState`，由 emu 執行緒回報 `錄製中不能讀取存檔：它會破壞「從開機狀態依輸入序列執行」的前提`（狀態列紅字）。**暫停可用；
+「單步一幀」可用**（它就是一次 `run_frame`，錄製時會被記錄）；存檔（F5）可用（唯讀）。
+
+**播放**：重新開機、`ReplayPlayer` 驗證版本與 `rom_id`（不符時彈出可讀的錯誤，不進入播放）；**播放期間鍵盤輸入被忽略**（UI 不送 `SetInput`，
+emu 執行緒也忽略）；速度 1x（60.0988 Hz，有聲音）、2x（靜音）、最快（靜音；在 8 ms 的時間片內連續跑，只有每個時間片的第一幀開輸出，
+輸出不影響指紋所以不影響驗證）。狀態列顯示 `[錄製中] 第 N 幀（T 秒）`、`[播放中 1x] 第 n/N 幀｜檢查點 k/K 已驗證相符｜鍵盤輸入已停用`、
+`[播放完成] …`、`[檢查點不符] 第 F 幀；分歧發生在第 a–b 幀之間`，以及 `ROM <rom_id 前 16 字元>`（tooltip 顯示完整 32 字元）。**檢查點不符時立即暫停**，
+並彈出視窗顯示分歧的幀範圍與雙方指紋；播放完成也自動暫停。（狀態列用文字標記而不是符號字元，避免字型缺字顯示成方框。）
+
+**存成檔案供 `diff-state` 使用**：`File → Save State to File...`（`EmuCommand::ExportState`）。
+
+**自動化測試（`emu.rs`，不需要 GUI）**：錄製 → 停止 → 播放的完整往返（含 reset 確實作用在模擬上、播放時鍵盤輸入被忽略）；竄改輸入 → 不符事件的範圍
+包含該幀且自動暫停；錄製中／播放中每一種被停用的操作都被拒絕並說明原因、被拒絕的操作沒有多跑任何東西、錄下來的 replay 仍可完整重播；ROM 不符與壞檔案的
+可讀錯誤；一般執行時 reset 經 `FrameInput` 生效（排隊、下一幀才作用、只作用一次）；「最快」與 2x 播放驗證全部檢查點。
+**需要 GUI 才能確認的項目**（選單 disabled 的外觀與 tooltip、對話框、狀態列文字與顏色、彈出視窗、字型）**沒有宣稱驗證過**，見
+[`manual-test-phase4a.md`](manual-test-phase4a.md)。
+
+### 18.8 `nes-test` 子命令
+
+| 命令 | 內容 |
+|---|---|
+| `replay info <replay>` | header（格式版本、錄製時的核心版本與是否相符、`rom_id` 與前 16 字元）、總幀數與秒數、輸入段數、reset 次數與幀號、檢查點間隔與數量 |
+| `replay verify <rom> <replay>` | 驗證全部檢查點（關閉輸出）；通過 → 0（並印出耗時）；不符／拒絕／讀檔失敗 → 非 0，回報第一個不符的檢查點與分歧範圍 |
+| `replay generate <rom> <out>` | 從開機依偽隨機的雙人輸入腳本錄一份 replay（`--frames`、`--seed`、`--interval`、`--reset-at`，可重複）；測試與效能量測用 |
+| `diff-state <a> <b>` | 解碼兩份存檔，以 `serde_json::Value` 為中介逐欄位比對，輸出 `路徑: 左 vs 右`（例如 `ppu.v: 0x2104 vs 0x2105`）；大型陣列（RAM、VRAM、OAM、CHR-RAM、PRG-RAM）只列不同的**索引範圍**與首個差異，不傾印整個陣列；路徑省略 `cpu.bus.` 前綴；相同 → 0、有差異 → 1、無法解碼 → 2 |
+| `save-state <rom> <out>` | 從開機（可選 `--replay`，依它的輸入）跑到 `--frames` 幀後寫出存檔；用來產生 `diff-state` 的比對對象（例如與 GUI 在同一幀存的檔案） |
+| `info <rom>` | 新增 `rom_id` 一行（完整 32 字元與前 16 字元） |
+
+`nes-test` 新增一般依賴 `serde_json`（使用者已同意；它原本就是 `nes-core` 的 dev-dependency，`Cargo.lock` 已有）。
+
+### 18.9 實測紀錄（Phase 4a）
+
+以下都是實際執行的結果（Windows、release、同一台機器）：
+
+- **`behavior_fingerprint` 耗時**（`bench_run_frame`，每次呼叫）：`rendering_rom` 約 0.70–0.78 µs、`apu_probe_rom` 約 0.64–0.70 µs、Spacegulls（CHR-RAM
+  8 KB + PRG-RAM 8 KB）約 1.0–1.1 µs；對照 `state_hash`（先 postcard 序列化整個 `Nes` 再雜湊）約 10.3 µs／10.1 µs／15.8–17.2 µs，**指紋約快 15 倍**。
+  相對於一幀約 0.6–1.5 ms 的模擬成本，每幀算一次指紋（netplay 的 desync 偵測）可以忽略。
+- **replay 驗證模式 10000 幀**（`nes-test replay verify`，Spacegulls，關閉輸出）：8.27–8.51 s（三次，約 1175–1210 幀/秒；10000 幀約 166 秒的遊戲時間，
+  快約 20 倍）。5 分鐘（約 18000 幀）的 replay 驗證約需 15 秒。
+- **破壞性測試 1（竄改輸入）**：對 Spacegulls 的 10000 幀 replay 用外部腳本改單一幀的輸入（p1 XOR 0xFF）：第 3001 幀 → 回報第 3060 幀不符、範圍 3001–3060；
+  第 4321 幀 → 4380／4321–4380；第 9999 幀 → 10000／9961–10000；三次結束碼皆為 1，範圍都包含被竄改的幀。第 5000、5001 幀（reset 那一幀與之後）竄改後
+  **驗證仍通過**——遊戲在那兩幀沒有讀取輸入（reset 後的開機畫面），單一幀的輸入沒有在狀態裡留下任何痕跡；這是檢查點機制的**固有性質**（驗證的是
+  模擬狀態，不是輸入串流本身）。合成的輸入探針 ROM 每幀都會讀輸入並累積進 RAM，所以單元測試裡任何一幀（2–300）的竄改都被偵測到。
+- **破壞性測試 2（指紋漏欄位）**：暫時拿掉 `Ppu::fingerprint` 的 `v` → c（`tampering_one_field_per_category…` 的「PPU：loopy v」）失敗、c′ 失敗、d 失敗；
+  暫時拿掉 `Apu::fingerprint` 的 `frame_irq`（c 沒有列到的欄位）→ c 通過、**c′ 失敗並指出 `cpu.bus.apu.frame_irq`**、d 失敗。兩次都已還原。
+
+### 18.10 已知限制與後續
+
+- replay 只能從開機狀態開始；不支援含存檔的 replay（規則）。
+- 檢查點只能偵測「有沒有在該幀留下狀態差異」；被遊戲忽略的輸入不會被偵測（§18.9）。需要逐幀輸入雜湊時可以在 4b 的協定層做。
+- `nes-net` 的協定骨架仍是 `rom_hash: u64`，4b 實作握手時改用 `rom_id`（§15.5）。
+- 「單步一幀」錄製時可用；`Nes::step_instruction` 與 `load_state` 在錄製期間被拒絕，但 `nes-core` 本身不強制（呼叫端責任）；`ReplayRecorder` 只能靠
+  幀數對不上與 `NotPowerOn` 偵測誤用。
+- 播放時按 reset 會被拒絕（reset 來自 replay）。

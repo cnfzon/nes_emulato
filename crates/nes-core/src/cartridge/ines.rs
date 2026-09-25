@@ -16,7 +16,7 @@
 
 use super::{
     CHR_BANK_SIZE, CHR_RAM_SIZE, Cartridge, Cnrom, Mapper, Mirroring, Mmc1, Nrom, PRG_BANK_SIZE,
-    PRG_RAM_SIZE, RomInfo, Uxrom,
+    PRG_RAM_SIZE, RomId, RomInfo, Uxrom,
 };
 use crate::error::RomError;
 
@@ -85,10 +85,8 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
     };
     let prg_ram = vec![0u8; PRG_RAM_SIZE];
 
-    let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
-    hasher.update(&prg_rom);
-    hasher.update(&chr_rom);
-    let rom_hash = hasher.digest();
+    // 整個檔案（含 header 與 trainer）的識別碼，不只 PRG + CHR。
+    let rom_id = RomId::of_file(bytes);
 
     let mapper = match mapper_id {
         0 => Mapper::Nrom(Nrom::new(prg_rom_banks)),
@@ -114,7 +112,7 @@ pub fn parse(bytes: &[u8]) -> Result<Cartridge, RomError> {
         chr_ram,
         prg_ram,
         mapper,
-        rom_hash,
+        rom_id,
     })
 }
 
