@@ -1,7 +1,7 @@
 //! 真實 UDP 的整合測試（**唯一使用真實時間的測試**）。
 //!
 //! - `hello_roundtrip_over_udp`：兩個 [`UdpTransport`] 綁在 127.0.0.1，互傳一則編碼過的 `Hello`。
-//! - `two_udp_sessions_play_600_frames_and_end_with_identical_fingerprints`：兩個 `LockstepSession`
+//! - `two_udp_sessions_play_600_frames_and_end_with_identical_fingerprints`：兩個 `Session`
 //!   經由真實的 UDP socket 連線，各跑 600 幀，兩端逐幀指紋相同，且等於離線標準答案。
 //!
 //! # 為什麼這裡要用真實時間、逾時為什麼這麼寬鬆
@@ -24,7 +24,7 @@ use nes_core::RomId;
 use nes_core::test_support::input_probe_rom;
 use nes_net::sim::{Endpoint, expected_log};
 use nes_net::{
-    LockstepSession, Msg, SessionConfig, Transport, UdpTransport, protocol::PROTOCOL_VERSION,
+    Mode, Msg, Session, SessionConfig, Transport, UdpTransport, protocol::PROTOCOL_VERSION,
 };
 
 const HANG_GUARD: Duration = Duration::from_secs(60);
@@ -58,11 +58,21 @@ fn hello_roundtrip_over_udp() {
 
 #[test]
 fn two_udp_sessions_play_600_frames_and_end_with_identical_fingerprints() {
+    play_over_udp(Mode::Lockstep);
+}
+
+/// 規格 10h：rollback 模式、真實 UDP，600 幀，兩端（已確認幀的）指紋相同且等於離線重播。
+#[test]
+fn two_udp_sessions_play_600_frames_in_rollback_mode_with_identical_fingerprints() {
+    play_over_udp(Mode::Rollback);
+}
+
+fn play_over_udp(mode: Mode) {
     const FRAMES: u32 = 600;
     let rom = input_probe_rom();
     let rom_id = RomId::of_file(&rom);
     let script_seed = 0xFEED;
-    let delay = 2;
+    let delay = if mode == Mode::Rollback { 1 } else { 2 };
 
     let host_transport = UdpTransport::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let host_addr: SocketAddr =
@@ -70,14 +80,14 @@ fn two_udp_sessions_play_600_frames_and_end_with_identical_fingerprints() {
     let client_transport = UdpTransport::connect(host_addr).unwrap();
 
     let mut a = Endpoint::new(
-        LockstepSession::new(SessionConfig::host(rom_id, delay, 0xABCD)),
+        Session::new(SessionConfig::host(rom_id, delay, 0xABCD).with_mode(mode)),
         host_transport,
         &rom,
         script_seed,
         FRAMES,
     );
     let mut b = Endpoint::new(
-        LockstepSession::new(SessionConfig::client(rom_id)),
+        Session::new(SessionConfig::client(rom_id).with_input_delay(delay)),
         client_transport,
         &rom,
         script_seed,
@@ -103,22 +113,29 @@ fn two_udp_sessions_play_600_frames_and_end_with_identical_fingerprints() {
         }
     }
 
-    assert_eq!(a.frames(), FRAMES, "A 事件 {:?}", a.events);
-    assert_eq!(b.frames(), FRAMES, "B 事件 {:?}", b.events);
+    assert!(a.frames() >= FRAMES, "A 事件 {:?}", a.events);
+    assert!(b.frames() >= FRAMES, "B 事件 {:?}", b.events);
+    assert_eq!(a.exec_error, None);
+    assert_eq!(b.exec_error, None);
     let (la, lb) = (a.log.as_ref().unwrap(), b.log.as_ref().unwrap());
-    assert_eq!(la.fingerprints(), lb.fingerprints(), "兩端指紋必須逐幀相同");
+    // rollback 的已確認幀可能比目標多幾幀：只比對前 FRAMES 幀。
+    let upto = |l: &nes_net::matchlog::MatchLog| l.fingerprints()[..=FRAMES as usize].to_vec();
+    assert_eq!(upto(la), upto(lb), "兩端指紋必須逐幀相同");
     let expected = expected_log(&rom, script_seed, delay, FRAMES).unwrap();
-    assert_eq!(
-        la.fingerprints(),
-        expected.fingerprints(),
-        "必須等於離線重播"
+    assert_eq!(upto(la), expected.fingerprints(), "必須等於離線重播");
+    assert!(
+        !a.events
+            .iter()
+            .chain(&b.events)
+            .any(|e| matches!(e, nes_net::Event::Desync { .. })),
+        "不得有 desync"
     );
     assert_eq!(
         la.to_replay(FRAMES, 60).encode(),
         lb.to_replay(FRAMES, 60).encode()
     );
     println!(
-        "真實 UDP 600 幀：耗時 {:?}，A stall {} 次、B stall {} 次，A 送 {} 位元組",
+        "真實 UDP（{mode}）600 幀：耗時 {:?}，A stall {} 次、B stall {} 次，A 送 {} 位元組",
         start.elapsed(),
         a.session.stats().stalls,
         b.session.stats().stalls,

@@ -49,13 +49,21 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
   要等真實 socket 的測試（`UdpTransport`、`transport_roundtrip`、emu 執行緒的 loopback 測試）是少數例外，逾時只當卡死保護，並在文件說明。
 - 解碼一律回傳 `Result`，**任何位元組序列都不得 panic**；模擬網路需要的亂數用 `nes-net` 自己的固定種子 PRNG（`rng.rs`），不新增依賴。
 - netplay 的正確性以「等價性」驗證：連線兩端的行為指紋逐幀相同，且等於雙方輸入合併後離線重播的結果
-  （`nes-net/tests/equivalence.rs`、`nes-test netsim`）。改動 session／協定後這些測試必須通過。
+  （`nes-net/tests/equivalence.rs`、`nes-net/tests/rollback_equivalence.rs`、`nes-test netsim`）。改動 session／協定後這些測試必須通過。
+- rollback 的指紋**只能對「以已確認輸入模擬出來的幀」計算並對外送出**（`nes-net/src/rollback.rs` 的說明）；
+  對預測幀算指紋會在丟包時產生假 desync，`rollback_equivalence.rs` 的破壞性測試會抓到。
+- **新增 mapper 時必須正確宣告 `Mapper::observes_chr_reads()`**：會觀察 PPU CHR 讀取的 mapper（MMC3 的 A12 IRQ 計數、
+  MMC2／MMC4 的 tile latch）宣告 `true`，輸出關閉時才會走完整渲染路徑（`ppu/render.rs`）；宣告錯誤會讓 rollback 重跑與一般執行的
+  mapper 狀態分歧。同時要補該 mapper 的「輸出開／關指紋逐幀相同」測試（見 `output_switch_tests.rs`）。mapper 0–3 宣告 `false`。
+- `nes-core` 新增「不改變模擬行為」的 API（例如 `Nes::copy_state_from`）不需遞增 `CORE_BEHAVIOR_VERSION`，
+  但複製狀態的實作必須用不含 `..` 的完整解構（新增欄位時編譯器強迫決定複製或排除），並有還原等價測試。
 
 ## 測試基準與階段驗收
 
-- **目前基準（Phase 4b 結束）：396 通過 + 2 忽略**：nes-app 42、nes-core（lib）254 + 2 ignored、
-  nes-core `golden_frames` 1、nes-net（lib）37、nes-net `equivalence` 6、nes-net `handshake` 20、
-  nes-net `transport_roundtrip` 2、nes-test 34。
+- **目前基準（Phase 4c.1 結束）：446 通過 + 2 忽略**：nes-app 43、nes-core（lib）263 + 2 ignored、
+  nes-core `golden_frames` 1、nes-core `output_off_equivalence` 1、nes-net（lib）55、nes-net `equivalence` 6、nes-net `handshake` 24、
+  nes-net `rollback_equivalence` 13、nes-net `transport_roundtrip` 3、nes-test 37。
+  （Phase 4b 基準：396 通過 + 2 忽略；4c 移除了 `rollback.rs` 骨架的 3 個「回傳空結果」測試，改由規劃器的 15 個實測試取代。）
 - 每個階段結束時，以 `cargo test --workspace` 的**實際輸出**逐一列出每個執行檔的測試數量。**數量只能增加**；若有測試被移除或被 cfg 排除，必須說明理由。
 - 每個階段的驗收指令（全部要跑並回報結果）：
   1. `cargo build --workspace`
@@ -90,6 +98,12 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
   9. 網路模擬（Phase 4b 起）：`cargo run --release -p nes-test -- netsim <rom> --frames 3600 --runs 20`，
      另加 `--loss 10 --delay 100 --jitter 30` 與 `--loss 30 --delay 200 --jitter 80 --duplicate 5`；三種條件都必須「兩端相同、
      ＝離線重播、replay 位元組相同」全部通過（結束碼 0）。stall 與頻寬只回報，不設門檻（lockstep 在高延遲下本來就慢）。
+     Phase 4c 起再跑 rollback：`--mode rollback` 的同三種條件（另加 `--input-change-rate 0.5 --resets` 的最壞情況、
+     `--clock-skew 1` 的時鐘偏差），全部同樣必須通過；lockstep 對 rollback 的對照表用
+     `netsim <rom> --compare --runs 20`。
+  10. rollback 效能（Phase 4c 起）：`cargo run --release -p nes-test -- rollback-bench <rom> --depth 8`，回報
+     「最壞：一個節拍合計 K 幀（還原＋重跑＋新的一幀）」的 p50／p90／p99／p99.9／最大與一般幀基準（10000 個節拍），與幀預算
+     （16.64 ms）比較，目標 p99 < 預算；最大值超出時用「同工重跑」證明是否為雜訊；超出要如實說明，不得調整量測方式來湊。
 
 ## 建置與交付
 

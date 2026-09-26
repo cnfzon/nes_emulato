@@ -8,8 +8,8 @@ use nes_core::{Buttons, CORE_BEHAVIOR_VERSION, RomId};
 use nes_net::protocol::{DisconnectReason, MAX_INPUTS_PER_PACKET, PROTOCOL_VERSION};
 use nes_net::sim::{MatchConfig, expected_log, run_match};
 use nes_net::{
-    Datagram, EndReason, Event, InMemoryTransport, LockstepSession, Msg, NetworkConfig,
-    RejectReason, SessionConfig, SimulatedTransport, Status, Transport,
+    Datagram, EndReason, Event, InMemoryTransport, Mode, Msg, NetworkConfig, RejectReason, Session,
+    SessionConfig, SimulatedTransport, Status, Transport,
 };
 
 fn ms(n: u64) -> Duration {
@@ -24,8 +24,8 @@ type Sim = SimulatedTransport<InMemoryTransport>;
 
 /// 兩個 session（只有輸入，沒有 `Nes`）＋模擬網路＋虛擬時鐘。
 struct Pair {
-    host: LockstepSession,
-    client: LockstepSession,
+    host: Session,
+    client: Session,
     th: Sim,
     tc: Sim,
     now: Duration,
@@ -37,8 +37,8 @@ impl Pair {
     fn new(host: SessionConfig, client: SessionConfig, net: NetworkConfig, seed: u64) -> Self {
         let (a, b) = InMemoryTransport::pair();
         Self {
-            host: LockstepSession::new(host),
-            client: LockstepSession::new(client),
+            host: Session::new(host),
+            client: Session::new(client),
             th: SimulatedTransport::new(a, net, seed * 2),
             tc: SimulatedTransport::new(b, net, seed * 2 + 1),
             now: Duration::ZERO,
@@ -89,6 +89,7 @@ fn connected_event(events: &[Event]) -> Option<(u8, u8)> {
         Event::Connected {
             player,
             input_delay,
+            ..
         } => Some((*player, *input_delay)),
         _ => None,
     })
@@ -214,11 +215,11 @@ fn a_different_rom_is_rejected_with_the_reason() {
 fn the_host_keeps_waiting_after_a_rejection_and_accepts_a_good_client_later() {
     let (a, b) = InMemoryTransport::pair();
     let mut th = a;
-    let mut host = LockstepSession::new(SessionConfig::host(rom_id(), 2, 9));
+    let mut host = Session::new(SessionConfig::host(rom_id(), 2, 9));
     // 壞 client（ROM 不同）先來，被拒絕；好 client 再來（同一條線路）。
     let mut bad = SessionConfig::client(RomId::of_file(b"wrong"));
     bad.handshake_timeout = Some(ms(500));
-    let mut bad_client = LockstepSession::new(bad);
+    let mut bad_client = Session::new(bad);
     let mut tb = b;
     let mut now = Duration::ZERO;
     while now < ms(500) && !bad_client.is_ended() {
@@ -232,7 +233,7 @@ fn the_host_keeps_waiting_after_a_rejection_and_accepts_a_good_client_later() {
     ));
     assert_eq!(host.status(), Status::Waiting);
 
-    let mut good_client = LockstepSession::new(SessionConfig::client(rom_id()));
+    let mut good_client = Session::new(SessionConfig::client(rom_id()));
     while now < ms(2000) && !good_client.is_running() {
         host.poll(now, &mut th);
         good_client.poll(now, &mut tb);
@@ -269,8 +270,8 @@ fn a_lost_accept_is_recovered_because_the_host_answers_a_repeated_hello() {
     let (a, b) = InMemoryTransport::pair();
     let mut th = SimulatedTransport::new(a, NetworkConfig::IDEAL, 1);
     let mut tc = SimulatedTransport::new(b, NetworkConfig::IDEAL, 2);
-    let mut host = LockstepSession::new(SessionConfig::host(rom_id(), 2, 3));
-    let mut client = LockstepSession::new(SessionConfig::client(rom_id()));
+    let mut host = Session::new(SessionConfig::host(rom_id(), 2, 3));
+    let mut client = Session::new(SessionConfig::client(rom_id()));
     th.set_config(NetworkConfig::IDEAL.blackout());
     let mut now = Duration::ZERO;
     while now < ms(1000) {
@@ -351,8 +352,8 @@ fn a_third_party_hello_gets_room_full() {
         sent_to: Vec::new(),
     };
     let mut tc = b;
-    let mut host = LockstepSession::new(SessionConfig::host(rom_id(), 2, 1));
-    let mut client = LockstepSession::new(SessionConfig::client(rom_id()));
+    let mut host = Session::new(SessionConfig::host(rom_id(), 2, 1));
+    let mut client = Session::new(SessionConfig::client(rom_id()));
     let mut now = Duration::ZERO;
     while now < ms(500) && !(host.is_running() && client.is_running()) {
         host.poll(now, &mut th);
@@ -402,7 +403,7 @@ fn a_third_party_hello_gets_room_full() {
 fn a_hello_with_a_different_wire_version_is_rejected_readably() {
     let (a, mut b) = InMemoryTransport::pair();
     let mut th = a;
-    let mut host = LockstepSession::new(SessionConfig::host(rom_id(), 2, 1));
+    let mut host = Session::new(SessionConfig::host(rom_id(), 2, 1));
     let mut bytes = Msg::Hello {
         protocol_version: PROTOCOL_VERSION,
         core_behavior_version: CORE_BEHAVIOR_VERSION,
@@ -425,6 +426,167 @@ fn a_hello_with_a_different_wire_version_is_rejected_readably() {
         })
     );
     assert_eq!(host.status(), Status::Waiting);
+}
+
+/// v1（Phase 4b）的 Client 送 Hello：v2 房主用 **v1 的標頭**回覆 `Reject`，本體佈局與 v1 相同——
+/// 舊版程式解得出並顯示「協定版本不符：房主使用 v2，你使用 v1」。
+#[test]
+fn a_v1_client_is_rejected_with_a_reply_it_can_decode() {
+    let (a, mut b) = InMemoryTransport::pair();
+    let mut th = a;
+    let mut host = Session::new(SessionConfig::host(rom_id(), 2, 1).with_mode(Mode::Rollback));
+    // v1 的 Hello：標頭版本 1，本體（Hello 的欄位）與 v2 相同。
+    let mut hello = Msg::Hello {
+        protocol_version: 1,
+        core_behavior_version: CORE_BEHAVIOR_VERSION,
+        rom_id: rom_id(),
+    }
+    .encode()
+    .unwrap();
+    hello[4] = 1;
+    b.send(Duration::ZERO, &hello);
+    host.poll(Duration::ZERO, &mut th);
+    let replies = b.recv(Duration::ZERO);
+    assert_eq!(replies.len(), 1);
+    let bytes = &replies[0].data;
+    assert_eq!(
+        &bytes[..6],
+        &[b'N', b'E', b'S', b'N', 1, 0],
+        "標頭必須是 v1，舊版才接受"
+    );
+    // v1 程式的解碼：略過標頭後，本體是 Reject { ProtocolVersion { host: 2, client: 1 } }。
+    let mut as_v2 = bytes.clone();
+    as_v2[4] = PROTOCOL_VERSION as u8;
+    assert_eq!(
+        Msg::decode(&as_v2),
+        Ok(Msg::Reject {
+            reason: RejectReason::ProtocolVersion {
+                host: PROTOCOL_VERSION,
+                client: 1
+            }
+        })
+    );
+    assert_eq!(host.status(), Status::Waiting, "房主拒絕之後仍然等別人");
+}
+
+/// v2 的 Client 連上 v1 的房主：房主（v1）回的 `Reject` 標頭是 v1，v2 的 Client 要顯示易懂的原因，
+/// 而不是等到逾時。
+#[test]
+fn a_v2_client_shows_a_readable_reason_when_the_host_speaks_v1() {
+    let (mut a, b) = InMemoryTransport::pair();
+    let mut tb = b;
+    let mut client = Session::new(SessionConfig::client(rom_id()));
+    client.poll(Duration::ZERO, &mut tb); // 送出 Hello
+    // v1 房主的回覆：v1 標頭 + Reject { ProtocolVersion { host: 1, client: 2 } }。
+    let reject = Msg::Reject {
+        reason: RejectReason::ProtocolVersion {
+            host: 1,
+            client: PROTOCOL_VERSION,
+        },
+    }
+    .encode_with_version(1)
+    .unwrap();
+    a.send(Duration::ZERO, &reject);
+    client.poll(ms(1), &mut tb);
+    let reason = client.end_reason().expect("必須立刻結束，不是等逾時");
+    assert_eq!(
+        reason,
+        EndReason::Rejected(RejectReason::ProtocolVersion {
+            host: 1,
+            client: PROTOCOL_VERSION
+        })
+    );
+    let text = reason.to_string();
+    assert!(
+        text.contains("v1") && text.contains("v2") && text.contains("lockstep"),
+        "{text}"
+    );
+}
+
+/// 模式由房主決定、Client 跟隨；rollback 時各方的本地輸入延遲各自決定（不必一致），lockstep 則共用房主的。
+#[test]
+fn the_host_decides_the_mode_and_input_delays_are_local_in_rollback() {
+    let mut p = Pair::new(
+        SessionConfig::host(rom_id(), 3, 0x77).with_mode(Mode::Rollback),
+        SessionConfig::client(rom_id()).with_input_delay(0),
+        NetworkConfig::IDEAL,
+        1,
+    );
+    assert!(p.run_until(ms(500), Pair::connected));
+    assert_eq!(
+        (p.host.mode(), p.client.mode()),
+        (Mode::Rollback, Mode::Rollback)
+    );
+    assert_eq!((p.host.input_delay(), p.client.input_delay()), (3, 0));
+    assert!(matches!(
+        p.client_events
+            .iter()
+            .find(|e| matches!(e, Event::Connected { .. })),
+        Some(Event::Connected {
+            mode: Mode::Rollback,
+            input_delay: 0,
+            player: 1
+        })
+    ));
+    // 超過 rollback 上限（4）的設定被截斷。
+    let mut q = Pair::new(
+        SessionConfig::host(rom_id(), 8, 0x78).with_mode(Mode::Rollback),
+        SessionConfig::client(rom_id()).with_input_delay(8),
+        NetworkConfig::IDEAL,
+        2,
+    );
+    assert!(q.run_until(ms(500), Pair::connected));
+    assert_eq!((q.host.input_delay(), q.client.input_delay()), (4, 4));
+    // lockstep：Client 的設定被房主的覆蓋。
+    let mut l = Pair::new(
+        SessionConfig::host(rom_id(), 5, 0x79),
+        SessionConfig::client(rom_id()).with_input_delay(0),
+        NetworkConfig::IDEAL,
+        3,
+    );
+    assert!(l.run_until(ms(500), Pair::connected));
+    assert_eq!(
+        (l.host.mode(), l.client.mode()),
+        (Mode::Lockstep, Mode::Lockstep)
+    );
+    assert_eq!((l.host.input_delay(), l.client.input_delay()), (5, 5));
+}
+
+/// lockstep 也支援 Reset：任一方按下，雙方在同一幀拿到 `reset: true`。
+#[test]
+fn a_reset_pressed_by_either_side_reaches_both_in_lockstep() {
+    let mut p = Pair::ok(NetworkConfig::IDEAL, 1);
+    assert!(p.run_until(ms(500), Pair::connected));
+    let press = nes_net::PlayerInput::new(Buttons::A, true);
+    let mut seen = [None, None];
+    let mut frame = [0u32; 2]; // 各端已取得的幀數
+    for i in 0..40u32 {
+        let now = p.now;
+        // Client 在第 5 次取樣按 Reset。
+        if p.host.local_input_wanted() {
+            p.host.add_local_input(Buttons::empty());
+        }
+        if p.client.local_input_wanted() {
+            p.client.add_local_input(if i == 5 {
+                press
+            } else {
+                Buttons::empty().into()
+            });
+        }
+        for (k, s) in [&mut p.host, &mut p.client].into_iter().enumerate() {
+            if let Some(input) = s.next_ready_frame(now) {
+                if input.reset {
+                    seen[k].get_or_insert(frame[k]);
+                }
+                frame[k] += 1;
+            }
+        }
+        for _ in 0..20 {
+            p.step();
+        }
+    }
+    assert!(seen[0].is_some() && seen[1].is_some(), "{seen:?}");
+    assert_eq!(seen[0], seen[1], "雙方在同一幀 reset");
 }
 
 // ---- 垃圾封包、session_id、輸入的邊界 --------------------------------------------------
@@ -453,7 +615,10 @@ fn garbage_and_foreign_session_packets_are_ignored() {
         Msg::Input {
             session_id: 0xBAD,
             start_frame: 0,
-            inputs: vec![Buttons::all(); 4],
+            inputs: vec![Buttons::all().into(); 4],
+            sender_frame: 0,
+            frame_advantage: 0,
+            confirmed: None,
         },
         Msg::Checksum {
             session_id: 0xBAD,
@@ -486,7 +651,10 @@ fn a_hostile_input_packet_cannot_grow_memory_or_overflow() {
         let msg = Msg::Input {
             session_id: sid,
             start_frame: start,
-            inputs: vec![Buttons::all(); count],
+            inputs: vec![Buttons::all().into(); count],
+            sender_frame: u32::MAX,
+            frame_advantage: i8::MAX,
+            confirmed: None,
         };
         p.tc.send(p.now, &msg.encode().unwrap());
     }

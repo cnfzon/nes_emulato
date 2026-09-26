@@ -8,21 +8,42 @@
 //! - `replay info|verify|generate`：replay 檔案的檢視、驗證（全部檢查點）與產生（Phase 4a）。
 //! - `diff-state <a> <b>`：逐欄位比對兩份存檔，找出 desync 從哪個欄位開始。
 //! - `save-state <rom> <out>`：跑到指定幀（可依 replay 輸入）後寫出存檔，供 `diff-state` 使用。
-//! - `netsim <rom>`：無視窗的網路模擬（兩個 lockstep session、虛擬時鐘、可調丟包／延遲／抖動／重複），
-//!   驗證連線兩端與離線重播逐幀相同，並輸出 stall 與頻寬（Phase 4b）。
+//! - `netsim <rom>`：無視窗的網路模擬（兩個 session、虛擬時鐘、可調丟包／延遲／抖動／重複；`--mode lockstep|rollback`），
+//!   驗證連線兩端與離線重播逐幀相同，並輸出 stall、rollback 統計與頻寬（Phase 4b／4c）；`--compare` 產生
+//!   lockstep 對 rollback 的對照表。
+//! - `rollback-bench <rom>`：量測「重跑 K 幀」的耗時（是否在幀預算之內）。
 
 mod blargg;
 mod diff_state;
 mod nestest_log;
 mod netsim_cmd;
 mod png;
+#[cfg(feature = "profile")]
+mod profile_cmd;
 mod replay_cmd;
+mod rollback_bench;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// `netsim --mode` 的選項。
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ModeArg {
+    Lockstep,
+    Rollback,
+}
+
+impl From<ModeArg> for nes_net::Mode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Lockstep => nes_net::Mode::Lockstep,
+            ModeArg::Rollback => nes_net::Mode::Rollback,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -82,8 +103,8 @@ enum Command {
         #[arg(long)]
         frames: Option<u32>,
     },
-    /// 無視窗的網路模擬：兩個 lockstep session 經由模擬網路（虛擬時鐘）連線，用腳本化輸入跑指定幀數，
-    /// 驗證兩端逐幀指紋相同、且等於離線重播，並輸出 stall 與頻寬（表格格式）。
+    /// 無視窗的網路模擬：兩個 session（lockstep 或 rollback）經由模擬網路（虛擬時鐘）連線，用腳本化輸入
+    /// 跑指定幀數，驗證兩端逐幀（已確認幀）指紋相同、且等於離線重播，並輸出 stall、rollback 統計與頻寬（表格格式）。
     /// 結束碼：全部通過 0、有失敗 1、ROM 讀不了 2。
     Netsim {
         rom: PathBuf,
@@ -107,9 +128,9 @@ enum Command {
         /// 跑幾組連續的種子。
         #[arg(long, default_value_t = 1)]
         runs: u64,
-        /// input delay（0–8）。
-        #[arg(long, default_value_t = 2)]
-        input_delay: u8,
+        /// input delay：lockstep 0–8（預設 2，雙方共用）；rollback 0–4（預設 1，各方自己的本地輸入延遲）。
+        #[arg(long)]
+        input_delay: Option<u8>,
         /// 關閉冗餘傳送（只用於比較實驗：仍然正確，但 stall 增加）。
         #[arg(long)]
         no_redundancy: bool,
@@ -119,6 +140,49 @@ enum Command {
         /// 從虛擬時間第 N 秒起丟棄所有封包（斷線實驗；此時「完成」欄會是「否」）。
         #[arg(long)]
         blackout_at: Option<f64>,
+        /// 連線模式。
+        #[arg(long, value_enum, default_value_t = ModeArg::Lockstep)]
+        mode: ModeArg,
+        /// rollback 的預測視窗 K（1–32）：目前幀最多領先已確認幀幾幀，之後暫停推進。
+        #[arg(long, default_value_t = 8)]
+        window: u32,
+        /// 端點 B 的幀時鐘比 A 快的百分比（負數＝慢）；用來驗證 rollback 的時間同步。
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        clock_skew: f64,
+        /// 腳本輸入變化的頻率（0–1）：每 round(1/頻率) 次取樣換一次按鍵。1＝每幀都換，0.5＝每 2 幀，
+        /// 0.333（預設）＝每 3 幀。越高預測失誤越多（最壞情況）。
+        #[arg(long, default_value_t = 1.0 / 3.0)]
+        input_change_rate: f64,
+        /// 關閉 rollback 的時間同步（只用於比較實驗）。
+        #[arg(long)]
+        no_time_sync: bool,
+        /// 腳本裡包含 Reset（每位玩家平均每 400 次取樣一次；雙方在同一幀 soft reset）。
+        #[arg(long)]
+        resets: bool,
+        /// 對照表：4b 的三種網路條件（忽略 --loss/--delay/--jitter/--duplicate），lockstep 與 rollback 並排，
+        /// 各跑 --runs 組種子。
+        #[arg(long)]
+        compare: bool,
+    },
+    /// 量測 rollback 的重跑成本：在真實 ROM 上，還原到 K 幀之前並重跑 K 幀（輸出關閉）再推進新的一幀，
+    /// 與一幀的時間預算（16.64 ms）比較，回報平均與最大耗時。用 `--release` 才有意義。
+    RollbackBench {
+        rom: PathBuf,
+        /// 重跑的深度（預測視窗 K）。
+        #[arg(long, default_value_t = 8)]
+        depth: u32,
+        /// 量測幾次。
+        #[arg(long, default_value_t = 10000)]
+        iterations: u32,
+    },
+    /// 剖析：把「重跑一幀（輸出關閉）」的時間分配到 PPU（時序迴圈／掃描線渲染）、APU、mapper 與其餘（CPU＋匯流排）。
+    /// 需要 `--features profile` 建置。
+    #[cfg(feature = "profile")]
+    RollbackProfile {
+        rom: PathBuf,
+        /// 取樣幾個遊戲中的幀。
+        #[arg(long, default_value_t = 1000)]
+        frames: u32,
     },
     /// 執行 blargg 測試 ROM（`$6000` 結果協定）並回報 pass/fail。
     Blargg {
@@ -202,6 +266,13 @@ fn main() -> ExitCode {
             no_redundancy,
             script_seed,
             blackout_at,
+            mode,
+            window,
+            clock_skew,
+            input_change_rate,
+            no_time_sync,
+            resets,
+            compare,
         } => netsim_cmd::run(&netsim_cmd::Args {
             rom: &rom,
             frames,
@@ -215,7 +286,21 @@ fn main() -> ExitCode {
             no_redundancy,
             script_seed,
             blackout_at,
+            mode: mode.into(),
+            window,
+            clock_skew,
+            input_change_rate,
+            no_time_sync,
+            resets,
+            compare,
         }),
+        #[cfg(feature = "profile")]
+        Command::RollbackProfile { rom, frames } => profile_cmd::run(&rom, frames),
+        Command::RollbackBench {
+            rom,
+            depth,
+            iterations,
+        } => rollback_bench::run(&rom, depth, iterations),
         Command::SaveState {
             rom,
             out,

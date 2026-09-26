@@ -14,3 +14,7 @@ log = "0.4.34"
 nes-core = { version = "0.1.0", path = "../nes-core", features = ["testing"] }
 nes-net = { version = "0.1.0", path = "../nes-net" }
 serde_json = "1.0.151"
+
+[features]
+# 剖析用：啟用 nes-core 的 `profile` 元件隔離方法與 `rollback-profile` 子命令（預設不編譯）。
+profile = ["nes-core/profile"]

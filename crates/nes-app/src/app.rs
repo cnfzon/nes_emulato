@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use nes_core::{Buttons, DebugSnapshot, PpuViews, ReplayMismatch, RomId, RomInfo};
+use nes_net::Mode;
 
 use crate::audio::AudioOutput;
 use crate::commands::{
@@ -26,8 +27,9 @@ const RESTRICTED_WHILE_REPLAY: &str = "錄製／播放 replay 中停用：讀取
      錄出來的 replay 之後就無法重播。暫停與「單步一幀」仍可用（單步的幀會被錄進 replay）。";
 
 /// Netplay 期間停用的功能與原因（選單提示、Debugger 面板共用）。
-const RESTRICTED_WHILE_NETPLAY: &str = "Netplay 中停用：讀取存檔（F9）、單步指令、Trace、載入別的 ROM、暫停、Reset、錄製／播放 replay。\
+const RESTRICTED_WHILE_NETPLAY: &str = "Netplay 中停用：讀取存檔（F9）、單步指令、Trace、載入別的 ROM、暫停、錄製／播放 replay。\
      原因：這些操作只發生在你這一端，會讓雙方的模擬分歧（同步暫停與讀檔留待之後評估）。\
+     Reset 可用：它是輸入的一部分，任一方按下，雙方會在同一幀重置。\
      存檔仍可用：F5 存到記憶體、File → Save State to File 存成檔案，方便除錯。";
 
 /// 預設的 Netplay 監聽 port。
@@ -104,8 +106,12 @@ pub struct NesApp {
     net_port_text: String,
     net_addr_text: String,
     net_form_error: Option<String>,
-    /// 房主決定的 input delay（0–8）；加入者使用房主的值。
+    /// 房主選的連線模式（加入者跟隨房主）。
+    net_mode: Mode,
+    /// lockstep：房主決定的共用 input delay（0–8）。rollback：這一方的本地 input delay（0–4）。
     net_input_delay: u8,
+    /// rollback 的預測視窗 K（1–32）。
+    net_window: u32,
     net_result: Option<NetResult>,
 }
 
@@ -153,7 +159,9 @@ impl NesApp {
             net_port_text: DEFAULT_NET_PORT.to_string(),
             net_addr_text: String::new(),
             net_form_error: None,
-            net_input_delay: nes_net::DEFAULT_INPUT_DELAY,
+            net_mode: Mode::Rollback,
+            net_input_delay: nes_net::rollback::DEFAULT_INPUT_DELAY,
+            net_window: nes_net::rollback::DEFAULT_WINDOW,
             net_result: None,
         }
     }
@@ -539,17 +547,63 @@ impl NesApp {
                 ui.close();
             }
             ui.horizontal(|ui| {
+                ui.label("模式（房主決定）");
+                for (mode, label, tip) in [
+                    (
+                        Mode::Rollback,
+                        "rollback",
+                        "本地輸入立即套用，對方輸入先預測；預測錯了就還原並重跑。高延遲下手感好、幀率穩定。",
+                    ),
+                    (
+                        Mode::Lockstep,
+                        "lockstep",
+                        "雙方輸入到齊才推進。沒有預測與重跑，但延遲高時幀率會下降。",
+                    ),
+                ] {
+                    if ui
+                        .add_enabled(idle, egui::RadioButton::new(self.net_mode == mode, label))
+                        .on_hover_text(tip)
+                        .clicked()
+                        && self.net_mode != mode
+                    {
+                        self.net_mode = mode;
+                        // 兩種模式的預設與上限不同。
+                        self.net_input_delay = match mode {
+                            Mode::Rollback => nes_net::rollback::DEFAULT_INPUT_DELAY,
+                            Mode::Lockstep => nes_net::DEFAULT_INPUT_DELAY,
+                        };
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
                 ui.label("Input delay（幀）");
+                let max = match self.net_mode {
+                    Mode::Rollback => nes_net::rollback::MAX_INPUT_DELAY,
+                    Mode::Lockstep => nes_net::MAX_INPUT_DELAY,
+                };
+                self.net_input_delay = self.net_input_delay.min(max);
                 ui.add_enabled(
                     idle,
-                    egui::DragValue::new(&mut self.net_input_delay)
-                        .range(0..=nes_net::MAX_INPUT_DELAY),
+                    egui::DragValue::new(&mut self.net_input_delay).range(0..=max),
                 )
                 .on_hover_text(
-                    "本地按鍵套用在 N 幀之後。越大越不容易 stall，但操作越延遲（2 幀約 33 ms）。",
+                    "本地按鍵套用在 N 幀之後（1 幀約 16.6 ms）。lockstep：越大越不容易 stall；rollback：越大越不容易預測失誤，但操作越延遲。",
                 );
             });
-            ui.weak("只有房主的設定有效；加入者使用房主決定的值");
+            ui.horizontal(|ui| {
+                ui.label("預測視窗 K（幀，rollback）");
+                ui.add_enabled(
+                    idle && self.net_mode == Mode::Rollback,
+                    egui::DragValue::new(&mut self.net_window)
+                        .range(1..=nes_net::rollback::MAX_WINDOW),
+                )
+                .on_hover_text(
+                    "目前幀最多領先「雙方輸入都已確認的幀」K 幀，之後暫停等待（退化成 lockstep 的等待）。K 越大越能吸收網路延遲，但重跑越深。",
+                );
+            });
+            ui.weak(
+                "模式由房主決定，加入者跟隨；rollback 的 input delay 與 K 是各自的本地設定，lockstep 的 input delay 用房主的。",
+            );
             ui.separator();
             let cancel_label = match self.net.phase {
                 NetPhase::Idle | NetPhase::Waiting { .. } | NetPhase::Connecting { .. } => "取消",
@@ -582,19 +636,37 @@ impl NesApp {
             NetPhase::Connected {
                 player,
                 input_delay,
+                mode,
             } => {
                 let s = &self.net.stats;
                 let ping = s.rtt.map_or("—".to_string(), |r| {
                     format!("{:.0} ms", r.as_secs_f64() * 1000.0)
                 });
-                format!(
-                    "[Netplay] 已連線｜你是玩家 {}｜ping {ping}｜input delay {input_delay}｜stall {} 次（{:.1} 秒）｜↑{} ↓{} B/s",
-                    player + 1,
+                let head = format!(
+                    "[Netplay {mode}] 已連線｜你是玩家 {}｜ping {ping}｜input delay {input_delay}",
+                    player + 1
+                );
+                let stall = format!(
+                    "stall {} 次（{:.1} 秒）",
                     s.stalls,
-                    s.stall_time.as_secs_f64(),
-                    s.send_bytes_per_sec,
-                    s.recv_bytes_per_sec,
-                )
+                    s.stall_time.as_secs_f64()
+                );
+                match &s.rollback {
+                    // rollback：狀態列只放最重要的幾項（完整的疊加層留到 4d）。
+                    Some(rb) => format!(
+                        "{head}｜rollback {:.1} 次/秒（深度 平均 {:.1}／最大 {}）｜幀差 {:+.1}｜預測準確率 {}｜{stall}",
+                        rb.rollbacks_per_sec,
+                        rb.avg_depth,
+                        rb.max_depth,
+                        rb.frame_advantage,
+                        rb.prediction_accuracy()
+                            .map_or("—".to_string(), |a| format!("{:.0}%", a * 100.0)),
+                    ),
+                    None => format!(
+                        "{head}｜{stall}｜↑{} ↓{} B/s",
+                        s.send_bytes_per_sec, s.recv_bytes_per_sec,
+                    ),
+                }
             }
         };
         ui.separator();
@@ -624,7 +696,10 @@ impl NesApp {
                                     .desired_width(70.0),
                             );
                         });
-                        ui.label(format!("Input delay：{} 幀（Netplay 選單可調整）", self.net_input_delay));
+                        ui.label(format!(
+                            "模式：{}｜Input delay：{} 幀｜預測視窗 K：{}（Netplay 選單可調整）",
+                            self.net_mode, self.net_input_delay, self.net_window
+                        ));
                         ui.weak(
                             "把你的區網 IP（命令提示字元執行 ipconfig，看「IPv4 位址」）與這個 port 告訴對方。\
                              Windows 防火牆第一次跳出提示時，請允許存取（私人網路）。",
@@ -639,7 +714,16 @@ impl NesApp {
                                     .desired_width(180.0),
                             );
                         });
-                        ui.weak("你是玩家 2；雙方必須載入同一份 ROM，input delay 由房主決定。");
+                        ui.horizontal(|ui| {
+                            ui.label("Input delay（幀）");
+                            ui.add(egui::DragValue::new(&mut self.net_input_delay).range(
+                                0..=nes_net::MAX_INPUT_DELAY,
+                            ));
+                        });
+                        ui.weak(
+                            "你是玩家 2；雙方必須載入同一份 ROM，連線模式由房主決定。\
+                             rollback 時用這裡的 input delay（0–4）與 Netplay 選單的預測視窗 K；lockstep 時 input delay 由房主決定。",
+                        );
                     }
                 }
                 if let Some(err) = &self.net_form_error {
@@ -678,7 +762,9 @@ impl NesApp {
                     .map_err(|_| "port 必須是 0–65535 的整數（例如 7000）".to_string())?;
                 let _ = self.cmd_tx.send(EmuCommand::NetHost {
                     port,
+                    mode: self.net_mode,
                     input_delay: self.net_input_delay,
+                    window: self.net_window,
                     replay_dir,
                 });
             }
@@ -686,7 +772,12 @@ impl NesApp {
                 let addr: SocketAddr = self.net_addr_text.trim().parse().map_err(|_| {
                     "格式必須是「IP:port」，例如 192.168.1.10:7000（要包含 port）".to_string()
                 })?;
-                let _ = self.cmd_tx.send(EmuCommand::NetJoin { addr, replay_dir });
+                let _ = self.cmd_tx.send(EmuCommand::NetJoin {
+                    addr,
+                    input_delay: self.net_input_delay,
+                    window: self.net_window,
+                    replay_dir,
+                });
             }
         }
         Ok(())
@@ -855,14 +946,14 @@ impl eframe::App for NesApp {
                     }
                     if ui
                         .add_enabled(
-                            self.rom_info.is_some() && !self.playing() && !self.netplaying(),
+                            self.rom_info.is_some() && !self.playing(),
                             egui::Button::new("Reset (soft reset)"),
                         )
                         .on_hover_text(
-                            "soft reset：CPU/PPU/APU 重置，RAM 保留；錄製時會記進 replay（reset 是輸入的一部分）",
+                            "soft reset：CPU/PPU/APU 重置，RAM 保留；錄製時會記進 replay（reset 是輸入的一部分）。Netplay 中任一方按下，雙方在同一幀重置",
                         )
                         .on_disabled_hover_text(
-                            "需要載入 ROM；播放 replay 時 reset 來自 replay；Netplay 中停用（reset 不是同步輸入的一部分）",
+                            "需要載入 ROM；播放 replay 時 reset 來自 replay",
                         )
                         .clicked()
                     {

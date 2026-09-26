@@ -40,6 +40,14 @@ impl MatchLog {
         true
     }
 
+    /// 直接加入一個已確認的幀（rollback：最終的雙方輸入，以及以這些輸入模擬出的、該幀結束後的指紋）。
+    /// 與 [`Self::record`] 不同，這裡沒有 `Nes` 可以核對幀數，由呼叫端（規劃器的 `drain_confirmed`，
+    /// 保證依序、每幀一次）負責。
+    pub fn push(&mut self, input: FrameInput, fingerprint: u64) {
+        self.inputs.push(input);
+        self.fingerprints.push(fingerprint);
+    }
+
     pub fn frames(&self) -> u32 {
         self.inputs.len() as u32
     }

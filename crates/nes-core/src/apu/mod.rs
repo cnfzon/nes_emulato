@@ -140,6 +140,32 @@ impl Apu {
         apu
     }
 
+    /// 把 `src` 的**模擬狀態**複製進 `self`（見 `Nes::copy_state_from`）。不動輸出管線 `out`。
+    /// 解構時不用 `..`：新增欄位時編譯器會強迫這裡決定「複製」或「排除」。
+    pub(crate) fn copy_state_from(&mut self, src: &Apu) {
+        let Apu {
+            pulse,
+            triangle,
+            noise,
+            dmc,
+            frame,
+            frame_irq,
+            cycles,
+            ahead,
+            dmc_stall,
+            out: _,
+        } = src;
+        self.pulse.clone_from(pulse);
+        self.triangle.clone_from(triangle);
+        self.noise.clone_from(noise);
+        self.dmc.clone_from(dmc);
+        self.frame.clone_from(frame);
+        self.frame_irq = *frame_irq;
+        self.cycles = *cycles;
+        self.ahead = *ahead;
+        self.dmc_stall = *dmc_stall;
+    }
+
     /// 行為指紋（`docs/architecture.md` §18.2）。排除 `out`（輸出管線）。
     pub(crate) fn fingerprint(&self, h: &mut Fp) {
         for pulse in &self.pulse {

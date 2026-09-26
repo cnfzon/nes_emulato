@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use nes_core::{Buttons, ReplayMismatch, RomId, RomInfo};
-use nes_net::Stats;
+use nes_net::{Mode, Stats};
 
 /// replay 播放速度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,17 +68,24 @@ pub enum EmuCommand {
         path: PathBuf,
     },
     /// Netplay：建立房間（Host＝玩家 1）。在 `port` 監聽（0＝系統挑一個，實際的 port 由
-    /// [`NetPhase::Waiting`] 回報），等對手連上。`input_delay`（0–8）由房主決定。**會重新開機**
-    /// （連線成功時），所以 Netplay 期間停用讀檔、單步、trace、載入 ROM、暫停、reset
-    ///（單方面做這些會讓雙方的模擬分歧）。每場連線自動錄成 replay，存在 `replay_dir`。
+    /// [`NetPhase::Waiting`] 回報），等對手連上。`mode` 由房主決定（lockstep 或 rollback）。
+    /// `input_delay`：lockstep 是雙方共用的輸入延遲（0–8，由房主決定）；rollback 是這一方的本地輸入延遲（0–4）。
+    /// `window`：rollback 的預測視窗 K。**會重新開機**（連線成功時），所以 Netplay 期間停用讀檔、單步、
+    /// trace、載入 ROM、暫停（單方面做這些會讓雙方的模擬分歧）；Reset 是輸入的一部分，雙方同一幀執行。
+    /// 每場連線自動錄成 replay，存在 `replay_dir`。
     NetHost {
         port: u16,
+        mode: Mode,
         input_delay: u8,
+        window: u32,
         replay_dir: PathBuf,
     },
-    /// Netplay：加入房間（Client＝玩家 2），對端是房主的 `addr`。input delay 由房主決定。
+    /// Netplay：加入房間（Client＝玩家 2），對端是房主的 `addr`。模式由房主決定；rollback 時
+    /// `input_delay`（0–4）與 `window` 是這一方自己的設定，lockstep 時輸入延遲由房主決定。
     NetJoin {
         addr: SocketAddr,
+        input_delay: u8,
+        window: u32,
         replay_dir: PathBuf,
     },
     /// 取消等待／中斷連線。
@@ -124,7 +131,11 @@ pub enum NetPhase {
     /// 加入者：送 Hello 中。
     Connecting { addr: SocketAddr },
     /// 已連線，正在對戰。`player`：0＝玩家 1、1＝玩家 2。
-    Connected { player: u8, input_delay: u8 },
+    Connected {
+        player: u8,
+        input_delay: u8,
+        mode: Mode,
+    },
     /// 主動中斷，等對方回覆。
     Closing,
 }

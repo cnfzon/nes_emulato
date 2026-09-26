@@ -137,6 +137,38 @@ impl Bus {
         false
     }
 
+    /// 把 `src` 的**模擬狀態**複製進 `self`（見 `Nes::copy_state_from`）。解構時不用 `..`：
+    /// 新增欄位時編譯器會強迫這裡決定「複製」或「排除」。
+    pub(crate) fn copy_state_from(&mut self, src: &Bus) {
+        let Bus {
+            ram,
+            ppu,
+            apu,
+            cartridge,
+            joypads,
+            total_cycles,
+            open_bus,
+            pending_oam_dma,
+            #[cfg(test)]
+            test_flat_ram,
+            #[cfg(test)]
+            test_access_log,
+        } = src;
+        self.ram.clone_from(ram);
+        self.ppu.copy_state_from(ppu);
+        self.apu.copy_state_from(apu);
+        self.cartridge.copy_state_from(cartridge);
+        self.joypads = *joypads;
+        self.total_cycles = *total_cycles;
+        self.open_bus = *open_bus;
+        self.pending_oam_dma = *pending_oam_dma;
+        #[cfg(test)]
+        {
+            self.test_flat_ram.clone_from(test_flat_ram);
+            self.test_access_log.clone_from(test_access_log);
+        }
+    }
+
     /// 行為指紋（`docs/architecture.md` §18.2）：匯流排自己的狀態、RAM、搖桿、PPU、APU、卡帶。
     pub(crate) fn fingerprint(&self, h: &mut Fp) {
         h.u64(self.total_cycles);

@@ -33,6 +33,12 @@ pub enum Mapper {
     Cnrom(Cnrom),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 只給測試：強制 [`Mapper::observes_chr_reads`] 回傳 `true`，驗證「宣告為是的 mapper 走完整渲染路徑」。
+    pub(crate) static OBSERVE_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// 一個 mapper 除錯資訊的列：`(名稱, 內容)`。
 pub type DebugRow = (String, String);
 
@@ -63,6 +69,23 @@ impl Mapper {
             Mapper::Mmc1(_) => 1,
             Mapper::Uxrom(_) => 2,
             Mapper::Cnrom(_) => 3,
+        }
+    }
+
+    /// 這個 mapper 會不會**觀察 PPU 的 CHR 讀取**（例如 MMC3 靠 PPU 位址線 A12 的邊緣計數 scanline IRQ、
+    /// MMC2／MMC4 靠讀到特定 tile 切換 CHR bank 的 latch）。
+    ///
+    /// 為 `true` 時，PPU 讀哪些 CHR 位址、依什麼順序讀，本身就是會改變 mapper 狀態的事件，所以
+    /// **輸出關閉時也必須走完整的渲染路徑**（`ppu/render.rs`：輸出關閉時「略過背景與非 sprite 0 精靈」的優化
+    /// 只在這裡回傳 `false` 時才生效）。mapper 0–3（NROM／MMC1／UxROM／CNROM）的 `read_chr` 是純函式，回傳 `false`。
+    /// **新增 mapper 時必須正確宣告**（`CLAUDE.md`、`docs/architecture.md` §20.13）。
+    pub fn observes_chr_reads(&self) -> bool {
+        #[cfg(test)]
+        if OBSERVE_OVERRIDE.with(std::cell::Cell::get) {
+            return true;
+        }
+        match self {
+            Mapper::Nrom(_) | Mapper::Mmc1(_) | Mapper::Uxrom(_) | Mapper::Cnrom(_) => false,
         }
     }
 

@@ -82,6 +82,25 @@ impl Cartridge {
         ines::parse(bytes)
     }
 
+    /// 把 `src` 的**可變狀態**（mapper 暫存器、CHR-RAM、PRG-RAM）複製進 `self`（見 `Nes::copy_state_from`）。
+    /// 靜態的 PRG-ROM／CHR-ROM 不複製（呼叫端保證是同一份 ROM）。解構時不用 `..`。
+    pub(crate) fn copy_state_from(&mut self, src: &Cartridge) {
+        let Cartridge {
+            info,
+            prg_rom: _,
+            chr_rom: _,
+            chr_ram,
+            prg_ram,
+            mapper,
+            rom_id,
+        } = src;
+        self.info.clone_from(info);
+        self.chr_ram.clone_from(chr_ram);
+        self.prg_ram.clone_from(prg_ram);
+        self.mapper.clone_from(mapper);
+        self.rom_id = *rom_id;
+    }
+
     /// 行為指紋（`docs/architecture.md` §18.2）：mapper 暫存器、CHR-RAM、PRG-RAM。
     /// 排除靜態的 PRG-ROM／CHR-ROM 與 iNES header 中繼資料（由 `rom_id` 識別）。
     pub(crate) fn fingerprint(&self, h: &mut crate::fingerprint::Fp) {

@@ -641,3 +641,88 @@ pub fn rendering_rom() -> Vec<u8> {
         false,
     )
 }
+
+/// **SMB 式畫面分割**的合成 ROM：主迴圈輪詢 sprite 0 hit（`$2002` bit 6），命中之後立刻改寫水平捲動
+/// （狀態列固定、其下捲動），NMI 處理常式每幀重設捲動並把 `$2002`（含 sprite overflow）存起來。
+///
+/// - 精靈 0 在 (Y=39, X=100)，背景是不透明的格子圖案，所以 sprite 0 hit 每幀都會發生；
+///   另外 9 個精靈擠在同一條掃描線（Y=39）造成 sprite overflow。
+/// - RAM：`$00` ＝ NMI 次數（同時是命中後寫進去的捲動值）、`$01` ＝ 命中次數、`$02` ＝ 等待命中時的迴圈計數
+///   （**反映 hit 的時序：hit 差一個 dot，計數就可能不同**）、`$03` ＝ NMI 裡讀到的 `$2002`。
+///
+/// 給「輸出開關（rollback 重跑關閉輸出）不影響行為」的測試用：輸出關閉時 PPU 只畫 sprite 0 並略過背景，
+/// 若略過的部分影響了 hit 或 overflow，RAM 與指紋就會不同。
+pub fn sprite0_split_rom() -> Vec<u8> {
+    const PALETTE: [u8; 32] = [
+        0x0F, 0x16, 0x2A, 0x30, 0x0F, 0x11, 0x21, 0x31, 0x0F, 0x15, 0x25, 0x35, 0x0F, 0x19, 0x29,
+        0x39, 0x0F, 0x06, 0x1A, 0x30, 0x0F, 0x12, 0x22, 0x32, 0x0F, 0x14, 0x24, 0x34, 0x0F, 0x18,
+        0x28, 0x38,
+    ];
+    // (Y, tile, attr, X)：sprite 0，再加 9 個同一條線上的精靈（overflow）。
+    const SPRITES: [u8; 40] = [
+        39, 5, 0x00, 100, 39, 3, 0x00, 8, 39, 3, 0x00, 24, 39, 3, 0x00, 40, 39, 3, 0x00, 56, 39, 3,
+        0x00, 72, 39, 3, 0x00, 140, 39, 3, 0x00, 156, 39, 3, 0x00, 172, 39, 3, 0x00, 188,
+    ];
+    const PALETTE_ADDR: u16 = 0x8200;
+    const SPRITE_ADDR: u16 = 0x8240;
+    const NMI_ADDR: u16 = 0x8100;
+
+    let mut a = Asm::new(0x8000);
+    a.sei().cld().ldx_imm(0xFF).txs();
+    a.set_ppu_addr(0x3F00).ldx_imm(0);
+    let l = a.pc();
+    a.lda_abs_x(PALETTE_ADDR)
+        .sta_abs(0x2007)
+        .inx()
+        .cpx_imm(32)
+        .bne(l);
+    a.set_ppu_addr(0x2000).ldx_imm(0);
+    let l = a.pc();
+    a.txa().and_imm(0x07).sta_abs(0x2007).inx().bne(l);
+    let l = a.pc();
+    a.txa().and_imm(0x07).sta_abs(0x2007).inx().bne(l);
+    a.set_ppu_addr(0x23C0).ldx_imm(0);
+    let l = a.pc();
+    a.txa().sta_abs(0x2007).inx().cpx_imm(64).bne(l);
+    a.lda_imm(0).sta_abs(0x2003).ldx_imm(0);
+    let l = a.pc();
+    a.lda_abs_x(SPRITE_ADDR)
+        .sta_abs(0x2004)
+        .inx()
+        .cpx_imm(40)
+        .bne(l);
+    a.lda_imm(0).sta_abs(0x2005).sta_abs(0x2005);
+    a.lda_imm(0x80).sta_abs(0x2000);
+    a.lda_imm(0x1E).sta_abs(0x2001);
+
+    // 主迴圈：等 sprite 0 hit 旗標被清掉（pre-render 行），再等它被設起來，然後改寫捲動。
+    let top = a.pc();
+    a.bit_abs(0x2002).bvs(top);
+    let wait_hit = a.pc();
+    a.inc_abs(0x0002).bit_abs(0x2002).bvc(wait_hit);
+    a.inc_abs(0x0001);
+    a.lda_abs(0x0000).sta_abs(0x2005).lda_imm(0).sta_abs(0x2005);
+    a.jmp(top);
+
+    let mut nmi = Asm::new(NMI_ADDR);
+    nmi.inc_abs(0x0000)
+        .lda_abs(0x2002)
+        .sta_abs(0x0003)
+        .lda_imm(0)
+        .sta_abs(0x2005)
+        .sta_abs(0x2005)
+        .rti();
+
+    build_nrom(
+        &a,
+        0x8000,
+        Some(NMI_ADDR),
+        &[
+            (NMI_ADDR, &nmi.bytes),
+            (PALETTE_ADDR, &PALETTE),
+            (SPRITE_ADDR, &SPRITES),
+        ],
+        &test_chr(),
+        false,
+    )
+}

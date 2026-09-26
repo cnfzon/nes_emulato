@@ -1,4 +1,11 @@
-//! Lockstep session：雙方在第 N 幀的輸入都到齊之後，才推進到第 N 幀。
+//! 連線 session：握手、輸入交換、統計、逾時與中斷，加上兩種推進模式——
+//! **lockstep**（Phase 4b）：雙方在第 N 幀的輸入都到齊之後，才推進到第 N 幀；
+//! **rollback**（Phase 4c）：本地輸入立即套用、對方輸入先預測，真實輸入到達且不同時還原並重跑
+//! （排程邏輯在 [`crate::rollback`]，這裡只負責網路與握手）。模式由 Host 在 `Accept` 決定，Client 跟隨。
+//!
+//! 下面的說明以 lockstep 為主（`next_ready_frame`／`frame_done`）；rollback 的介面是
+//! [`Session::advance`]（回傳請求清單，見 `rollback.rs` 與 `snapshot.rs`）。握手、Ack／重送、Ping、統計、
+//! 中斷與逾時兩種模式完全共用。
 //!
 //! # 這個模組做什麼、不做什麼
 //!
@@ -9,7 +16,7 @@
 //! session.poll(now, &mut transport);            // 收封包、送封包、重送、逾時、握手
 //! while let Some(event) = session.poll_event() { … }
 //! if session.local_input_wanted() {
-//!     session.add_local_input(keyboard);        // 這一幀「取樣」的按鍵（會套用在 D 幀之後）
+//!     session.add_local_input(keyboard);        // 這一幀「取樣」的按鍵（會套用在 D 幀之後）；可以帶 reset 旗標
 //! }
 //! if let Some(input) = session.next_ready_frame(now) {   // 雙方輸入到齊才回傳
 //!     nes.run_frame(input);
@@ -23,7 +30,7 @@
 //! # 為什麼是這個介面（給 4c 的 rollback 沿用）
 //!
 //! - `poll(now, transport)`／事件佇列／統計／握手／逾時／Ack 與冗餘傳送與**推進方式無關**，rollback 沿用。
-//! - lockstep 與 rollback 只差在「什麼時候可以推進」：lockstep 是 [`LockstepSession::next_ready_frame`]
+//! - lockstep 與 rollback 只差在「什麼時候可以推進」：lockstep 是 [`Session::next_ready_frame`]
 //!   （對方輸入沒到就回 `None`）；rollback 會改成「缺的輸入用預測補上、事後收到真的輸入再讀檔重跑」。
 //!   輸入的送收（`add_local_input` ＋ Input／Ack 封包）與指紋檢查（`frame_done`）兩者相同。
 //! - 用「呼叫端主動 poll」而不是 callback／執行緒，是為了讓 session 保持純邏輯、可用虛擬時鐘
@@ -54,13 +61,19 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use nes_core::{Buttons, CORE_BEHAVIOR_VERSION, FrameInput, RomId};
+use nes_core::{CORE_BEHAVIOR_VERSION, FrameInput, RomId};
 
 use crate::protocol::{
-    DisconnectReason, MAX_INPUTS_PER_PACKET, Msg, PROTOCOL_VERSION, ProtocolError, RejectReason,
+    ConfirmedFingerprint, DisconnectReason, LEGACY_PROTOCOL_VERSION, MAX_INPUTS_PER_PACKET, Mode,
+    Msg, PROTOCOL_VERSION, PlayerInput, ProtocolError, RejectReason,
+};
+use crate::rollback::{
+    self, ConfirmedFrame, Plan, RollbackConfig, RollbackPlanner, RollbackStats, Sabotage,
 };
 use crate::transport::{Datagram, Transport};
 
+/// lockstep 的預設輸入延遲（雙方共用，Host 決定）。rollback 的本地輸入延遲預設 1、可設 0–4
+/// （見 [`rollback::DEFAULT_INPUT_DELAY`]、[`rollback::MAX_INPUT_DELAY`]）。
 pub const DEFAULT_INPUT_DELAY: u8 = 2;
 pub const MAX_INPUT_DELAY: u8 = 8;
 /// 每隔幾個已完成的幀交換一次行為指紋。
@@ -94,8 +107,18 @@ pub enum Role {
 pub struct SessionConfig {
     pub role: Role,
     pub rom_id: RomId,
-    /// Host 決定；Client 的這個欄位會被 `Accept` 覆蓋。上限 [`MAX_INPUT_DELAY`]（超過會被截斷）。
+    /// **lockstep**：雙方共用的輸入延遲，Host 決定，Client 的這個欄位會被 `Accept` 覆蓋（上限
+    /// [`MAX_INPUT_DELAY`]，超過會被截斷）。**rollback**：這一方自己的本地輸入延遲（上限
+    /// [`rollback::MAX_INPUT_DELAY`]），雙方各自決定、不必一致。
     pub input_delay: u8,
+    /// 連線模式。Host 決定；Client 的這個欄位會被 `Accept` 覆蓋。
+    pub mode: Mode,
+    /// rollback 的預測視窗 K（本地設定，雙方不必一致）。
+    pub window: u32,
+    /// rollback 的時間同步（預設開；關閉只用於比較實驗）。
+    pub time_sync: bool,
+    /// 破壞性測試開關（**只給測試用**）。
+    pub sabotage: Sabotage,
     /// Host 提供（`nes-net` 不產生亂數／不讀系統時間）；Client 的這個欄位會被 `Accept` 覆蓋。
     pub session_id: u32,
     pub core_behavior_version: u16,
@@ -108,11 +131,16 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    /// Host。預設 lockstep（Phase 4b 的行為）；用 [`Self::with_mode`] 改成 rollback。
     pub fn host(rom_id: RomId, input_delay: u8, session_id: u32) -> Self {
         Self {
             role: Role::Host,
             rom_id,
             input_delay,
+            mode: Mode::Lockstep,
+            window: rollback::DEFAULT_WINDOW,
+            time_sync: true,
+            sabotage: Sabotage::None,
             session_id,
             core_behavior_version: CORE_BEHAVIOR_VERSION,
             protocol_version: PROTOCOL_VERSION,
@@ -126,7 +154,11 @@ impl SessionConfig {
         Self {
             role: Role::Client,
             rom_id,
-            input_delay: DEFAULT_INPUT_DELAY,
+            input_delay: rollback::DEFAULT_INPUT_DELAY,
+            mode: Mode::Lockstep,
+            window: rollback::DEFAULT_WINDOW,
+            time_sync: true,
+            sabotage: Sabotage::None,
             session_id: 0,
             core_behavior_version: CORE_BEHAVIOR_VERSION,
             protocol_version: PROTOCOL_VERSION,
@@ -134,6 +166,23 @@ impl SessionConfig {
             peer_timeout: PEER_TIMEOUT,
             handshake_timeout: Some(HANDSHAKE_TIMEOUT),
         }
+    }
+}
+
+impl SessionConfig {
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_input_delay(mut self, input_delay: u8) -> Self {
+        self.input_delay = input_delay;
+        self
+    }
+
+    pub fn with_window(mut self, window: u32) -> Self {
+        self.window = window;
+        self
     }
 }
 
@@ -173,18 +222,23 @@ impl fmt::Display for EndReason {
     }
 }
 
-/// 統計資料（`Event::Stats` 每秒一次，或隨時用 [`LockstepSession::stats`] 查詢）。
+/// 統計資料（`Event::Stats` 每秒一次，或隨時用 [`Session::stats`] 查詢）。
 /// 位元組數是 UDP payload（不含 UDP／IP 標頭的 28 位元組／封包）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Stats {
+    pub mode: Mode,
     /// 平滑後的來回時間（Ping／Pong 量測）；還沒有量到就是 `None`。
     pub rtt: Option<Duration>,
+    /// 這一方實際使用的（本地）輸入延遲。
     pub input_delay: u8,
-    /// 已完成的幀數。
+    /// 已完成的幀數（rollback：已確認幀）。
     pub frame: u32,
-    /// 累計 stall 次數（一次連續等不到輸入算一次）與總時間。
+    /// 累計 stall 次數（一次連續等不到輸入算一次）與總時間。lockstep：等對方的輸入；
+    /// rollback：預測視窗已滿、暫停推進。
     pub stalls: u32,
     pub stall_time: Duration,
+    /// rollback 專屬統計（lockstep 為 `None`）。
+    pub rollback: Option<RollbackStats>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub packets_sent: u64,
@@ -199,7 +253,9 @@ pub enum Event {
     /// 握手成功。雙方都必須從開機狀態開始（重新載入 ROM），第 0 幀對齊。
     Connected {
         player: u8,
+        /// 這一方實際使用的（本地）輸入延遲。
         input_delay: u8,
+        mode: Mode,
     },
     /// 下一幀的輸入沒到齊，開始 stall（一次連續的 stall 只通知一次）。
     Stalled {
@@ -251,23 +307,29 @@ enum State {
 }
 
 #[derive(Debug)]
-pub struct LockstepSession {
+pub struct Session {
     cfg: SessionConfig,
     state: State,
     session_id: u32,
     local_player: u8,
     input_delay: u8,
+    mode: Mode,
+    /// rollback 模式（握手完成後）的排程器。
+    rb: Option<RollbackPlanner>,
+    /// 上一次統計時的累計 rollback 次數（算每秒次數用）。
+    rollbacks_at_last_stats: u32,
+    rollbacks_per_sec: f32,
     started_at: Option<Duration>,
     last_recv: Duration,
     next_hello: Duration,
 
     // 本地輸入：`local[i]` 是第 `local_base + i` 幀。前面已被對方確認、且已被我們自己用掉的會丟棄。
-    local: VecDeque<Buttons>,
+    local: VecDeque<PlayerInput>,
     local_base: u32,
     /// 對方已確認收到的幀數（第 `< local_acked_next` 幀都確認了）。
     local_acked_next: u32,
     // 對方的輸入（尚未被 `next_ready_frame` 用掉的）。
-    remote: BTreeMap<u32, Buttons>,
+    remote: BTreeMap<u32, PlayerInput>,
     /// 從第 0 幀起連續收到到哪（第 `< remote_contig` 幀都收到了）。
     remote_contig: u32,
     /// 下一個要交給 `run_frame` 的幀。
@@ -303,9 +365,10 @@ pub struct LockstepSession {
     peer_frames: Option<u32>,
 }
 
-impl LockstepSession {
+impl Session {
     pub fn new(cfg: SessionConfig) -> Self {
-        let input_delay = cfg.input_delay.min(MAX_INPUT_DELAY);
+        let mode = cfg.mode;
+        let input_delay = local_delay_for(mode, cfg.input_delay);
         let (state, local_player) = match cfg.role {
             Role::Host => (State::Listening, 0),
             Role::Client => (State::Connecting, 1),
@@ -315,6 +378,10 @@ impl LockstepSession {
             state,
             local_player,
             input_delay,
+            mode,
+            rb: None,
+            rollbacks_at_last_stats: 0,
+            rollbacks_per_sec: 0.0,
             started_at: None,
             last_recv: Duration::ZERO,
             next_hello: Duration::ZERO,
@@ -378,17 +445,26 @@ impl LockstepSession {
         self.local_player
     }
 
+    /// 這一方實際使用的（本地）輸入延遲。
     pub fn input_delay(&self) -> u8 {
         self.input_delay
+    }
+
+    /// 連線模式。Host 從設定得知；Client 要握手完成（`Connected`）之後才是 Host 決定的那個。
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     pub fn session_id(&self) -> u32 {
         self.session_id
     }
 
-    /// 已交給呼叫端並回報完成（[`Self::frame_done`]）的幀數。
+    /// 已完成的幀數。lockstep：已交給呼叫端並回報完成（[`Self::frame_done`]）的幀數；
+    /// rollback：**已確認幀**（雙方輸入都是真實的、不會再被改變的幀數；存 replay 與 `Disconnect` 用這個）。
     pub fn frames_completed(&self) -> u32 {
-        self.frames_done
+        self.rb
+            .as_ref()
+            .map_or(self.frames_done, RollbackPlanner::confirmed_frame)
     }
 
     pub fn end_reason(&self) -> Option<EndReason> {
@@ -401,12 +477,18 @@ impl LockstepSession {
     }
 
     pub fn stats(&self) -> Stats {
+        let rollback = self.rb.as_ref().map(|rb| RollbackStats {
+            rollbacks_per_sec: self.rollbacks_per_sec,
+            ..rb.stats()
+        });
         Stats {
+            mode: self.mode,
             rtt: self.srtt_us.map(Duration::from_micros),
             input_delay: self.input_delay,
-            frame: self.frames_done,
-            stalls: self.stalls,
-            stall_time: self.stall_time,
+            frame: self.frames_completed(),
+            stalls: rollback.map_or(self.stalls, |r| r.stalls),
+            stall_time: rollback.map_or(self.stall_time, |r| r.stall_time),
+            rollback,
             bytes_sent: self.bytes_sent,
             bytes_received: self.bytes_received,
             packets_sent: self.packets_sent,
@@ -427,27 +509,30 @@ impl LockstepSession {
     }
 
     /// 現在該取樣本地輸入了嗎？每推進一幀恰好一次（前 D 幀是預先填好的空輸入）。
+    /// **只有 lockstep 用**（rollback 的取樣由 [`Self::advance`] 內部決定）。
     pub fn local_input_wanted(&self) -> bool {
-        self.is_running() && self.local_next() <= self.next_frame + u32::from(self.input_delay)
+        self.rb.is_none()
+            && self.is_running()
+            && self.local_next() <= self.next_frame + u32::from(self.input_delay)
     }
 
     /// 加入這一次取樣的本地按鍵（套用在 `D` 幀之後）。只有 [`Self::local_input_wanted`] 為 `true`
     /// 時才接受（否則忽略並回傳 `false`），所以本地輸入永遠只會領先 `D + 1` 幀，不會因為 stall
     /// 而無限堆積。
-    pub fn add_local_input(&mut self, buttons: Buttons) -> bool {
+    pub fn add_local_input(&mut self, input: impl Into<PlayerInput>) -> bool {
         if !self.local_input_wanted() {
             return false;
         }
-        self.local.push_back(buttons);
+        self.local.push_back(input.into());
         self.input_dirty = true;
         true
     }
 
-    /// 雙方在 `next_frame` 的輸入都到齊時回傳這一幀的 [`FrameInput`]（`reset` 永遠是 `false`：
-    /// netplay 期間 reset 不是輸入的一部分，UI 停用它）；否則回傳 `None`——**不阻塞**，
+    /// 雙方在 `next_frame` 的輸入都到齊時回傳這一幀的 [`FrameInput`]（`reset` 是雙方 reset 旗標的 OR，
+    /// 所以任一方按 Reset，雙方在同一幀 soft reset）；否則回傳 `None`——**不阻塞**，
     /// 呼叫端下個節拍再試。第一次等不到時開始計算一次 stall，等到了才結束。
     pub fn next_ready_frame(&mut self, now: Duration) -> Option<FrameInput> {
-        if !self.is_running() {
+        if !self.is_running() || self.rb.is_some() {
             return None;
         }
         let f = self.next_frame;
@@ -470,21 +555,21 @@ impl LockstepSession {
         self.remote.remove(&f);
         self.next_frame += 1;
         self.prune_local();
-        let (p1, p2) = if self.local_player == 0 {
-            (local, remote)
-        } else {
-            (remote, local)
-        };
-        Some(FrameInput::new(p1, p2))
+        Some(PlayerInput::merge(local, remote, self.local_player))
     }
 
-    fn local_input(&self, frame: u32) -> Option<Buttons> {
+    fn local_input(&self, frame: u32) -> Option<PlayerInput> {
         let idx = frame.checked_sub(self.local_base)?;
         self.local.get(idx as usize).copied()
     }
 
     fn prune_local(&mut self) {
-        let keep_from = self.local_acked_next.min(self.next_frame);
+        // lockstep 還要用 `local[next_frame..]`；rollback 有自己的一份（規劃器），只留尚未被 Ack 的（重送用）。
+        let keep_from = if self.rb.is_some() {
+            self.local_acked_next
+        } else {
+            self.local_acked_next.min(self.next_frame)
+        };
         while self.local_base < keep_from && self.local.pop_front().is_some() {
             self.local_base += 1;
         }
@@ -513,9 +598,13 @@ impl LockstepSession {
 
     fn compare_checksum(&mut self, frame: u32, local: u64, remote: u64) {
         self.local_fps.remove(&frame);
-        if local == remote {
-            return;
+        if local != remote {
+            self.raise_desync(frame, local, remote);
         }
+    }
+
+    /// 偵測到雙方的行為指紋不同：事件、通知對方、結束。
+    fn raise_desync(&mut self, frame: u32, local: u64, remote: u64) {
         self.events.push_back(Event::Desync {
             frame,
             local: Some(local),
@@ -525,10 +614,72 @@ impl LockstepSession {
             self.outbox.push(Msg::Disconnect {
                 session_id: self.session_id,
                 reason: DisconnectReason::Desync { frame },
-                frames_completed: self.frames_done,
+                frames_completed: self.frames_completed(),
             });
         }
         self.end(EndReason::Desync { frame });
+    }
+
+    // ---- rollback ---------------------------------------------------------------
+
+    /// **rollback 模式**：每個幀節拍呼叫一次，回傳這個節拍要在模擬器上執行的請求清單（見 [`crate::rollback`]）。
+    /// `keyboard` 是這個節拍的本地按鍵（可帶 reset 旗標），只有真的推進新的一幀時才被取樣。
+    /// 不在 rollback 模式、或還沒連上，回傳 [`Outcome::Idle`](crate::rollback::Outcome::Idle)。
+    ///
+    /// 呼叫端依序執行 `plan.requests`（[`crate::snapshot::execute`]），每個 `SaveState` 之後呼叫
+    /// [`Self::state_saved`]，最後呼叫 [`Self::drain_confirmed`]。
+    pub fn advance(&mut self, now: Duration, keyboard: impl Into<PlayerInput>) -> Plan {
+        if !self.is_running() {
+            return Plan::idle();
+        }
+        let Some(rb) = self.rb.as_mut() else {
+            return Plan::idle();
+        };
+        let plan = rb.advance(now, keyboard.into());
+        if let Some(sampled) = plan.sampled {
+            // 送給對方的本地輸入序列（與規劃器裡的那份相同）。
+            self.local.push_back(sampled);
+            self.input_dirty = true;
+        }
+        plan
+    }
+
+    /// rollback：呼叫端執行完一個 `SaveState { frame }` 之後回報該狀態的行為指紋。
+    pub fn state_saved(&mut self, frame: u32, fingerprint: u64) {
+        if let Some(rb) = &mut self.rb {
+            rb.state_saved(frame, fingerprint);
+        }
+        self.check_rollback_desync();
+    }
+
+    /// rollback：取走新確認的幀（最終的雙方輸入與指紋），用來記錄 replay。
+    pub fn drain_confirmed(&mut self) -> Vec<ConfirmedFrame> {
+        self.rb
+            .as_mut()
+            .map(RollbackPlanner::drain_confirmed)
+            .unwrap_or_default()
+    }
+
+    /// rollback：呼叫端量測一次重跑（還原＋重跑整段請求）的耗時後回報（統計用）。
+    pub fn record_resim(&mut self, duration: Duration) {
+        if let Some(rb) = &mut self.rb {
+            rb.record_resim(duration);
+        }
+    }
+
+    /// rollback 的規劃器（唯讀，測試與診斷用）。
+    pub fn planner(&self) -> Option<&RollbackPlanner> {
+        self.rb.as_ref()
+    }
+
+    /// 比對對方送來的指紋（只比對本地已確認的幀）；不符就結束。
+    fn check_rollback_desync(&mut self) {
+        if self.is_ended() {
+            return;
+        }
+        if let Some(d) = self.rb.as_mut().and_then(RollbackPlanner::poll_desync) {
+            self.raise_desync(d.frame, d.local, d.remote);
+        }
     }
 
     // ---- 主動中斷 -------------------------------------------------------------
@@ -542,7 +693,7 @@ impl LockstepSession {
                     self.outbox.push(Msg::Disconnect {
                         session_id: self.session_id,
                         reason: DisconnectReason::Left,
-                        frames_completed: self.frames_done,
+                        frames_completed: self.frames_completed(),
                     });
                 }
                 self.state = State::Closing {
@@ -612,7 +763,7 @@ impl LockstepSession {
                     let msg = Msg::Disconnect {
                         session_id: self.session_id,
                         reason: DisconnectReason::Left,
-                        frames_completed: self.frames_done,
+                        frames_completed: self.frames_completed(),
                     };
                     self.send(now, transport, None, &msg);
                 }
@@ -625,6 +776,10 @@ impl LockstepSession {
     fn poll_running<T: Transport + ?Sized>(&mut self, now: Duration, transport: &mut T) {
         if now.saturating_sub(self.last_recv) > self.cfg.peer_timeout {
             self.end(EndReason::Timeout);
+            return;
+        }
+        self.check_rollback_desync();
+        if self.is_ended() {
             return;
         }
         self.send_inputs_if_due(now, transport);
@@ -643,6 +798,12 @@ impl LockstepSession {
                 .max(1e-9);
             self.rate_sent = (self.window_sent as f64 / elapsed) as u32;
             self.rate_received = (self.window_received as f64 / elapsed) as u32;
+            if let Some(rb) = &self.rb {
+                let total = rb.stats().rollbacks;
+                self.rollbacks_per_sec =
+                    (total - self.rollbacks_at_last_stats) as f32 / elapsed as f32;
+                self.rollbacks_at_last_stats = total;
+            }
             self.window_start = now;
             self.window_sent = 0;
             self.window_received = 0;
@@ -691,7 +852,7 @@ impl LockstepSession {
         let Some(offset) = start.checked_sub(self.local_base) else {
             return;
         };
-        let inputs: Vec<Buttons> = self
+        let inputs: Vec<PlayerInput> = self
             .local
             .iter()
             .skip(offset as usize)
@@ -702,10 +863,22 @@ impl LockstepSession {
             return;
         }
         self.last_send = now;
+        // 時間同步與指紋資訊（rollback）：每個 Input 封包都帶，所以丟包只會延後、不會跳過。
+        let (sender_frame, frame_advantage, confirmed) = match &self.rb {
+            Some(rb) => (
+                rb.current_frame(),
+                rb.advantage_to_send(),
+                rb.confirmed_fingerprint(),
+            ),
+            None => (self.next_frame, 0, None),
+        };
         let msg = Msg::Input {
             session_id: self.session_id,
             start_frame: start,
             inputs,
+            sender_frame,
+            frame_advantage,
+            confirmed,
         };
         self.send(now, transport, None, &msg);
     }
@@ -724,7 +897,19 @@ impl LockstepSession {
         to: Option<SocketAddr>,
         msg: &Msg,
     ) {
-        let Ok(bytes) = msg.encode() else {
+        self.send_with_version(now, transport, to, msg, PROTOCOL_VERSION);
+    }
+
+    /// 同 [`Self::send`]，但標頭寫指定的協定版本（只用來讓舊版 Client 讀懂 `Reject`）。
+    fn send_with_version<T: Transport + ?Sized>(
+        &mut self,
+        now: Duration,
+        transport: &mut T,
+        to: Option<SocketAddr>,
+        msg: &Msg,
+        header_version: u16,
+    ) {
+        let Ok(bytes) = msg.encode_with_version(header_version) else {
             log::error!("編碼失敗（不應發生）：{msg:?}");
             return;
         };
@@ -751,15 +936,33 @@ impl LockstepSession {
         let msg = match Msg::decode(&datagram.data) {
             Ok(msg) => msg,
             Err(ProtocolError::UnsupportedVersion(theirs)) => {
-                // 對方用不同版本的協定打招呼：Host 還在等人時，明確告訴它為什麼不行。
-                if matches!(self.state, State::Listening) && !datagram.stranger {
-                    let reject = Msg::Reject {
-                        reason: RejectReason::ProtocolVersion {
-                            host: self.cfg.protocol_version,
-                            client: theirs,
-                        },
-                    };
-                    self.send(now, transport, datagram.from, &reject);
+                let ours = self.cfg.protocol_version;
+                match self.state {
+                    // 對方用不同版本的協定打招呼：Host 還在等人時，明確告訴它為什麼不行。
+                    // 對 v1（Phase 4b）的 Client 用 v1 的標頭回覆：`Reject` 的本體佈局兩版相同，舊版程式才解得出並顯示原因。
+                    State::Listening if !datagram.stranger => {
+                        let reject = Msg::Reject {
+                            reason: RejectReason::ProtocolVersion {
+                                host: ours,
+                                client: theirs,
+                            },
+                        };
+                        let header = if theirs == LEGACY_PROTOCOL_VERSION {
+                            theirs
+                        } else {
+                            ours
+                        };
+                        self.send_with_version(now, transport, datagram.from, &reject, header);
+                    }
+                    // Client：房主回了一個「別的版本」的（Reject）封包（例如 v1 的房主拒絕 v2 的我們，
+                    // 用它自己的標頭回覆）。任何版本的 NESN 封包都代表對方的協定與我們不同。
+                    State::Connecting if !datagram.stranger => {
+                        self.end(EndReason::Rejected(RejectReason::ProtocolVersion {
+                            host: theirs,
+                            client: ours,
+                        }));
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -799,7 +1002,8 @@ impl LockstepSession {
                 session_id,
                 input_delay,
                 player,
-            } => self.on_accept(now, session_id, input_delay, player),
+                mode,
+            } => self.on_accept(now, session_id, input_delay, player, mode),
             Msg::Reject { reason } => {
                 if matches!(self.state, State::Connecting) {
                     self.end(EndReason::Rejected(reason));
@@ -857,7 +1061,7 @@ impl LockstepSession {
                 if let Some(addr) = from {
                     transport.set_peer(addr);
                 }
-                self.begin_running(now, 0);
+                self.begin_running(now, 0, self.cfg.mode, self.cfg.input_delay);
                 self.send_accept(now, transport, from);
             }
             // Accept 掉了，Client 又送 Hello：重送同一份 Accept（冪等）。
@@ -876,29 +1080,53 @@ impl LockstepSession {
             session_id: self.session_id,
             input_delay: self.input_delay,
             player: 1,
+            mode: self.mode,
         };
         self.send(now, transport, to, &accept);
     }
 
-    fn on_accept(&mut self, now: Duration, session_id: u32, input_delay: u8, player: u8) {
+    fn on_accept(
+        &mut self,
+        now: Duration,
+        session_id: u32,
+        input_delay: u8,
+        player: u8,
+        mode: Mode,
+    ) {
         if !matches!(self.state, State::Connecting) || player > 1 || input_delay > MAX_INPUT_DELAY {
             return;
         }
         self.session_id = session_id;
-        self.input_delay = input_delay;
-        self.begin_running(now, player);
+        // lockstep：雙方共用 Host 決定的 D。rollback：各自決定本地輸入延遲（用自己的設定）。
+        let delay = match mode {
+            Mode::Lockstep => input_delay,
+            Mode::Rollback => self.cfg.input_delay,
+        };
+        self.begin_running(now, player, mode, delay);
     }
 
-    /// 握手完成：進入 Running。前 `D` 幀的本地輸入是空的（協定約定，雙方都知道 D）。
-    fn begin_running(&mut self, now: Duration, player: u8) {
+    /// 握手完成：進入 Running。前 `D` 幀的本地輸入是空的（lockstep：協定約定，雙方都知道 D；
+    /// rollback：空輸入也照常送給對方，對方不必猜）。
+    fn begin_running(&mut self, now: Duration, player: u8, mode: Mode, input_delay: u8) {
         self.state = State::Running;
+        self.mode = mode;
+        self.input_delay = local_delay_for(mode, input_delay);
+        if mode == Mode::Rollback {
+            self.rb = Some(RollbackPlanner::new(RollbackConfig {
+                window: self.cfg.window,
+                input_delay: self.input_delay,
+                local_player: player,
+                time_sync: self.cfg.time_sync,
+                sabotage: self.cfg.sabotage,
+            }));
+        }
         self.local_player = player;
         self.last_recv = now;
         self.next_ping = now;
         self.window_start = now;
         self.next_stats = now + STATS_INTERVAL;
         self.local.extend(std::iter::repeat_n(
-            Buttons::empty(),
+            PlayerInput::NONE,
             usize::from(self.input_delay),
         ));
         // 預填的輸入也要送給對方（對方要靠封包才知道我方前 D 幀是空的），連上就立刻送。
@@ -906,6 +1134,7 @@ impl LockstepSession {
         self.events.push_back(Event::Connected {
             player,
             input_delay: self.input_delay,
+            mode,
         });
     }
 
@@ -930,8 +1159,17 @@ impl LockstepSession {
             Msg::Input {
                 start_frame,
                 inputs,
+                sender_frame,
+                frame_advantage,
+                confirmed,
                 ..
-            } => self.on_input(now, transport, start_frame, &inputs),
+            } => self.on_input(
+                now,
+                transport,
+                start_frame,
+                &inputs,
+                (sender_frame, frame_advantage, confirmed),
+            ),
             Msg::Ack { frame, .. } => {
                 let acked = frame.saturating_add(1).min(self.local_next());
                 self.local_acked_next = self.local_acked_next.max(acked);
@@ -974,7 +1212,7 @@ impl LockstepSession {
                         let reply = Msg::Disconnect {
                             session_id: self.session_id,
                             reason: DisconnectReason::Left,
-                            frames_completed: self.frames_done,
+                            frames_completed: self.frames_completed(),
                         };
                         for _ in 0..DISCONNECT_REPEATS {
                             self.send(now, transport, None, &reply);
@@ -1000,23 +1238,42 @@ impl LockstepSession {
         now: Duration,
         transport: &mut T,
         start_frame: u32,
-        inputs: &[Buttons],
+        inputs: &[PlayerInput],
+        sync: (u32, i8, Option<ConfirmedFingerprint>),
     ) {
-        for (i, &buttons) in inputs.iter().enumerate() {
-            let Some(frame) = start_frame.checked_add(i as u32) else {
-                break;
-            };
-            // 已經連續收到的：重複，忽略。太遠的：不收（有上限，防止記憶體無限成長）。
-            if frame < self.remote_contig {
-                continue;
+        if let Some(rb) = self.rb.as_mut() {
+            // rollback：輸入交給規劃器（它有「領先連續收到太遠不收」的上限）。
+            let rtt = self.srtt_us.map(Duration::from_micros);
+            for (i, &input) in inputs.iter().enumerate() {
+                let Some(frame) = start_frame.checked_add(i as u32) else {
+                    break;
+                };
+                rb.on_remote_input(frame, input);
             }
-            if frame - self.remote_contig >= MAX_REMOTE_AHEAD {
-                break;
+            let (sender_frame, advantage, confirmed) = sync;
+            rb.on_remote_sync(sender_frame, advantage, rtt);
+            if let Some(fp) = confirmed {
+                rb.on_remote_fingerprint(fp);
             }
-            self.remote.entry(frame).or_insert(buttons);
-        }
-        while self.remote.contains_key(&self.remote_contig) {
-            self.remote_contig += 1;
+            self.remote_contig = rb.remote_contiguous();
+            self.check_rollback_desync();
+        } else {
+            for (i, &input) in inputs.iter().enumerate() {
+                let Some(frame) = start_frame.checked_add(i as u32) else {
+                    break;
+                };
+                // 已經連續收到的：重複，忽略。太遠的：不收（有上限，防止記憶體無限成長）。
+                if frame < self.remote_contig {
+                    continue;
+                }
+                if frame - self.remote_contig >= MAX_REMOTE_AHEAD {
+                    break;
+                }
+                self.remote.entry(frame).or_insert(input);
+            }
+            while self.remote.contains_key(&self.remote_contig) {
+                self.remote_contig += 1;
+            }
         }
         // 每收到一個 Input 就回 Ack（重複的封包也回：Ack 可能掉了）。
         if let Some(last) = self.remote_contig.checked_sub(1) {
@@ -1026,6 +1283,14 @@ impl LockstepSession {
             };
             self.send(now, transport, None, &ack);
         }
+    }
+}
+
+/// 各模式允許的本地輸入延遲上限。
+fn local_delay_for(mode: Mode, requested: u8) -> u8 {
+    match mode {
+        Mode::Lockstep => requested.min(MAX_INPUT_DELAY),
+        Mode::Rollback => requested.min(rollback::MAX_INPUT_DELAY),
     }
 }
 

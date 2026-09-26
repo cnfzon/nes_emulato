@@ -94,6 +94,32 @@ impl Cpu {
         &mut self.bus
     }
 
+    /// 把 `src` 的**模擬狀態**複製進 `self`（見 `Nes::copy_state_from`）。解構時不用 `..`。
+    pub(crate) fn copy_state_from(&mut self, src: &Cpu) {
+        let Cpu {
+            a,
+            x,
+            y,
+            sp,
+            pc,
+            status,
+            jammed,
+            irq_sample,
+            irq_masked,
+            bus,
+        } = src;
+        self.a = *a;
+        self.x = *x;
+        self.y = *y;
+        self.sp = *sp;
+        self.pc = *pc;
+        self.status = *status;
+        self.jammed = *jammed;
+        self.irq_sample = *irq_sample;
+        self.irq_masked = *irq_masked;
+        self.bus.copy_state_from(bus);
+    }
+
     /// 行為指紋（`docs/architecture.md` §18.2）：暫存器、旗標、IRQ 偵測狀態，接著是整條匯流排。
     pub(crate) fn fingerprint(&self, h: &mut Fp) {
         h.u8(self.a);

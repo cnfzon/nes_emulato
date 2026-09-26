@@ -24,11 +24,15 @@ mod fingerprint_tests;
 pub mod frame;
 pub mod input;
 pub mod joypad;
+#[cfg(test)]
+mod output_switch_tests;
 pub mod ppu;
 pub mod replay;
 #[cfg(test)]
 mod replay_tests;
 pub mod rom_id;
+#[cfg(test)]
+mod snapshot_tests;
 pub mod state;
 /// 測試用的迷你組譯器與合成 ROM（`cargo test` 或 `testing` feature 才編譯）。
 #[cfg(any(test, feature = "testing"))]
@@ -250,6 +254,79 @@ impl Nes {
         }
 
         Ok(())
+    }
+
+    /// **剖析用（`profile` feature，預設不編譯）**：只讓 PPU 推進 `cpu_cycles` 個 CPU cycle（×3 個 dot），
+    /// 每次 `chunk` 個 cycle（模擬 `Bus::advance` 每條指令推進 2–7 個 cycle 的呼叫粒度），**不動 CPU、APU、匯流排**。
+    /// `render` 為 `false` 時先把 `mask` 清成 0（渲染關閉），用來把「逐 dot 的時序迴圈」與「掃描線渲染」的成本分開。
+    /// 這會改變狀態，所以只能對 `copy_state_from` 出來的暫時實例使用。計時由呼叫端（`nes-test`）負責——
+    /// `nes-core` 本身仍然不讀時間。
+    #[cfg(feature = "profile")]
+    pub fn profile_ppu(&mut self, cpu_cycles: u32, chunk: u32, render: bool) {
+        let bus = self.cpu.bus_mut();
+        if !render {
+            bus.ppu.mask = 0;
+        }
+        let chunk = chunk.max(1);
+        let mut left = cpu_cycles;
+        while left > 0 {
+            let c = chunk.min(left);
+            let cart = &bus.cartridge;
+            bus.ppu.step_dots(c * 3, cart);
+            left -= c;
+        }
+    }
+
+    /// **剖析用**：只讓 APU 推進 `cpu_cycles` 個 CPU cycle，每次 `chunk` 個（見 [`Nes::profile_ppu`]）。
+    #[cfg(feature = "profile")]
+    pub fn profile_apu(&mut self, cpu_cycles: u32, chunk: u32) {
+        let bus = self.cpu.bus_mut();
+        let chunk = chunk.max(1);
+        let mut left = cpu_cycles;
+        while left > 0 {
+            let c = chunk.min(left);
+            let cart = &bus.cartridge;
+            bus.apu.step(c, cart);
+            left -= c;
+        }
+    }
+
+    /// **剖析用**：對 mapper 做 `reads` 次 PRG 讀取（位址掃過 `$8000..=$FFFF`）與 `reads` 次 CHR 讀取，
+    /// 回傳位元組的 XOR（防止被最佳化掉）。
+    #[cfg(feature = "profile")]
+    pub fn profile_mapper(&self, reads: u32) -> u8 {
+        let cart = &self.cpu.bus().cartridge;
+        let mut acc = 0u8;
+        let mut addr = 0x8000u16;
+        for i in 0..reads {
+            acc ^= cart.read_prg(addr);
+            acc ^= cart.read_chr((i as u16).wrapping_mul(7) & 0x1FFF);
+            addr = addr.wrapping_add(13) | 0x8000;
+        }
+        acc
+    }
+
+    /// **rollback 用的快照複製**：把 `src` 的模擬狀態複製進 `self`，**不經過序列化、不配置記憶體**
+    /// （沿用 `self` 既有的 `Vec` 容量），也**不複製輸出與靜態資料**——`framebuffer`（約 240 KB）、
+    /// 音訊輸出管線、輸出設定（開關／取樣率／聲道遮罩）與 PRG-ROM／CHR-ROM 都維持 `self` 原有的內容。
+    ///
+    /// 語意：呼叫之後 `self.behavior_fingerprint() == src.behavior_fingerprint()`，且兩者接下來
+    /// 吃相同輸入會得到完全相同的模擬結果；`self` 的輸出（畫面、音訊）之後由下一次 `run_frame`
+    /// 產生（輸出不影響行為，見 §18.2）。用來存快照（`slot.copy_state_from(&nes)`）與還原
+    /// （`nes.copy_state_from(&slot)`）。
+    ///
+    /// 兩台必須載入同一份 ROM（`rom_id` 相同）；不同則不做任何事並回傳 `false`。
+    /// **這個方法沒有改變任何模擬行為**：`CORE_BEHAVIOR_VERSION` 與存檔格式都不變。
+    /// 每個結構的複製都用「不含 `..` 的完整解構」，新增狀態欄位而漏掉複製會編譯失敗；
+    /// `copy_state_from_*` 測試再以存檔位元組與指紋驗證。
+    pub fn copy_state_from(&mut self, src: &Nes) -> bool {
+        if self.cpu.bus().cartridge.rom_id != src.cpu.bus().cartridge.rom_id {
+            return false;
+        }
+        let Nes { cpu, frame_count } = src;
+        self.cpu.copy_state_from(cpu);
+        self.frame_count = *frame_count;
+        true
     }
 
     /// 目前狀態的 xxh3-64 雜湊值，用來做 rollback / netplay 的 desync 偵測。

@@ -12,6 +12,12 @@ use super::{Ppu, palette};
 use crate::cartridge::Cartridge;
 use crate::frame::WIDTH;
 
+#[cfg(test)]
+thread_local! {
+    /// 只給測試：`render_background` 被呼叫的次數。
+    pub(crate) static BG_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// 一條掃描線上精靈的疊合結果。
 struct SpriteLine {
     /// 調色盤 RAM 索引（`0x10 | pal << 2 | color`）；`0` 代表這個像素沒有精靈。
@@ -63,17 +69,25 @@ impl Ppu {
             return;
         }
 
-        let mut background = [0u8; WIDTH];
-        if show_bg {
-            self.render_background(cart, &mut background);
-        }
-
+        // 輸出關閉時，只有「會影響行為」的部分需要算：overflow 與 sprite 0 hit。sprite 0 hit 只取決於
+        // sprite 0 的不透明像素與背景是否為不透明，其他精靈的像素與最終顏色都不影響狀態，
+        // 所以只畫 sprite 0；而且這條線上沒有 sprite 0 的不透明像素時，連背景都不算
+        // （`render_background`／`read_chr` 對 mapper 0–3 沒有副作用）。
+        // **前提**：mapper 不觀察 CHR 讀取（`Mapper::observes_chr_reads() == false`）。MMC3 的 A12 計數、
+        // MMC2 的 tile latch 這類 mapper，讀哪些位址本身就會改變狀態，一律走完整路徑。
+        // 輸出開啟時完全照舊。
+        let skip_unobservable = !output && !cart.mapper.observes_chr_reads();
         let mut sprites = SpriteLine {
             index: [0; WIDTH],
             behind: [false; WIDTH],
             is_sprite0: [false; WIDTH],
         };
-        self.evaluate_sprites(line, cart, show_sprites, &mut sprites);
+        self.evaluate_sprites(line, cart, show_sprites, skip_unobservable, &mut sprites);
+
+        let mut background = [0u8; WIDTH];
+        if show_bg && (!skip_unobservable || sprites.is_sprite0.iter().any(|&b| b)) {
+            self.render_background(cart, &mut background);
+        }
 
         let mut hit_x = None;
         if output {
@@ -103,6 +117,8 @@ impl Ppu {
     /// 背景：33 個 tile（含捲動造成的第 33 個部分 tile），結果寫進 `out`
     /// （`0` = 透明，其餘是調色盤 RAM 索引 `pal << 2 | color`）。
     fn render_background(&self, cart: &Cartridge, out: &mut [u8; WIDTH]) {
+        #[cfg(test)]
+        BG_RENDERS.with(|c| c.set(c.get() + 1));
         // 預取（dot 328/336）已經讓 v 前進了 `prefetch_incs` 個 tile。
         let mut start = self.v;
         for _ in 0..self.prefetch_incs {
@@ -156,7 +172,15 @@ impl Ppu {
 
     /// 這條掃描線的精靈：挑出最多 8 個（超過就登記 overflow），依 OAM 順序
     /// 疊合（先出現者優先）。`draw` 為 `false`（精靈顯示關閉）時只做 overflow 判斷。
-    fn evaluate_sprites(&mut self, line: u16, cart: &Cartridge, draw: bool, out: &mut SpriteLine) {
+    /// `only_sprite0` 為 `true`（輸出關閉）時只畫 sprite 0（其餘只計數，overflow 判斷照舊）。
+    fn evaluate_sprites(
+        &mut self,
+        line: u16,
+        cart: &Cartridge,
+        draw: bool,
+        only_sprite0: bool,
+        out: &mut SpriteLine,
+    ) {
         let tall = self.ctrl & 0x20 != 0;
         let height: i32 = if tall { 16 } else { 8 };
         let hide_left = self.mask & 0x04 == 0;
@@ -175,7 +199,7 @@ impl Ppu {
                 break;
             }
             found += 1;
-            if !draw {
+            if !draw || (only_sprite0 && n != 0) {
                 continue;
             }
 

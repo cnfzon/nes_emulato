@@ -31,7 +31,7 @@
 //! 拿到的畫面不會有撕裂。
 
 mod palette;
-mod render;
+pub(crate) mod render;
 mod views;
 
 pub use palette::{SYSTEM_PALETTE, to_rgba};
@@ -169,6 +169,63 @@ impl Default for Ppu {
 }
 
 impl Ppu {
+    /// 把 `src` 的**模擬狀態**複製進 `self`（見 `Nes::copy_state_from`）。不動輸出（`frame_buffer`、
+    /// `output_enabled`）。解構時不用 `..`：新增欄位時編譯器會強迫這裡決定「複製」或「排除」。
+    pub(crate) fn copy_state_from(&mut self, src: &Ppu) {
+        let Ppu {
+            ctrl,
+            mask,
+            status,
+            oam_addr,
+            v,
+            t,
+            fine_x,
+            w,
+            data_buffer,
+            io_latch,
+            oam,
+            vram,
+            palette,
+            scanline,
+            cycle,
+            frame,
+            odd_frame,
+            nmi_line,
+            nmi_pending,
+            nmi_delay,
+            frame_done,
+            sprite0_hit_dot,
+            overflow_pending,
+            prefetch_incs,
+            frame_buffer: _,
+            output_enabled: _,
+        } = src;
+        self.ctrl = *ctrl;
+        self.mask = *mask;
+        self.status = *status;
+        self.oam_addr = *oam_addr;
+        self.v = *v;
+        self.t = *t;
+        self.fine_x = *fine_x;
+        self.w = *w;
+        self.data_buffer = *data_buffer;
+        self.io_latch = *io_latch;
+        self.oam.clone_from(oam);
+        self.vram.clone_from(vram);
+        self.palette = *palette;
+        self.scanline = *scanline;
+        self.cycle = *cycle;
+        self.frame = *frame;
+        self.odd_frame = *odd_frame;
+        self.nmi_line = *nmi_line;
+        self.nmi_pending = *nmi_pending;
+        self.nmi_delay = *nmi_delay;
+        self.frame_done = *frame_done;
+        self.sprite0_hit_dot = *sprite0_hit_dot;
+        self.overflow_pending = *overflow_pending;
+        self.prefetch_incs = *prefetch_incs;
+    }
+
     /// 行為指紋（`docs/architecture.md` §18.2）。排除 `frame_buffer` 與 `output_enabled`（輸出）。
     pub(crate) fn fingerprint(&self, h: &mut Fp) {
         h.u8(self.ctrl);
