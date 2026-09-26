@@ -23,6 +23,13 @@
 > 雙實例逐幀比對工具與 `diff-state` 供 4b／4c 的 desync 除錯使用。模擬行為**沒有改變**
 > （`CORE_BEHAVIOR_VERSION` 仍是 3；只有存檔格式升到 3）。規格見 `docs/architecture.md` §18，
 > 需要 GUI 確認的項目見 [`docs/manual-test-phase4a.md`](docs/manual-test-phase4a.md)。
+>
+> **Phase 4b（Lockstep 連線與網路模擬層）**：`nes-net` 有了 `Transport`（UDP／記憶體內／可模擬丟包延遲抖動重複的
+> `SimulatedTransport`，依虛擬時鐘）、協定 v1（magic + 版本 + postcard）、握手（版本／核心／ROM 不符會被拒絕並說明原因）、
+> lockstep session（input delay、冗餘傳送、Ack、每 60 幀交換行為指紋）；`nes-app` 有 **Netplay** 選單（建立房間／加入／
+> 中斷），每場自動錄成 replay。正確性歸約到 4a 的 replay：連線兩端的指紋逐幀相同，且等於「雙方輸入合併後離線重播」。
+> `nes-core` **完全沒有修改**（`CORE_BEHAVIOR_VERSION` 仍是 3）。規格與實測見 `docs/architecture.md` §19，需要兩台
+> 電腦確認的項目見 [`docs/manual-test-phase4b.md`](docs/manual-test-phase4b.md)。
 
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
@@ -34,7 +41,7 @@
 nes-netplay/
 ├── crates/
 │   ├── nes-core/   決定性的模擬核心（CPU/PPU/APU/Cartridge），無 I/O 依賴
-│   ├── nes-net/    Rollback netplay：協定、UDP 傳輸層、會話排程
+│   ├── nes-net/    Netplay：協定、傳輸層（UDP／模擬網路）、lockstep session（4b）、模擬器；rollback（4c）
 │   ├── nes-app/    eframe GUI 前端（UI 執行緒 + Emu 執行緒）
 │   └── nes-test/   命令列測試／除錯工具（iNES header 解析、nestest/blargg）
 └── docs/
@@ -78,6 +85,9 @@ cargo run --release -p nes-test -- replay generate path/to/rom.nes demo.replay -
 # 逐欄位比對兩份存檔（GUI：File → Save State to File...；CLI：save-state）
 cargo run --release -p nes-test -- diff-state a.state b.state
 
+# 無視窗的網路模擬（虛擬時鐘）：兩端指紋是否逐幀相同、是否等於離線重播、stall 與頻寬（表格輸出）
+cargo run --release -p nes-test -- netsim path/to/rom.nes --frames 3600 --loss 10 --delay 100 --jitter 30 --runs 20
+
 # run_frame 效能（CPU + PPU + APU 合計；輸出開啟與關閉各量一次；也量行為指紋的耗時）
 cargo run --release -p nes-core --features testing --example bench_run_frame
 
@@ -96,7 +106,8 @@ cargo run --release -p nes-app -- --audio-selftest
 F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。選單 **Emulation → Reset**（soft reset）；選單 **Replay**：
 錄製（會先重新開機）／停止並儲存／播放（1x、2x、最快，播放時鍵盤輸入被忽略、逐幀驗證檢查點）。**錄製與播放
 replay 期間停用**讀取存檔（F9）、單步指令、Trace 與載入別的 ROM（它們會破壞「從開機狀態依輸入序列執行」的
-前提）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
+前提）。選單 **Netplay**（兩台電腦都用玩家 1 的按鍵；Host＝玩家 1、Client＝玩家 2）：建立房間／加入／input delay／
+中斷連線；**Netplay 期間同樣停用**讀檔、單步、Trace、載入 ROM、暫停與 Reset（單方面做這些會讓雙方分歧）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
 各聲道獨立靜音、暫存器與計數器、音訊緩衝區填充量與累計 underrun。
 
 ## 交付與效能量測

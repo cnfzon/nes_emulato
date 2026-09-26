@@ -10,6 +10,10 @@
 
 ## 準備
 
+> **存檔有兩種，位置不同**：`Emulation` 選單的 `Save State (F5)（記憶體）`／`Load State (F9)（記憶體）` 只存在記憶體，不寫檔案；
+> **寫入檔案的是 `File → Save State to File...`**（存成 `.state`，供 `nes-test diff-state` 使用）。該項目要**先載入 ROM** 才會啟用
+> （沒載入時是灰的）；按下後跳出存檔對話框（預設檔名 `snapshot.state`），成功時狀態列顯示「已儲存存檔：路徑」。
+
 ```bash
 cargo build --release -p nes-app -p nes-test    # 或分開建置；交付用的 nes-app 請單獨建置（見 README）
 target\release\nes-app.exe
@@ -37,7 +41,7 @@ target\release\nes-app.exe
 | B2 | 按下 `Start Recording` | 遊戲**從開機重新開始**（回到標題畫面，不是接著剛才的進度）；狀態列出現紅字 `[錄製中] 第 N 幀（T 秒）`，N 持續增加 |
 | B3 | 玩約 5 分鐘：**兩位玩家都要有操作**（玩家 1 用方向鍵／Z／X／Enter，玩家 2 用 WASD／F／G／T），約在 2:30 時按一次 `Emulation → Reset (soft reset)` | 遊戲在 reset 後回到標題畫面；狀態列仍是 `[錄製中]`，幀數繼續增加（錄製**沒有**因為 reset 中斷） |
 | B4 | **錄製中按 F9** | **被阻擋**：狀態列出現紅字「錄製中不能讀取存檔：它會破壞「從開機狀態依輸入序列執行」的前提」；遊戲畫面**沒有**跳回任何舊狀態；`[錄製中]` 的幀數繼續增加 |
-| B5 | 錄製中開 `Emulation` 選單 | `Load State (F9)` 是灰的，滑過去有 tooltip 說明原因；`Save State (F5)` 仍可用；`Reset` 仍可用 |
+| B5 | 錄製中開 `Emulation` 選單 | `Load State (F9)（記憶體）` 是灰的，滑過去有 tooltip 說明原因；`Save State (F5)（記憶體）` 仍可用；`Reset` 仍可用 |
 | B6 | 錄製中開 `File` 選單 | `Open ROM...` 是灰的（tooltip 說明）；`Save State to File...` 可用 |
 | B7 | 錄製中 `View → Debugger`，看控制列 | 「單步指令」與「Trace 到檔案…」是灰的；面板顯示**黃色說明文字**（「錄製／播放 replay 中停用：讀取存檔（F9）、單步指令、Trace、載入別的 ROM。…暫停與『單步一幀』仍可用」） |
 | B8 | 錄製中按 Debugger 的「暫停」，再按「單步一幀」幾次 | 暫停可用；每按一次「單步一幀」，狀態列 `[錄製中]` 的幀數 +1（單步的幀**會被錄進** replay）；「單步指令」仍是灰的 |

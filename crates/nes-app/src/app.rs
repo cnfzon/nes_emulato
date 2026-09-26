@@ -3,6 +3,8 @@
 //! 這個 struct 不持有 `Nes`——它只透過 `cmd_tx` 送指令給 emu 執行緒、
 //! 從 `event_rx` 收事件、從 `frame_output`（triple buffer）讀最新畫面。
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -10,7 +12,9 @@ use eframe::egui;
 use nes_core::{Buttons, DebugSnapshot, PpuViews, ReplayMismatch, RomId, RomInfo};
 
 use crate::audio::AudioOutput;
-use crate::commands::{EmuCommand, EmuEvent, PlaybackSpeed, SessionStatus};
+use crate::commands::{
+    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, PlaybackSpeed, SessionStatus,
+};
 use crate::debugger::DebuggerUi;
 use crate::input::{
     HOTKEY_LOAD_STATE, HOTKEY_SAVE_STATE, PLAYER1_KEYS, PLAYER2_KEYS, buttons_from_keys,
@@ -20,6 +24,36 @@ use crate::input::{
 const RESTRICTED_WHILE_REPLAY: &str = "錄製／播放 replay 中停用：讀取存檔（F9）、單步指令、Trace、載入別的 ROM。\
      replay 是「開機狀態 + 每幀輸入」，這些操作會讓模擬離開「從開機狀態依輸入序列執行」的軌道，\
      錄出來的 replay 之後就無法重播。暫停與「單步一幀」仍可用（單步的幀會被錄進 replay）。";
+
+/// Netplay 期間停用的功能與原因（選單提示、Debugger 面板共用）。
+const RESTRICTED_WHILE_NETPLAY: &str = "Netplay 中停用：讀取存檔（F9）、單步指令、Trace、載入別的 ROM、暫停、Reset、錄製／播放 replay。\
+     原因：這些操作只發生在你這一端，會讓雙方的模擬分歧（同步暫停與讀檔留待之後評估）。\
+     存檔仍可用：F5 存到記憶體、File → Save State to File 存成檔案，方便除錯。";
+
+/// 預設的 Netplay 監聽 port。
+const DEFAULT_NET_PORT: &str = "7000";
+
+/// Netplay 自動存下的 replay 與 desync 狀態檔的固定資料夾：執行檔旁的 `netplay_replays/`。
+fn netplay_replay_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("netplay_replays")))
+        .unwrap_or_else(|| PathBuf::from("netplay_replays"))
+}
+
+/// Netplay 選單開啟的輸入視窗。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetDialog {
+    Host,
+    Join,
+}
+
+/// 上一場 Netplay 的結果（彈出視窗顯示原因與自動存下的檔案）。
+struct NetResult {
+    kind: NetEndKind,
+    message: String,
+    files: Vec<PathBuf>,
+}
 
 /// NES 的畫面更新率（NTSC），只用來把幀數換算成秒數顯示。
 const NTSC_FPS: f64 = 60.0988;
@@ -63,6 +97,16 @@ pub struct NesApp {
     unsaved_recording: Option<Vec<u8>>,
     /// 檢查點不符時彈出的視窗內容。
     mismatch_window: Option<ReplayMismatch>,
+
+    /// Netplay 的階段與統計（來自 emu 執行緒）。
+    net: NetStatus,
+    net_dialog: Option<NetDialog>,
+    net_port_text: String,
+    net_addr_text: String,
+    net_form_error: Option<String>,
+    /// 房主決定的 input delay（0–8）；加入者使用房主的值。
+    net_input_delay: u8,
+    net_result: Option<NetResult>,
 }
 
 impl NesApp {
@@ -104,6 +148,13 @@ impl NesApp {
             playback_speed: PlaybackSpeed::X1,
             unsaved_recording: None,
             mismatch_window: None,
+            net: NetStatus::default(),
+            net_dialog: None,
+            net_port_text: DEFAULT_NET_PORT.to_string(),
+            net_addr_text: String::new(),
+            net_form_error: None,
+            net_input_delay: nes_net::DEFAULT_INPUT_DELAY,
+            net_result: None,
         }
     }
 
@@ -117,9 +168,23 @@ impl NesApp {
         matches!(self.session, SessionStatus::Playing { .. })
     }
 
-    /// 錄製或播放中：會破壞「從開機狀態依輸入序列執行」的功能都停用。
+    /// Netplay 進行中（含等待對手、連線中、中斷中）。
+    fn netplaying(&self) -> bool {
+        self.net.phase != NetPhase::Idle
+    }
+
+    /// 錄製、播放或 Netplay 中：會破壞「從開機狀態依輸入序列執行」（或讓 Netplay 雙方分歧）的功能都停用。
     fn busy(&self) -> bool {
-        self.recording() || self.playing()
+        self.recording() || self.playing() || self.netplaying()
+    }
+
+    /// 目前停用功能的原因（提示文字）。
+    fn restriction_text(&self) -> &'static str {
+        if self.netplaying() {
+            RESTRICTED_WHILE_NETPLAY
+        } else {
+            RESTRICTED_WHILE_REPLAY
+        }
     }
 
     fn apply_volume(&self) {
@@ -127,6 +192,9 @@ impl NesApp {
     }
 
     fn toggle_pause(&mut self) {
+        if self.netplaying() {
+            return; // Netplay 期間停用暫停（UI 已 disabled，這裡是保險）
+        }
         self.paused = !self.paused;
         let cmd = if self.paused {
             EmuCommand::Pause
@@ -166,6 +234,38 @@ impl NesApp {
                     self.save_recording_dialog();
                 }
                 EmuEvent::StateExported(bytes) => self.save_state_file_dialog(&bytes),
+                EmuEvent::Net(status) => self.net = status,
+                EmuEvent::NetEnded {
+                    kind,
+                    message,
+                    files,
+                } => {
+                    self.net = NetStatus::default();
+                    self.net_dialog = None;
+                    match kind {
+                        NetEndKind::Normal => {
+                            self.last_error = None;
+                            let saved = files
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            self.last_info = Some(if saved.is_empty() {
+                                message
+                            } else {
+                                format!("{message}。replay：{saved}")
+                            });
+                        }
+                        NetEndKind::Error | NetEndKind::Desync => {
+                            self.last_error = Some(message.clone());
+                            self.net_result = Some(NetResult {
+                                kind,
+                                message,
+                                files,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -180,7 +280,14 @@ impl NesApp {
         if self.playing() {
             return;
         }
-        for (player, keys) in [&PLAYER1_KEYS, &PLAYER2_KEYS].into_iter().enumerate() {
+        // Netplay：兩台電腦的本地鍵盤都用玩家 1 的按鍵配置，由 session 對應到被分配的玩家位置；
+        // 玩家 2 的按鍵（WASD…）不作用。
+        let maps: &[&crate::input::KeyMap] = if self.netplaying() {
+            &[&PLAYER1_KEYS]
+        } else {
+            &[&PLAYER1_KEYS, &PLAYER2_KEYS]
+        };
+        for (player, keys) in maps.iter().enumerate() {
             let buttons = ctx.input(|i| buttons_from_keys(keys, |key| i.key_down(key)));
             if buttons != self.last_input[player] {
                 self.last_input[player] = buttons;
@@ -288,7 +395,11 @@ impl NesApp {
     fn debugger_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let pause_label = if self.paused { "繼續" } else { "暫停" };
-            if ui.button(pause_label).clicked() {
+            if ui
+                .add_enabled(!self.netplaying(), egui::Button::new(pause_label))
+                .on_disabled_hover_text(RESTRICTED_WHILE_NETPLAY)
+                .clicked()
+            {
                 self.toggle_pause();
             }
         });
@@ -321,7 +432,7 @@ impl NesApp {
             });
         });
         if busy {
-            ui.colored_label(egui::Color32::YELLOW, RESTRICTED_WHILE_REPLAY);
+            ui.colored_label(egui::Color32::YELLOW, self.restriction_text());
         } else if !self.paused {
             ui.weak("暫停後才能單步 / trace");
         }
@@ -397,6 +508,229 @@ impl NesApp {
         }
     }
 
+    /// Netplay 選單：建立房間、加入、input delay、取消／中斷連線。
+    fn netplay_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Netplay", |ui| {
+            let idle = self.net.phase == NetPhase::Idle;
+            let can_start = idle && self.rom_info.is_some() && !self.busy();
+            let why_not = "需要先載入 ROM，且不能在錄製／播放 replay／Netplay 中";
+            if ui
+                .add_enabled(can_start, egui::Button::new("建立房間…"))
+                .on_hover_text(
+                    "你當房主（玩家 1）：在指定的 port 等對手連上。連線成功時雙方都會重新開機。",
+                )
+                .on_disabled_hover_text(why_not)
+                .clicked()
+            {
+                self.net_dialog = Some(NetDialog::Host);
+                self.net_form_error = None;
+                ui.close();
+            }
+            if ui
+                .add_enabled(can_start, egui::Button::new("加入…"))
+                .on_hover_text(
+                    "加入別人的房間（你是玩家 2）：輸入房主的 IP:port。雙方必須載入同一份 ROM。",
+                )
+                .on_disabled_hover_text(why_not)
+                .clicked()
+            {
+                self.net_dialog = Some(NetDialog::Join);
+                self.net_form_error = None;
+                ui.close();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Input delay（幀）");
+                ui.add_enabled(
+                    idle,
+                    egui::DragValue::new(&mut self.net_input_delay)
+                        .range(0..=nes_net::MAX_INPUT_DELAY),
+                )
+                .on_hover_text(
+                    "本地按鍵套用在 N 幀之後。越大越不容易 stall，但操作越延遲（2 幀約 33 ms）。",
+                );
+            });
+            ui.weak("只有房主的設定有效；加入者使用房主決定的值");
+            ui.separator();
+            let cancel_label = match self.net.phase {
+                NetPhase::Idle | NetPhase::Waiting { .. } | NetPhase::Connecting { .. } => "取消",
+                NetPhase::Connected { .. } | NetPhase::Closing => "中斷連線",
+            };
+            if ui
+                .add_enabled(
+                    !idle && self.net.phase != NetPhase::Closing,
+                    egui::Button::new(cancel_label),
+                )
+                .clicked()
+            {
+                let _ = self.cmd_tx.send(EmuCommand::NetDisconnect);
+                ui.close();
+            }
+            if !idle {
+                ui.separator();
+                ui.colored_label(egui::Color32::YELLOW, RESTRICTED_WHILE_NETPLAY);
+            }
+        });
+    }
+
+    /// 狀態列的 Netplay 資訊：連線狀態、ping、input delay、stall 次數。
+    fn net_label(&self, ui: &mut egui::Ui) {
+        let text = match self.net.phase {
+            NetPhase::Idle => return,
+            NetPhase::Waiting { port } => format!("[Netplay] 等待對手連線（UDP port {port}）…"),
+            NetPhase::Connecting { addr } => format!("[Netplay] 正在連線到 {addr}…"),
+            NetPhase::Closing => "[Netplay] 中斷連線中…".to_string(),
+            NetPhase::Connected {
+                player,
+                input_delay,
+            } => {
+                let s = &self.net.stats;
+                let ping = s.rtt.map_or("—".to_string(), |r| {
+                    format!("{:.0} ms", r.as_secs_f64() * 1000.0)
+                });
+                format!(
+                    "[Netplay] 已連線｜你是玩家 {}｜ping {ping}｜input delay {input_delay}｜stall {} 次（{:.1} 秒）｜↑{} ↓{} B/s",
+                    player + 1,
+                    s.stalls,
+                    s.stall_time.as_secs_f64(),
+                    s.send_bytes_per_sec,
+                    s.recv_bytes_per_sec,
+                )
+            }
+        };
+        ui.separator();
+        ui.colored_label(egui::Color32::LIGHT_BLUE, text);
+    }
+
+    /// 建立房間／加入的輸入視窗。
+    fn net_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.net_dialog else {
+            return;
+        };
+        let mut close = false;
+        let title = match dialog {
+            NetDialog::Host => "Netplay：建立房間",
+            NetDialog::Join => "Netplay：加入房間",
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                match dialog {
+                    NetDialog::Host => {
+                        ui.horizontal(|ui| {
+                            ui.label("監聽 port（UDP）");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_port_text)
+                                    .desired_width(70.0),
+                            );
+                        });
+                        ui.label(format!("Input delay：{} 幀（Netplay 選單可調整）", self.net_input_delay));
+                        ui.weak(
+                            "把你的區網 IP（命令提示字元執行 ipconfig，看「IPv4 位址」）與這個 port 告訴對方。\
+                             Windows 防火牆第一次跳出提示時，請允許存取（私人網路）。",
+                        );
+                    }
+                    NetDialog::Join => {
+                        ui.horizontal(|ui| {
+                            ui.label("房主的 IP:port");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_addr_text)
+                                    .hint_text("192.168.1.10:7000")
+                                    .desired_width(180.0),
+                            );
+                        });
+                        ui.weak("你是玩家 2；雙方必須載入同一份 ROM，input delay 由房主決定。");
+                    }
+                }
+                if let Some(err) = &self.net_form_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                }
+                ui.horizontal(|ui| {
+                    let go = match dialog {
+                        NetDialog::Host => "建立房間",
+                        NetDialog::Join => "連線",
+                    };
+                    if ui.button(go).clicked() {
+                        match self.start_netplay(dialog) {
+                            Ok(()) => close = true,
+                            Err(e) => self.net_form_error = Some(e),
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.net_dialog = None;
+        }
+    }
+
+    /// 檢查輸入並送出 `NetHost`／`NetJoin`。
+    fn start_netplay(&mut self, dialog: NetDialog) -> Result<(), String> {
+        let replay_dir = netplay_replay_dir();
+        match dialog {
+            NetDialog::Host => {
+                let port: u16 = self
+                    .net_port_text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "port 必須是 0–65535 的整數（例如 7000）".to_string())?;
+                let _ = self.cmd_tx.send(EmuCommand::NetHost {
+                    port,
+                    input_delay: self.net_input_delay,
+                    replay_dir,
+                });
+            }
+            NetDialog::Join => {
+                let addr: SocketAddr = self.net_addr_text.trim().parse().map_err(|_| {
+                    "格式必須是「IP:port」，例如 192.168.1.10:7000（要包含 port）".to_string()
+                })?;
+                let _ = self.cmd_tx.send(EmuCommand::NetJoin { addr, replay_dir });
+            }
+        }
+        Ok(())
+    }
+
+    /// Netplay 結束後的說明視窗（錯誤與 desync；正常離開只在狀態列顯示）。
+    fn net_result_window(&mut self, ctx: &egui::Context) {
+        let Some(result) = &self.net_result else {
+            return;
+        };
+        let mut close = false;
+        let (title, color) = match result.kind {
+            NetEndKind::Desync => ("Netplay：偵測到不同步（desync）", egui::Color32::LIGHT_RED),
+            _ => ("Netplay 已結束", egui::Color32::YELLOW),
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.colored_label(color, &result.message);
+                if !result.files.is_empty() {
+                    ui.separator();
+                    ui.label("已自動存下：");
+                    for path in &result.files {
+                        ui.add(egui::Label::new(path.display().to_string()).selectable(true));
+                    }
+                    if result.kind == NetEndKind::Desync {
+                        ui.weak(
+                            "分析：用 nes-test replay verify <rom> <replay> 找出分歧的幀範圍；\
+                             用 nes-test diff-state 比對雙方的 .state 檔。",
+                        );
+                    }
+                }
+                ui.separator();
+                ui.label("已回到單機模式。");
+                if ui.button("關閉").clicked() {
+                    close = true;
+                }
+            });
+        if close {
+            self.net_result = None;
+        }
+    }
+
     fn ensure_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
         let fb = self.frame_output.read();
         let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -439,7 +773,7 @@ impl eframe::App for NesApp {
                     let busy = self.busy();
                     if ui
                         .add_enabled(!busy, egui::Button::new("Open ROM..."))
-                        .on_disabled_hover_text(RESTRICTED_WHILE_REPLAY)
+                        .on_disabled_hover_text(self.restriction_text())
                         .clicked()
                     {
                         self.open_rom_dialog();
@@ -511,32 +845,38 @@ impl eframe::App for NesApp {
                 });
                 ui.menu_button("Emulation", |ui| {
                     let pause_label = if self.paused { "Resume" } else { "Pause" };
-                    if ui.button(pause_label).clicked() {
+                    if ui
+                        .add_enabled(!self.netplaying(), egui::Button::new(pause_label))
+                        .on_disabled_hover_text(RESTRICTED_WHILE_NETPLAY)
+                        .clicked()
+                    {
                         self.toggle_pause();
                         ui.close();
                     }
                     if ui
                         .add_enabled(
-                            self.rom_info.is_some() && !self.playing(),
+                            self.rom_info.is_some() && !self.playing() && !self.netplaying(),
                             egui::Button::new("Reset (soft reset)"),
                         )
                         .on_hover_text(
                             "soft reset：CPU/PPU/APU 重置，RAM 保留；錄製時會記進 replay（reset 是輸入的一部分）",
                         )
-                        .on_disabled_hover_text("需要載入 ROM；播放 replay 時 reset 來自 replay")
+                        .on_disabled_hover_text(
+                            "需要載入 ROM；播放 replay 時 reset 來自 replay；Netplay 中停用（reset 不是同步輸入的一部分）",
+                        )
                         .clicked()
                     {
                         let _ = self.cmd_tx.send(EmuCommand::Reset);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Save State (F5)").clicked() {
+                    if ui.button("Save State (F5)（記憶體）").clicked() {
                         let _ = self.cmd_tx.send(EmuCommand::SaveState);
                         ui.close();
                     }
                     if ui
-                        .add_enabled(!self.busy(), egui::Button::new("Load State (F9)"))
-                        .on_disabled_hover_text(RESTRICTED_WHILE_REPLAY)
+                        .add_enabled(!self.busy(), egui::Button::new("Load State (F9)（記憶體）"))
+                        .on_disabled_hover_text(self.restriction_text())
                         .clicked()
                     {
                         let _ = self.cmd_tx.send(EmuCommand::LoadState);
@@ -607,9 +947,10 @@ impl eframe::App for NesApp {
                     }
                     if busy {
                         ui.separator();
-                        ui.colored_label(egui::Color32::YELLOW, RESTRICTED_WHILE_REPLAY);
+                        ui.colored_label(egui::Color32::YELLOW, self.restriction_text());
                     }
                 });
+                self.netplay_menu(ui);
             });
         });
 
@@ -651,6 +992,7 @@ impl eframe::App for NesApp {
                 ui.separator();
                 self.audio_status_label(ui);
                 self.session_label(ui);
+                self.net_label(ui);
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
@@ -724,6 +1066,9 @@ impl eframe::App for NesApp {
                 self.mismatch_window = None;
             }
         }
+
+        self.net_dialog_window(&ctx);
+        self.net_result_window(&ctx);
 
         if self.quit_requested {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);

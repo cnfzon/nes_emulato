@@ -2246,6 +2246,7 @@ dependencies = [
  "env_logger",
  "log",
  "nes-core",
+ "nes-net",
  "serde_json",
 ]
 

@@ -8,7 +8,7 @@ rollback 連線雙人對戰。課程四大主題與對應模組（精簡版；�
 
 1. 作業系統與應用程式的關係（多執行緒、檔案 I/O、timing）→ `nes-app` 的 emu 執行緒與 channel / triple buffer、音訊環形緩衝區（`nes-app/src/audio.rs`）
 2. 視窗環境 → `nes-app`（eframe/egui）
-3. 網路環境 → `nes-net`（UDP + 手刻協定 + rollback 排程）
+3. 網路環境 → `nes-net`（UDP + 手刻協定；Phase 4b lockstep、4c rollback 排程）
 4. 整合設計 → `Nes::run_frame` 作為 core / net / app 的交會點
 
 Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes-test`（CLI 測試工具）。
@@ -41,10 +41,21 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
   `docs/architecture.md` §15。`behavior_fingerprint_is_pinned_to_the_version_numbers` 失敗時，
   **不得只更新雜湊而不遞增版本號**。
 
+## nes-net 的硬性限制
+
+- **session 與協定的邏輯不得直接讀取系統時間**（`Instant::now()`、`SystemTime`、`sleep`）：所有與時間有關的函式都由呼叫端傳入
+  「目前時間」（`now: Duration`），測試因此用虛擬時鐘，不必真的等待、結果完全可重現、不會因機器負載而偶發失敗
+  （Phase 3.5 曾發生過依賴真實時間的偶發失敗）。只有 `nes-app` 的 emu 執行緒提供真實的 `now`。
+  要等真實 socket 的測試（`UdpTransport`、`transport_roundtrip`、emu 執行緒的 loopback 測試）是少數例外，逾時只當卡死保護，並在文件說明。
+- 解碼一律回傳 `Result`，**任何位元組序列都不得 panic**；模擬網路需要的亂數用 `nes-net` 自己的固定種子 PRNG（`rng.rs`），不新增依賴。
+- netplay 的正確性以「等價性」驗證：連線兩端的行為指紋逐幀相同，且等於雙方輸入合併後離線重播的結果
+  （`nes-net/tests/equivalence.rs`、`nes-test netsim`）。改動 session／協定後這些測試必須通過。
+
 ## 測試基準與階段驗收
 
-- **目前基準（Phase 4a 結束）：332 通過 + 2 忽略**：nes-app 37、nes-core（lib）254 + 2 ignored、
-  nes-core `golden_frames` 1、nes-net 9、`transport_roundtrip` 1、nes-test 30。
+- **目前基準（Phase 4b 結束）：396 通過 + 2 忽略**：nes-app 42、nes-core（lib）254 + 2 ignored、
+  nes-core `golden_frames` 1、nes-net（lib）37、nes-net `equivalence` 6、nes-net `handshake` 20、
+  nes-net `transport_roundtrip` 2、nes-test 34。
 - 每個階段結束時，以 `cargo test --workspace` 的**實際輸出**逐一列出每個執行檔的測試數量。**數量只能增加**；若有測試被移除或被 cfg 排除，必須說明理由。
 - 每個階段的驗收指令（全部要跑並回報結果）：
   1. `cargo build --workspace`
@@ -63,9 +74,22 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
      以及 Phase 3.5 起的 `apu_test`、`blargg_apu_2005.07.30`、
      `apu_reset`、`cpu_interrupts_v2/rom_singles`），與 `docs/architecture.md` §14 與 §14.7 比對，
      不得退步；預期失敗的項目要個別說明原因，**不要硬湊到通過**。
+     **固定的計數規則（每個階段的數字必須能直接比較）**：計數單位是「一個 `.nes` 檔」，以下 **80 個**（相對 `roms/nes-test-roms/`）
+     一個都不能漏，合集（`official_only`、`all_instrs`、`ppu_vbl_nmi.nes`、`apu_test.nes`、`cpu_interrupts.nes`）與它的單檔**各算一個**：
+     `instr_test-v5/rom_singles/*`（16）＋ `official_only`、`all_instrs`（2）；`ppu_vbl_nmi/rom_singles/*`（10）＋ `ppu_vbl_nmi.nes`（1）；
+     `oam_read`（1）；`ppu_read_buffer`（1）；`sprite_hit_tests_2005.10.05/*`（11）；`blargg_ppu_tests_2005.09.15b/*`（5）；
+     `scrolltest/scroll.nes`（1）；`apu_test/rom_singles/*`（8）＋ `apu_test.nes`（1）；`blargg_apu_2005.07.30/*`（11）；`apu_reset/*`（6）；
+     `cpu_interrupts_v2/rom_singles/*`（5）＋ `cpu_interrupts.nes`（1）。
+     **不列入**（無自動判定，不宣稱通過）：`dmc_tests/*`（4）、`apu_mixer/*`（4，靠聽）。
+     回報格式固定為「80 個：X PASS、Y 預期失敗、Z 無自動判定」；`scrolltest/scroll.nes` 一律歸為 Z（沒有 `$6000` 簽章，退出碼 1 不代表失敗，
+     靠 `golden_frames`），其餘失敗歸 Y 並逐一說明。目前（Phase 3.5 起皆同）：**80 個：66 PASS、13 預期失敗、1 無自動判定**
+     （13＝`ppu_vbl_nmi` 單檔 6 ＋ 合集 1、`power_up_palette` 1、`cpu_interrupts` 單檔 4 ＋ 合集 1）。
   8. 黃金畫面：`cargo test --workspace` 已包含 `golden_frames`（需要 `roms/nes-test-roms/`，
      缺檔時略過）與 `Nes` 的 `golden_frame_hash_of_rendering_rom`。畫面雜湊改變時，先確認變動是
      預期的，再用 `nes-test golden <rom> --frames N` 重新產生並更新雜湊。
+  9. 網路模擬（Phase 4b 起）：`cargo run --release -p nes-test -- netsim <rom> --frames 3600 --runs 20`，
+     另加 `--loss 10 --delay 100 --jitter 30` 與 `--loss 30 --delay 200 --jitter 80 --duplicate 5`；三種條件都必須「兩端相同、
+     ＝離線重播、replay 位元組相同」全部通過（結束碼 0）。stall 與頻寬只回報，不設門檻（lockstep 在高延遲下本來就慢）。
 
 ## 建置與交付
 

@@ -10,7 +10,7 @@
 |---|---|---|
 | **(1) 作業系統與應用程式的關係**：多執行緒、檔案 I/O、timing | `nes-app/src/emu.rs`（emu 執行緒，60.0988Hz 固定步進）、`nes-app/src/main.rs`（`thread::spawn` + `crossbeam-channel` + `triple_buffer` 跨執行緒通訊）、`nes-app/src/app.rs`（用 `rfd`／`std::fs::read` 做檔案 I/O）、`nes-app/src/audio.rs`（系統音訊執行緒、lock-free 環形緩衝區、動態速率控制；見 §17.9） | UI 執行緒與 Emu 執行緒分離，避免模擬迴圈的 timing 被 GUI 重繪卡住；反之也避免 GUI 被模擬迴圈的 sleep 卡住。 |
 | **(2) 視窗環境** | `nes-app`（`eframe`/`egui`） | 選單列、遊戲畫面 texture、Debugger 側邊面板、狀態列、鍵盤輸入映射。 |
-| **(3) 網路環境** | `nes-net`（`protocol.rs` 封包格式、`transport.rs` UDP 傳輸層、`session.rs` rollback 排程） | 用 `std::net::UdpSocket`（non-blocking）+ 手刻協定，不用 async runtime，理由見 §5。 |
+| **(3) 網路環境** | `nes-net`（`protocol.rs` 封包格式、`transport.rs` UDP／記憶體內傳輸層、`simnet.rs` 網路模擬、`session.rs` lockstep session（Phase 4b，§19）、`rollback.rs` rollback 排程（4c）） | 用 `std::net::UdpSocket`（non-blocking）+ 手刻協定，不用 async runtime，理由見 §5；session 邏輯不讀系統時間（虛擬時鐘可測，§19）。 |
 | **(4) 整合設計** | `Nes::run_frame` 作為 `nes-core` / `nes-net` / `nes-app` 三者的交會點 | `nes-app` 的 emu 執行緒把「網路層排出的指令」（`nes-net::Request`）套用在 `nes-core::Nes` 上；GUI 只透過 channel 跟 emu 執行緒溝通，三個子系統彼此不直接耦合。 |
 
 ## 2. Crate 依賴圖
@@ -26,6 +26,7 @@ graph LR
     nes_app --> nes_core
     nes_app --> nes_net
     nes_test --> nes_core
+    nes_test --> nes_net
 ```
 
 `nes-core` 是唯一不依賴其他本專案 crate 的節點，且被所有人依賴——這是刻意的：
@@ -60,7 +61,7 @@ emu 執行緒與 UI 執行緒之間目前有 5 條獨立通道，方向、型別
 
 | 通道 | 型別 | 方向 | 用途 | 背壓策略 |
 |---|---|---|---|---|
-| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`SetDebugViews`／`StepInstruction`／`StepFrame`／`SetAudioChannelMask`／`TraceToFile`／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
+| 指令 | `crossbeam_channel::Sender/Receiver<EmuCommand>` | UI → Emu | `LoadRom`／`SetInput`／`Pause`／`Resume`／`SaveState`／`LoadState`／`SetDebugEnabled`／`SetDebugViews`／`StepInstruction`／`StepFrame`／`SetAudioChannelMask`／`TraceToFile`／`Reset`／錄製與播放／`NetHost`／`NetJoin`／`NetDisconnect`（Phase 4b）／`Quit`，每一則都有意義、不能丟 | unbounded：emu 執行緒每迴圈用 `try_iter()` 一次清空，不會累積 |
 | 事件 | `crossbeam_channel::Sender/Receiver<EmuEvent>` | Emu → UI | `RomLoaded`／`Error`／`FpsReport`／`FrameAdvanced`／`TraceWritten`，每則都要送達 | unbounded：`FpsReport` 每秒 1 則、`FrameAdvanced` 每幀 1 則（UI 每次重繪都會 `try_iter()` 清空），不會累積成問題 |
 | 畫面 | `triple_buffer::Input/Output<FrameBuffer>` | Emu → UI | 每幀畫好的 `FrameBuffer` | `triple_buffer`：只在乎「最新一張」，UI 沒讀不會擋住 emu 寫入，也不會無限堆積 |
 | Debug 快照 | `triple_buffer::Input/Output<Option<DebugSnapshot>>` | Emu → UI | Debugger 面板顯示的 CPU/PPU/APU 狀態；`None` 代表「尚未收到任何快照」，跟真實模擬狀態（即使欄位剛好是 0）明確區分 | `triple_buffer`：同 FrameBuffer；另外用 `EmuCommand::SetDebugEnabled` 讓 emu 執行緒只在面板開啟時才產生快照，面板關閉時零成本 |
@@ -161,7 +162,11 @@ Deserialize)` 可以直接運作，postcard 編碼時只需要多存一個 varia
 掉的幀，不需要額外的重傳握手（reduce round-trip，這對延遲敏感的 netplay
 很重要）。
 
-### Rollback 演算法（詳細版見 `nes-net/src/session.rs` 的 doc comment）
+> **Phase 4b 的實作是 lockstep**（雙方輸入到齊才推進），封包格式、握手、Ack／重送、指紋檢查與統計見 §19；
+> 下面的 rollback 流程是 **4c 的設計草案**（`rollback.rs` 目前只有骨架），封包的細節以 §19.3 為準
+> （例如 Checksum 用行為指紋、幀號約定）。
+
+### Rollback 演算法（詳細版見 `nes-net/src/rollback.rs` 的 doc comment）
 
 ```mermaid
 sequenceDiagram
@@ -198,8 +203,9 @@ sequenceDiagram
    雜湊），同一幀雙方雜湊不一致就代表模擬邏輯出現了不確定性，應立即中止並
    回報，而不是悄悄讓兩邊玩不同的遊戲。
 
-`RollbackSession` 目前（Phase 0）只定義了資料結構與方法簽名，`handle_msg`／
-`advance` 的本體回傳空結果，真正的排程邏輯排進後續階段。
+`RollbackSession`（`rollback.rs`）目前（Phase 0 的骨架）只定義了資料結構與方法簽名，`handle_msg`／
+`advance` 的本體回傳空結果，真正的排程邏輯排進 Phase 4c；4b 的 `LockstepSession` 已經實作了它會沿用的部分
+（握手、輸入的送收與 Ack、指紋交換、逾時、統計、事件佇列；見 §19.5）。
 
 ## 7. 決定性（determinism）規則清單
 
@@ -897,8 +903,8 @@ framebuffer 與修改前不同。** 遇到這種修改，必須遞增 `CORE_BEHA
 
 - **replay 格式**（Phase 4a 已實作，§18.3）：檔頭記錄 `CORE_BEHAVIOR_VERSION` 與 ROM 的 `rom_id`（§8.2），重播前比對；
   版本不同就拒絕（不默默重播）。**replay 的內容是「開機狀態 + 輸入序列 + 行為指紋檢查點」，不包含存檔**（§15.6）。
-- **netplay 握手**（4b 起）：雙方交換 `CORE_BEHAVIOR_VERSION` 與 `rom_id`，任一不符就拒絕連線。
-  （`nes-net` 目前的協定骨架還寫著 `rom_hash: u64`，是 Phase 0 的佔位，4b 實作握手時要改成 `rom_id`。）
+- **netplay 握手**（Phase 4b 已實作，§19.4）：雙方交換協定版本、`CORE_BEHAVIOR_VERSION` 與 `rom_id`，任一不符就拒絕連線。
+  （Phase 0 的佔位 `rom_hash: u64` 已在 4b 換成 `rom_id`。）
   這比事後靠指紋偵測到 desync 更早、訊息也更明確。desync 偵測仍保留，**用 `Nes::behavior_fingerprint`（§18.2）
   而不是 `state_hash`**：前者與存檔格式無關，雙方即使存檔格式版本不同（各自的 rollback 用各自的格式）也能比對。
 - 這兩者沿用同一個 `CORE_BEHAVIOR_VERSION`，不另建協定版本；`STATE_FORMAT_VERSION` 只影響
@@ -1485,7 +1491,283 @@ emu 執行緒也忽略）；速度 1x（60.0988 Hz，有聲音）、2x（靜音�
 
 - replay 只能從開機狀態開始；不支援含存檔的 replay（規則）。
 - 檢查點只能偵測「有沒有在該幀留下狀態差異」；被遊戲忽略的輸入不會被偵測（§18.9）。需要逐幀輸入雜湊時可以在 4b 的協定層做。
-- `nes-net` 的協定骨架仍是 `rom_hash: u64`，4b 實作握手時改用 `rom_id`（§15.5）。
+- `nes-net` 的協定骨架的 `rom_hash: u64` 已在 Phase 4b 換成 `rom_id`（§15.5、§19.4）。
 - 「單步一幀」錄製時可用；`Nes::step_instruction` 與 `load_state` 在錄製期間被拒絕，但 `nes-core` 本身不強制（呼叫端責任）；`ReplayRecorder` 只能靠
   幀數對不上與 `NotPowerOn` 偵測誤用。
 - 播放時按 reset 會被拒絕（reset 來自 replay）。
+
+## 19. Phase 4b：Lockstep 連線與網路模擬層
+
+Phase 4a 把「輸入序列 → 完全相同的結果」做成可錄製、可重播、可驗證。本階段實作第一個連線模型 **lockstep**：
+雙方在第 N 幀的輸入都到齊之後，才推進到第 N 幀。它比 rollback 簡單、容易驗證，而且 4c 的 rollback 會沿用本階段的
+transport、協定、握手與 session 介面。**`nes-core` 完全沒有修改**（`git diff -- crates/nes-core` 為空；
+`CORE_BEHAVIOR_VERSION` 仍是 3，`STATE_FORMAT_VERSION` 仍是 3）。
+
+**核心驗證策略：把 netplay 的正確性「歸約」到 4a 已驗證過的 replay 正確性。** 連線兩端的行為指紋必須逐幀相同，
+而且必須等於「把雙方輸入依 input delay 合併成一份 replay、離線重播」的結果（§19.8）。
+
+### 19.1 檔案與 API 一覽
+
+| 內容 | 位置 |
+|---|---|
+| `Transport` trait、`UdpTransport`、`InMemoryTransport`、`Datagram` | `nes-net/src/transport.rs` |
+| `SimulatedTransport`（丟包、單程延遲、抖動、重複；虛擬時鐘）、`NetworkConfig` | `nes-net/src/simnet.rs` |
+| 協定 v1：`Msg`、`RejectReason`、`DisconnectReason`、`ProtocolError`、封包編解碼 | `nes-net/src/protocol.rs` |
+| `LockstepSession`、`SessionConfig`、`Event`、`Stats`、`EndReason` | `nes-net/src/session.rs` |
+| `MatchLog`：一場對戰的合併輸入＋每幀指紋，可切出標準 `Replay` | `nes-net/src/matchlog.rs` |
+| 無視窗的對戰模擬器（`run_match`、`Endpoint`、`expected_log`、`Tamper`） | `nes-net/src/sim.rs` |
+| 固定種子 PRNG（SplitMix64，不新增依賴） | `nes-net/src/rng.rs` |
+| rollback 的骨架（4c 才實作） | `nes-net/src/rollback.rs` |
+| emu 執行緒的 Netplay 模式、`NetHost`／`NetJoin`／`NetDisconnect`、`EmuEvent::Net`／`NetEnded` | `nes-app/src/{emu,commands}.rs` |
+| Netplay 選單、對話框、狀態列 | `nes-app/src/app.rs` |
+| CLI：`nes-test netsim` | `nes-test/src/netsim_cmd.rs` |
+
+**不新增依賴**：`nes-net` 原本就有 `postcard`／`serde`／`thiserror`／`log`；`nes-test` 只新增本專案的 `nes-net`（路徑依賴）。
+`nes-net` 的 dev-dependency 讓測試使用 `nes-core` 的 `testing` feature（合成 ROM）；`cargo build --release -p nes-app`
+不會啟用它（dev-dependency 不參與 `cargo build`）。
+
+### 19.2 Transport
+
+`Transport` 只搬位元組（datagram 語意：不保證送達、順序、可能重複），**非阻塞**：
+
+```rust
+pub trait Transport {
+    fn send(&mut self, now: Duration, data: &[u8]);                        // 送給目前的對端
+    fn send_to(&mut self, now: Duration, addr: SocketAddr, data: &[u8]);   // 預設＝send
+    fn recv(&mut self, now: Duration) -> Vec<Datagram>;                    // 取出所有已到達的封包
+    fn set_peer(&mut self, addr: SocketAddr) {}                            // 握手完成時鎖定對端
+}
+```
+
+- 每個方法都帶 **`now`（呼叫端傳入的時間）**：`UdpTransport` 用不到，`SimulatedTransport` 用它決定封包何時「送達」。
+- **`UdpTransport`**：`listen(local)`（Host，對端未知）與 `connect(host)`（Client，對端＝Host）。session 在握手完成時呼叫
+  `set_peer`，**之後只接受來自對端位址的封包**：別的位址的封包會被標記 `stranger`，session 只拿它回覆「房間已滿」
+  （`Hello` → `Reject { RoomFull }`，經 `send_to`），其餘一律忽略（`udp_locks_onto_the_peer_and_marks_strangers`、
+  `a_third_party_hello_gets_room_full`）。
+- **Windows 的 `ConnectionReset`**：對已關閉的 port 送封包後，下一次 `recv_from` 會回傳 `ConnectionReset`（ICMP port
+  unreachable）。它不是致命錯誤（對方關了程式，session 靠逾時發現），`recv` 必須**跳過而不是結束**
+  （`udp_recv_survives_sending_to_a_closed_port`）。一次 `recv` 最多處理 512 個封包，避免被灌封包時卡住 emu 執行緒。
+- **`InMemoryTransport::pair()`**：同一行程內的一對端點（`Arc<Mutex<VecDeque>>`），立即送達、保持順序。
+- **`SimulatedTransport<T>`**（包在任何 transport 外層，作用在**送出端**）：`send` 時擲骰決定丟不丟、要不要多送一份、
+  每一份的送達時間 ＝ `now + delay ± jitter`（均勻分布，最小 0）；封包放進「以送達時間排序」的佇列，之後任何一次
+  `send`／`recv` 只要 `now` 已到就交給內層。`jitter > 0` 時封包自然亂序；送達時間相同的保持送出順序。
+  **單程延遲**：RTT ≈ 2 × `delay`。固定種子（SplitMix64），相同種子與呼叫順序得到完全相同的結果
+  （`loss_rate_is_roughly_calibrated_and_reproducible`）。`set_config` 可在執行中改變條件（中途斷線）。
+
+### 19.3 協定 v1（`protocol.rs`）
+
+```text
+offset  size  內容
+0       4     magic "NESN"
+4       2     協定版本（little-endian u16，PROTOCOL_VERSION = 1）
+6       …     postcard(Msg)，不得有多餘位元組
+```
+
+整個封包最大 `MAX_PACKET_SIZE` = **512 位元組**（小於乙太網路 MTU，避免 IP 分片；最大的 `Input` 封包也只有約 80 位元組）。
+`decode` 一律回傳 `Result<Msg, ProtocolError>`：長度（先於任何解碼）、magic、版本、postcard 本體、多餘位元組、`Input` 的幀數
+（≤ 64）都會檢查；**任何位元組序列都不 panic**、不做與輸入長度不成比例的配置（測試：隨機位元組、合法標頭後接隨機位元組
+各 30000 組、每個訊息的每個截斷長度、每個訊息的每個單一位元突變、超過大小上限、宣稱 2^63 個元素的長度前綴）。
+
+| 訊息 | 方向 | 內容 |
+|---|---|---|
+| `Hello` | Client → Host | `protocol_version`、`core_behavior_version`（`CORE_BEHAVIOR_VERSION`）、`rom_id`（`RomId`，整個 ROM 檔案的 xxh3-128；取代 Phase 0 的 `rom_hash: u64`） |
+| `Accept` | Host → Client | `session_id`、`input_delay`（Host 決定，0–8）、`player`（分配給 Client 的位置，永遠是 1） |
+| `Reject` | Host → Client | `reason`：`ProtocolVersion{host,client}`、`CoreVersion{host,client}`、`RomMismatch{host,client}`、`RoomFull`；`Display` 是給使用者看的中文說明 |
+| `Input` | 雙向 | `session_id`、`start_frame`、`inputs`：發送者**自己那位玩家**從 `start_frame` 起的輸入（最多 64 幀；冗餘，見 §19.5） |
+| `Ack` | 雙向 | `session_id`、`frame`：已**連續**收到對方輸入的最高幀號 |
+| `Checksum` | 雙向 | `session_id`、`frame`（已完成的幀數）、`fingerprint`（`Nes::behavior_fingerprint`） |
+| `Ping`／`Pong` | 雙向 | `session_id`、`timestamp_us`（發送者填、對方原樣送回，只有發送者解讀） |
+| `Disconnect` | 雙向 | `session_id`、`reason`（`Left`／`Desync{frame}`）、`frames_completed`（發送者已完成的幀數，見 §19.5） |
+
+**與任務規格的差異（都是為了實作需要，特此列出）**：`Hello` 沒有 `session_id`（握手時還沒有）；`Ping`／`Pong` 也帶 `session_id`
+（規格「session_id 不符的封包直接丟棄」一律適用）；`Disconnect` 多了 `frames_completed`；`Ack` 的幀號是「最高的連續幀」，
+所以只在收到過輸入之後才送（沒有「還沒收到任何幀」的值）。
+
+**幀號約定**（與 replay §18.3 一致）：輸入的幀號 `f`（0 起算）＝第 `f + 1` 次 `run_frame` 使用的輸入；`Checksum` 的
+幀號 `n`＝已完成 `n` 次 `run_frame` 之後的指紋（＝replay 檢查點的幀號）。
+
+### 19.4 握手
+
+```text
+Client                                   Host（Listening）
+  Hello ────────────────────────────────▶  依序檢查：協定版本 → 核心行為版本 → ROM
+  （每 250 ms 重送，最多 10 秒）              任一不符：Reject{原因}，Host 仍然在等別人（不鎖定這個位址）
+  ◀──────────────────────────────── Accept  全部相符：鎖定對端位址、進入 Running、送 Accept
+```
+
+- **Host 玩家 1、Client 玩家 2**；input delay 由 Host 在 `Accept` 決定（Client 的設定被覆蓋）。
+- **雙方都從開機狀態開始（重新載入 ROM），第 0 幀對齊**：session 進入 Running 時產生 `Event::Connected`，呼叫端（emu 執行緒）
+  收到後 `Nes::from_rom` 重新開機並開始記錄。
+- **Accept 掉了**：Client 繼續送 Hello；Host 已在 Running，收到 Hello 就**重送同一份 Accept**（冪等）
+  （`a_lost_accept_is_recovered…`）。30% 丟包、5% 重複下，200 組種子都在 9 秒內完成握手
+  （`handshake_completes_under_30_percent_loss_for_many_seeds`）。
+- **標頭的協定版本不同**（連本體都可能無法解碼）：解碼回傳 `UnsupportedVersion(v)`，Host 在等人時仍回覆
+  `Reject{ProtocolVersion}`（`a_hello_with_a_different_wire_version_is_rejected_readably`）。
+- **Client 逾時**：10 秒沒有 Accept／Reject → `Disconnected{HandshakeTimeout}`，文字包含「請確認 IP 與 port 正確、房主已建立房間，
+  且防火牆允許 UDP」。Host 等對手不逾時（使用者取消）。
+- **被拒絕的原因回報給 UI**：`EndReason::Rejected(RejectReason)` 的 `Display`，例如「連線被拒絕：ROM 不同：房主的 ROM 是
+  6d4b660b0ce685ed，你的是 …。請雙方載入同一份 ROM 檔案」。
+
+### 19.5 Lockstep session（`session.rs`）
+
+**介面（呼叫端每個節拍做的事）**：
+
+```rust
+session.poll(now, &mut transport);                    // 收送封包、重送、逾時、握手、統計
+while let Some(event) = session.poll_event() { … }    // Connected／Stalled／Resumed／Desync／Disconnected／Stats
+if session.local_input_wanted() { session.add_local_input(keyboard); }
+if let Some(input) = session.next_ready_frame(now) {  // 雙方輸入到齊才回傳 FrameInput
+    nes.run_frame(input);
+    session.frame_done(|| nes.behavior_fingerprint()); // 每 60 幀才呼叫閉包，交換並比對指紋
+}                                                     // None：這個節拍不推進，也不阻塞
+session.disconnect(now);                              // 使用者中斷（要繼續 poll 直到 Ended）
+```
+
+**為什麼是這個形式（給 4c 沿用）**：(1) session 是純邏輯——不擁有 `Nes`、不讀系統時間、不做 I/O、不開執行緒，
+與 `nes-core` 的「外部驅動」一致（§4），也才能用虛擬時鐘完整測試；(2) `poll`／事件佇列／統計／握手／逾時／Ack 與冗餘傳送
+與「怎麼推進」無關，rollback 直接沿用，只替換 `next_ready_frame`（缺的輸入用預測補上、事後讀檔重跑）；(3) 呼叫端主動輪詢比
+callback 簡單：emu 執行緒本來就每毫秒醒來一次。
+
+- **不讀系統時間**：`poll`、`next_ready_frame`、`disconnect` 都由呼叫端傳入 `now`（自任意原點起算的 `Duration`）；stall 的時間、
+  逾時、重送、ping 全用它。`nes-net` 的 `src/` 沒有任何 `Instant::now()`／`SystemTime`（只有測試 `transport_roundtrip.rs` 與
+  `transport.rs` 的 UDP 單元測試為了等真實 socket 而使用，見 §19.10）。
+- **Input delay D（預設 2，0–8）**：本地第 k 次取樣的按鍵套用在第 `k + D` 幀；前 D 幀雙方都是空輸入（協定約定，雙方都知道 D）。
+  `local_input_wanted()` 保證每推進一幀恰好取樣一次（本地輸入永遠只領先 `D + 1` 幀，不會因為 stall 而堆積）。
+- **冗餘傳送**：每個 `Input` 封包帶「所有尚未被對方 Ack 的本地輸入」（從最舊的未確認幀起，上限 64 幀）；有新輸入立刻送，
+  沒有新輸入但仍有未確認的（stall 中），每 50 ms 重送；收到 `Ack` 就丟棄已確認的。接收端每收到一個 `Input`（含重複的）就回 `Ack`。
+  `redundancy = false`（只用於比較實驗）：每個封包只帶一幀——新輸入送最新一幀，每 50 ms 重送最舊的未確認幀；仍然正確，但
+  掉一個包要等一次重送。
+- **決定性**：`next_ready_frame` 只在第 f 幀雙方的輸入都已確定時才回傳，輸入一經收下不會被覆蓋，所以**交給 `run_frame` 的
+  `FrameInput` 序列只由雙方輸入決定，與封包的到達順序、時間、丟失、重複都無關**（§19.8 驗證）。`reset` 永遠是 `false`
+  （netplay 期間 reset 不是同步輸入的一部分，UI 停用它）。
+- **指紋交換**：每 60 個已完成的幀，雙方各送 `Checksum` 並比對。不符 → `Event::Desync { frame, local, remote }`，session 停止
+  （接著 `Disconnected { Desync }`），並送 `Disconnect { Desync }` 通知對方（對方也產生 Desync）。Checksum 不重送：掉了就略過該
+  檢查點，下一個 60 幀再比（desync 是持續的狀態分歧，不會因為漏比一次而漏掉）。
+- **逾時**：Running 中超過 5 秒沒有收到對方**任何**（session_id 相符的）封包 → `Disconnected { Timeout }`。每 500 ms 的
+  Ping 保證閒置時也有封包。
+- **中斷與幀數交換**：`disconnect(now)` 送 `Disconnect { Left, frames_completed }` 並進入 `Closing`（每 100 ms 重送，最多等 1 秒）；
+  對方收到後**回覆自己的 `frames_completed`** 再結束。雙方各自得到對方的幀數（`Event::Disconnected.peer_frames`），
+  存 replay 時**取兩者較小值**，兩份檔案的位元組因此完全相同。沒有交換到（強制結束、斷線逾時）時 `peer_frames` 是 `None`，
+  各自存自己的長度（仍各自通過 verify，但可能差幾幀）。
+- **統計**（`Stats`，`Event::Stats` 每秒一次，或 `stats()` 隨時查）：平滑 RTT（Ping／Pong）、input delay、已完成幀數、累計
+  stall 次數與時間（`next_ready_frame` 第一次等不到對方輸入時開始，等到才結束；一次連續等不到只算一次）、累計與最近 1 秒視窗的
+  每秒位元組數（UDP payload，不含 UDP／IP 標頭 28 位元組／封包）、封包數。stall 只在「本地輸入已有、就缺對方的」時計算。
+  第一個 stall 可能是開機時等第一個封包（連上時預填的輸入立刻送出，理想網路下實測 stall 為 0）。
+- **邊界**：對方輸入最多領先「連續收到的幀」256 幀（防記憶體被灌）；幀號用 `checked_add`；Ack 超過本地輸入時截斷；
+  session_id 不符、垃圾封包、結束後的封包一律忽略（`garbage_and_foreign_session_packets_are_ignored`、
+  `a_hostile_input_packet_cannot_grow_memory_or_overflow`）。
+
+### 19.6 `nes-app` 的整合
+
+- **emu 執行緒有兩種模式**：Local（`Session::Idle`／錄製／播放）與 Netplay（`Session::Netplay`）。Netplay 下仍以 60.0988 Hz
+  為節拍；**每次迴圈（約 1 ms）poll 一次 socket**（`net_poll`：收送封包、重送、逾時、事件），每個幀節拍向 session 要下一幀：
+  沒到齊就回傳 `Tick::Stalled`——**不推進、不阻塞執行緒**（UI 保持反應；音訊的空檔交給既有的動態速率控制），累積的時間最多留
+  一幀（恢復後不狂追），下個迴圈立刻再試。等對手／握手中不推進任何幀。**emu 執行緒是唯一提供 `now`（`Instant`）的地方**。
+- **連線成功 → 雙方重新開機**：收到 `Event::Connected` 時 `Nes::from_rom` 重新開機並建立 `MatchLog`。
+- **Netplay 期間停用**（emu 執行緒與 UI **兩層都擋**，被拒絕的操作不做任何事）：讀取存檔（F9）、單步指令、Trace、載入 ROM、
+  暫停、Reset、錄製／播放 replay。emu 執行緒回報「Netplay 中不能 X：單方面這麼做會讓雙方的模擬分歧（同步暫停／讀檔留待之後
+  評估）」；UI 把選單與按鈕設為 disabled 並附 tooltip，Debugger 面板顯示黃色說明。**存檔保留**（F5 存到記憶體；`File → Save State to File...` 匯出 `.state` 檔）。
+  Netplay 期間只有本地一個搖桿：**兩台電腦都用玩家 1 的按鍵配置**，session 對應到被分配的位置（`SetInput(1, …)` 被忽略）。
+- **每場連線自動錄成 replay**（沿用 4a 的格式，內容為雙方合併後的輸入），存到**執行檔旁的 `netplay_replays\`**：
+  `netplay-<Unix 秒>-p<1|2>-<ROM 前 16 字元>.replay`（`MatchLog::to_replay`，檢查點間隔 60）。正常結束時取雙方共同完成的幀數。
+  關閉程式（`Quit`）也走同一條路：送 `Disconnect` 並最多等 0.5 秒交換幀數再結束。
+- **Desync**：自動存下**目前的狀態檔**（`…-desync-frame<N>.state`）與該場 replay，UI 彈出視窗列出路徑與分析指令
+  （`nes-test replay verify` 找分歧幀範圍、`nes-test diff-state` 比對兩台的 `.state`；兩台偵測到的時間點可能差幾幀，
+  所以 `.state` 不保證是同一幀）。
+- **斷線、被拒絕、逾時、無法綁定 port**：一律回到單機模式（手上的 `Nes` 維持原狀繼續跑）並回報原因（`EmuEvent::NetEnded`，
+  UI 彈出視窗＋狀態列紅字）；不 panic。
+- **最小 UI**：`Netplay` 選單——建立房間（輸入 port）、加入（輸入 IP:port，格式錯誤在視窗內提示）、input delay（0–8，僅房主有效）、
+  取消／中斷連線；狀態列：`[Netplay] 已連線｜你是玩家 N｜ping … ms｜input delay D｜stall N 次（S 秒）｜↑ ↓ B/s`。
+  完整大廳留到 4d。
+
+### 19.7 `nes-test netsim`（無視窗的網路模擬）
+
+```bash
+nes-test netsim <rom> --frames 3600 --loss 10 --delay 100 --jitter 30 --duplicate 0 --seed 1 --runs 20 \
+    --input-delay 2 [--no-redundancy] [--script-seed 0x5eed] [--blackout-at <秒>]
+```
+
+在同一行程內建立兩個 `LockstepSession`，經由 `SimulatedTransport` 連線，用**虛擬時鐘**（每步 1 ms，兩端各自依 60.0988 Hz 累加器
+推進，與 emu 執行緒相同的迴圈）與腳本化的雙方輸入（每 3 次取樣換一次按鍵，兩位玩家、不同種子互不相同）跑指定幀數。輸出一列一個
+種子的 Markdown 表格（可直接貼進報告），欄位：**完成**、**兩端相同**（逐幀指紋）、**＝離線重播**（獨立算出的標準答案）、
+**replay 相同**（兩端各自記錄的 replay 與離線 replay 的位元組相同）、stall A／B（次／ms）、虛擬耗時與平均幀率、A→B 與 B→A 的每秒位元組數；
+最後一列是平均。全部通過 → 結束碼 0；有失敗 → 1；ROM 讀不了 → 2。`--blackout-at` 從指定的虛擬時間起丟棄所有封包（斷線實驗）。
+
+### 19.8 測試與驗證策略
+
+**等價性（`nes-net/tests/equivalence.rs`，本階段最重要）**：離線標準答案 `expected_log` 只由「雙方腳本 ＋ input delay ＋ ROM」算出
+（第 f 幀的輸入：`f < D` 為空，否則是各自的第 `f − D` 次取樣），**完全不經過網路與 session**——所以它是獨立的基準，不是「拿 session 的輸出
+跟 session 的輸出比」。每組驗證：(1) 兩端的逐幀指紋序列相同；(2) 兩端都等於離線標準答案；(3) 兩端各自記錄的 replay（**每幀一個檢查點**）
+與離線 replay 的位元組完全相同，且離線 replay 通過 `replay::verify`；(4) 沒有任何 Desync 事件。
+
+| 測試 | 內容 |
+|---|---|
+| `ideal_network_…`／`lossy_100ms_30ms_jitter_…`／`terrible_network_…` | 3600 幀、**各 20 組不同種子**（合成的輸入探針 ROM：每一幀的輸入都會留在 RAM 裡）：理想網路；10% 丟包、100 ms、抖動 30 ms；30% 丟包、200 ms、抖動 80 ms、5% 重複 |
+| `every_input_delay_from_0_to_8_is_equivalent` | D = 0…8 各 600 幀（有丟包） |
+| `off_by_one_frame_application_is_detected` | **破壞性測試**：接收端把對方的輸入套用到錯誤的幀（差 1）→ 等價性測試**必須失敗**，而且 session 自己的指紋交換在第 60 幀抓到（Desync 事件） |
+| `disabling_redundancy_stays_correct_but_stalls_much_more` | **破壞性測試**：關閉冗餘傳送——結果仍正確（等價），但 stall 時間增加（數據見 §19.9） |
+
+**其他**：握手（成功、三種不符各自被拒絕並回傳正確原因、拒絕後 Host 仍能接受好的 Client、30% 丟包 200 組種子、Accept 掉了、Client 逾時、房間已滿、
+標頭版本不同）、斷線（中途丟棄所有封包 → 雙方都在斷網後約 5 秒產生 `Disconnected { Timeout }`，5 組種子；主動中斷、對方不回覆、結束後不再產生事件）、
+stall 統計、垃圾封包與敵意封包、真實 UDP（`transport_roundtrip.rs`：兩個 `UdpTransport` 綁在 127.0.0.1，兩個 session 各跑 600 幀，兩端指紋相同且等於離線重播）、
+emu 執行緒（`emu.rs`：兩個 emu 執行緒經 loopback 連線、雙方存下位元組相同且通過 verify 的 replay；關閉程式的路徑；ROM 不同被拒絕；被停用的操作；port 被佔用）、
+`netsim` 子命令、`MatchLog` 與 `ReplayRecorder` 位元組相同。
+
+### 19.9 實測結果（`nes-test netsim`，Spacegulls，3600 幀，input delay 2，20 組種子，release）
+
+以下都是實際執行的結果。「stall」是**每端**的平均（次數／毫秒）；「耗時」是虛擬時間（理想是 3600 ÷ 60.0988 ≈ 59.9 秒）。
+
+| 網路條件（單程延遲） | 等價（兩端相同＋＝離線重播＋replay 位元組相同） | stall A（次／ms） | stall B（次／ms） | 耗時（s） | 平均幀率 | 頻寬 A→B／B→A（B/s） |
+|---|---|---|---|---|---|---|
+| 理想網路 | **20/20** | 0.0／0 | 0.0／0 | 59.9 | 60.1 | 1886／1886 |
+| 10% 丟包、100 ms、抖動 ±30 ms | **20/20** | 2228.8／92417 | 2220.4／92282 | 151.2 | 23.8 | 1140／1139 |
+| 30% 丟包、200 ms、抖動 ±80 ms、5% 重複 | **20/20** | 2019.0／216310 | 2033.4／216001 | 275.4 | 13.1 | 896／897 |
+
+（合成 ROM 版的同一組測試 `cargo test -p nes-net --test equivalence` 也全數等價；這裡用 Spacegulls 是因為報告要用真實遊戲的數字。）
+
+**這些數字說明了 lockstep 的本質，不是實作的問題**：input delay 2 幀只有約 33 ms，而條件 2、3 的單程延遲是 100／200 ms（RTT 200／400 ms 以上）。
+lockstep 每個往返只能前進「約 D + 1 幀」，所以幀率掉到 24／13 fps，遊戲「慢動作」但**完全正確**——這正是需要 rollback（4c）的理由。
+理想網路（同機／低延遲區網）下 stall 為 0、幀率 60.1。頻寬約 1–2 KB/s（冗餘傳送在丟包時每個封包帶較多輸入，理想網路反而較高：每幀一個封包
+＋每個 `Input` 一個 `Ack`）。
+
+**破壞性測試 2：關閉冗餘傳送（`--no-redundancy`）——結果仍然全部等價，stall 增加。**
+
+| 網路條件 | 冗餘 | 等價 | stall（每端，次／ms） | 耗時（s） | 平均幀率 |
+|---|---|---|---|---|---|
+| 10% 丟包、100 ms、±30 ms | 開 | 20/20 | 2228.8／92417 | 151.2 | 23.8 |
+| | **關** | 20/20 | 1701.3／168702 | 227.8 | 15.8 |
+| 30% 丟包、200 ms、±80 ms、5% 重複 | 開 | 20/20 | 2019.0／216310 | 275.4 | 13.1 |
+| | **關** | 20/20 | 1904.6／636253 | 695.5 | 5.2 |
+| 20% 丟包、15 ms、±5 ms（丟包主導） | 開 | 20/20 | 437.1／5211 | 65.0 | 55.4 |
+| | **關** | 20/20 | 1121.2／41576 | 100.9 | 35.7 |
+
+丟包主導條件下 stall 時間增加約 8 倍（5.2 s → 41.6 s，55.4 → 35.7 fps）；在高延遲條件下，stall 時間增加 1.8 倍與 2.9 倍（stall **次數**反而略少：沒有冗餘時「一次連續的 stall」拖得更久、合併成較少的次數）；丟包是主因時差距最明顯
+（冗餘讓下一個封包自然補上掉的幀，沒有冗餘就得等一次逾時重送）。
+
+### 19.10 已知限制與偏離規格之處
+
+- **UDP 單元測試也用了真實時間**：規格說「真實 UDP 跑 600 幀」是唯一使用真實時間的測試。實作上 `transport.rs` 的 `UdpTransport` 單元測試（3 個）與
+  `transport_roundtrip.rs` 的 `hello_roundtrip_over_udp` 也需要等 loopback 送達（輪詢 + 短暫 sleep，上限只是卡死保護）；它們不涉及 session 邏輯。
+  `nes-app` 的 emu 執行緒測試（兩個執行緒經 loopback 對戰）也是實時的（emu 執行緒本來就由實時計時器驅動），全部事件驅動、逾時只是卡死保護。
+  **session 與協定的所有測試（握手、等價性、斷線、破壞性）都是虛擬時鐘。**
+- **真實 UDP 測試的逾時**：整場 60 秒（`HANG_GUARD`）只用來在卡死時讓測試失敗；幀不依 60 Hz 推進（有輸入就跑），實測約 1.1 秒；session 的 5 秒斷線逾時只有在
+  loopback 上 5 秒完全沒封包才會觸發（機器被凍結超過 5 秒才可能）。
+- **lockstep 在高延遲下慢**（§19.9）；**不做** NAT 穿透、IPv6 監聽（Host 綁 `0.0.0.0`）、多於兩位玩家、觀戰。
+- **同步暫停、同步讀檔、netplay 中的 Reset**：停用（Reset 若要支援，必須成為 `Input` 的一部分；留待之後評估）。
+- **Checksum 不重送**（§19.5）；Desync 時兩台的 `.state` 不一定是同一幀。
+- **Netplay 結束後手上的 `Nes` 繼續在單機模式運作**（不重新開機）。
+- **GUI 部分沒有自動化驗證**：選單／對話框／狀態列的外觀與文字、Windows 防火牆、真實區網的延遲與 stall、彈出視窗（含 Desync 視窗，因為無法在 GUI 上自動觸發 desync）——
+  見 [`manual-test-phase4b.md`](manual-test-phase4b.md)。emu 執行緒的 Desync 存檔路徑（`finish_netplay` 的 `.state` 分支）只由 `nes-net` 的 desync 偵測測試與程式碼審視涵蓋，
+  沒有端到端的自動測試（沒有辦法在 emu 執行緒上注入故障）。
+
+**input delay 掃描**（理想網路 + 單程延遲 20 ms＝RTT 約 40 ms，3 組種子，Spacegulls 3600 幀；實測）：
+
+| input delay | 兩端相同＋＝離線重播 | stall（每端，次／ms） | 平均幀率 |
+|---|---|---|---|
+| 0 | 3/3 | 3600.0／77400 | 26.7 |
+| 1 | 3/3 | 3596.0／9930 | 53.3 |
+| 2 | 3/3 | 1.0／41（A）、15.0／46（B）（只有開機時） | 60.1 |
+| 4 | 3/3 | 1.0／41、0.0／0 | 60.1 |
+| 8 | 3/3 | 1.0／41、0.0／0 | 60.1 |
+
+RTT 約 40 ms（約 2.4 幀）時，D ≥ 2 就不再 stall；D = 0／1 每幀都在等。真實區網（RTT 幾毫秒）用預設的 D = 2 綽綽有餘。

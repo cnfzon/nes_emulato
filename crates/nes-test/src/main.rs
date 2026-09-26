@@ -8,10 +8,13 @@
 //! - `replay info|verify|generate`：replay 檔案的檢視、驗證（全部檢查點）與產生（Phase 4a）。
 //! - `diff-state <a> <b>`：逐欄位比對兩份存檔，找出 desync 從哪個欄位開始。
 //! - `save-state <rom> <out>`：跑到指定幀（可依 replay 輸入）後寫出存檔，供 `diff-state` 使用。
+//! - `netsim <rom>`：無視窗的網路模擬（兩個 lockstep session、虛擬時鐘、可調丟包／延遲／抖動／重複），
+//!   驗證連線兩端與離線重播逐幀相同，並輸出 stall 與頻寬（Phase 4b）。
 
 mod blargg;
 mod diff_state;
 mod nestest_log;
+mod netsim_cmd;
 mod png;
 mod replay_cmd;
 
@@ -78,6 +81,44 @@ enum Command {
         /// 跑幾幀（有 replay 時預設跑完全部；沒有時預設 0＝開機狀態）。
         #[arg(long)]
         frames: Option<u32>,
+    },
+    /// 無視窗的網路模擬：兩個 lockstep session 經由模擬網路（虛擬時鐘）連線，用腳本化輸入跑指定幀數，
+    /// 驗證兩端逐幀指紋相同、且等於離線重播，並輸出 stall 與頻寬（表格格式）。
+    /// 結束碼：全部通過 0、有失敗 1、ROM 讀不了 2。
+    Netsim {
+        rom: PathBuf,
+        #[arg(long, default_value_t = 3600)]
+        frames: u32,
+        /// 丟包率（百分比，0–100）。
+        #[arg(long, default_value_t = 0.0)]
+        loss: f64,
+        /// 單程延遲（毫秒；RTT 約為兩倍）。
+        #[arg(long, default_value_t = 0)]
+        delay: u64,
+        /// 抖動（毫秒）：每個封包的延遲在 delay ± jitter 之間均勻分布，會造成亂序。
+        #[arg(long, default_value_t = 0)]
+        jitter: u64,
+        /// 重複封包率（百分比，0–100）。
+        #[arg(long, default_value_t = 0.0)]
+        duplicate: f64,
+        /// 網路模擬的（起始）種子；`--runs N` 會用 seed、seed+1、…。
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// 跑幾組連續的種子。
+        #[arg(long, default_value_t = 1)]
+        runs: u64,
+        /// input delay（0–8）。
+        #[arg(long, default_value_t = 2)]
+        input_delay: u8,
+        /// 關閉冗餘傳送（只用於比較實驗：仍然正確，但 stall 增加）。
+        #[arg(long)]
+        no_redundancy: bool,
+        /// 雙方輸入腳本的種子。
+        #[arg(long, default_value_t = 0x5EED)]
+        script_seed: u64,
+        /// 從虛擬時間第 N 秒起丟棄所有封包（斷線實驗；此時「完成」欄會是「否」）。
+        #[arg(long)]
+        blackout_at: Option<f64>,
     },
     /// 執行 blargg 測試 ROM（`$6000` 結果協定）並回報 pass/fail。
     Blargg {
@@ -148,6 +189,33 @@ fn main() -> ExitCode {
             } => replay_cmd::generate(&rom, &out, frames, seed, interval, &reset_at),
         },
         Command::DiffState { a, b } => replay_cmd::diff_state(&a, &b),
+        Command::Netsim {
+            rom,
+            frames,
+            loss,
+            delay,
+            jitter,
+            duplicate,
+            seed,
+            runs,
+            input_delay,
+            no_redundancy,
+            script_seed,
+            blackout_at,
+        } => netsim_cmd::run(&netsim_cmd::Args {
+            rom: &rom,
+            frames,
+            loss,
+            delay_ms: delay,
+            jitter_ms: jitter,
+            duplicate,
+            seed,
+            runs,
+            input_delay,
+            no_redundancy,
+            script_seed,
+            blackout_at,
+        }),
         Command::SaveState {
             rom,
             out,

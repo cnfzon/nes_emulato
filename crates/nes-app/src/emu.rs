@@ -17,14 +17,28 @@
 //! 會被記進 replay）；暫停可用。所有幀（計時器驅動或單步）都經過 [`Emu::run_one_frame`]，所以
 //! 錄製一定記錄得到每一幀，reset 也只透過 `FrameInput` 傳遞。
 //!
+//! # Netplay（Phase 4b，lockstep）
+//!
+//! 模式：**Local**（`Session::Idle`／錄製／播放）與 **Netplay**（`Session::Netplay`）。Netplay 下 emu 執行緒
+//! 仍以 60.0988 Hz 為節拍；**每次迴圈（約 1 ms）都 poll 一次 socket**（收封包、送重送、逾時），
+//! 每個幀節拍再向 session 要「下一幀」：雙方輸入沒到齊就**不推進、也不阻塞**（UI 與音訊照常，音訊的空檔
+//! 交給既有的動態速率控制），下個迴圈再試。輸入延遲、握手、重送、指紋檢查都在 `nes-net` 的
+//! `LockstepSession`；這裡只負責把 session 的輸出（`FrameInput`）套用在 `Nes` 上，並把每一幀記進
+//! `MatchLog`（雙方合併後的輸入 ＋ 每幀指紋），結束時存成標準的 replay。
+//!
+//! Netplay 期間停用讀取存檔、單步、trace、載入 ROM、暫停、reset、錄製／播放 replay（單方面做這些會讓
+//! 雙方分歧；同步暫停留待之後評估）。存檔到檔案（F5、匯出）保留，方便除錯。
+//! Desync 時自動存下目前的狀態檔與該場 replay。**`nes-net` 的邏輯不讀系統時間**：`now` 全由這裡的
+//! `Instant` 提供。
+//!
 //! TODO：之後可以換成 `spin_sleep`（忙等 + 讓出時間片混合，減少 sleep 的
 //! 系統排程抖動）。
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
 use nes_core::replay::DEFAULT_CHECKPOINT_INTERVAL;
@@ -33,8 +47,13 @@ use nes_core::{
     ReplayMismatch, ReplayPlayer, ReplayRecorder,
 };
 
+use nes_net::matchlog::MatchLog;
+use nes_net::{EndReason, Event as NetEvent, LockstepSession, SessionConfig, Status, UdpTransport};
+
 use crate::audio::{AudioProducer, RateController};
-use crate::commands::{EmuCommand, EmuEvent, PlaybackSpeed, SessionStatus};
+use crate::commands::{
+    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, PlaybackSpeed, SessionStatus,
+};
 
 const TARGET_FPS: f64 = 60.0988;
 
@@ -48,6 +67,9 @@ const MAX_TRACE_INSTRUCTIONS: u32 = 1_000_000;
 
 /// 「最快」播放時，每個時間片最多連續跑多久才回頭處理指令與發布狀態。
 const MAX_SPEED_SLICE: Duration = Duration::from_millis(8);
+
+/// 結束程式時，等對方回覆它已完成幀數的時間上限（Netplay）。
+const QUIT_GRACE: Duration = Duration::from_millis(500);
 
 /// 從目前位置起執行 `count` 條指令，把每條指令「執行前」的 trace 行寫入
 /// `path`。呼叫端必須確保模擬已暫停（`Nes::step_instruction` 的限制）。
@@ -153,11 +175,85 @@ impl AudioSide {
     }
 }
 
-/// 目前的工作階段：一般執行、錄製、或播放 replay。
+/// 目前的工作階段：一般執行、錄製、播放 replay、或 Netplay。
 enum Session {
     Idle,
     Recording(ReplayRecorder),
     Replaying(ReplayPlayer),
+    Netplay(Box<Netplay>),
+}
+
+/// Netplay（lockstep）工作階段。
+struct Netplay {
+    session: LockstepSession,
+    transport: UdpTransport,
+    /// session 的時間原點：`now = clock.elapsed()`。`nes-net` 不讀系統時間，這裡是唯一提供時間的地方。
+    clock: Instant,
+    /// 連線成功（重新開機）之後才有：雙方合併後的輸入與每幀指紋。
+    log: Option<MatchLog>,
+    replay_dir: PathBuf,
+    /// 房主：實際監聽的 port；加入者：房主的位址。
+    target: NetTarget,
+    last_status: Status,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NetTarget {
+    Host { port: u16 },
+    Join { addr: std::net::SocketAddr },
+}
+
+impl Netplay {
+    fn phase(&self) -> NetPhase {
+        match (self.session.status(), self.target) {
+            (Status::Waiting | Status::Connecting, NetTarget::Host { port }) => {
+                NetPhase::Waiting { port }
+            }
+            (Status::Waiting | Status::Connecting, NetTarget::Join { addr }) => {
+                NetPhase::Connecting { addr }
+            }
+            (Status::Running, _) => NetPhase::Connected {
+                player: self.session.local_player(),
+                input_delay: self.session.input_delay(),
+            },
+            (Status::Closing, _) => NetPhase::Closing,
+            (Status::Ended, _) => NetPhase::Idle,
+        }
+    }
+
+    fn status(&self) -> NetStatus {
+        NetStatus {
+            phase: self.phase(),
+            stats: self.session.stats(),
+        }
+    }
+}
+
+/// 開始 Netplay 的角色。
+enum NetRole {
+    Host { port: u16, input_delay: u8 },
+    Join { addr: std::net::SocketAddr },
+}
+
+/// session_id：Host 每場不同即可（用系統時間與行程 id 攪出來；`nes-net` 不產生亂數）。
+fn fresh_session_id() -> u32 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    (nanos ^ (nanos >> 32)) as u32 ^ std::process::id().rotate_left(16)
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn write_into(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes)?;
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
 /// 一幀跑完之後的結果。
@@ -169,6 +265,17 @@ enum FrameOutcome {
     Mismatch(ReplayMismatch),
     /// 錄製時記錄失敗（幀數對不上、超過上限）。
     RecordFailed(ReplayError),
+    /// Netplay：下一幀雙方的輸入還沒到齊，這個節拍不推進（不阻塞，下個迴圈再試）。
+    Stalled,
+}
+
+/// 一個幀節拍的結果。
+enum Tick {
+    Ran,
+    /// Netplay 的輸入沒到齊。
+    Stalled,
+    /// 工作階段結束（播完、不符、錄製失敗）。
+    Ended,
 }
 
 /// Emu 執行緒的全部狀態。
@@ -203,21 +310,30 @@ impl Emu {
         self.send(EmuEvent::Error(message.into()));
     }
 
-    /// 錄製或播放中（不是一般執行）。
+    /// 錄製、播放或 Netplay 中（不是一般執行）。
     fn busy(&self) -> bool {
         !matches!(self.session, Session::Idle)
     }
 
-    /// 拒絕一個會破壞「從開機狀態依輸入序列執行」的操作，並說明原因。
+    fn netplaying(&self) -> bool {
+        matches!(self.session, Session::Netplay(_))
+    }
+
+    /// 拒絕一個會破壞「從開機狀態依輸入序列執行」（或讓 Netplay 雙方分歧）的操作，並說明原因。
     fn refuse(&self, what: &str) {
-        let during = match self.session {
-            Session::Recording(_) => "錄製中",
-            Session::Replaying(_) => "播放 replay 中",
+        let (during, why) = match self.session {
+            Session::Recording(_) => ("錄製中", "它會破壞「從開機狀態依輸入序列執行」的前提"),
+            Session::Replaying(_) => (
+                "播放 replay 中",
+                "它會破壞「從開機狀態依輸入序列執行」的前提",
+            ),
+            Session::Netplay(_) => (
+                "Netplay 中",
+                "單方面這麼做會讓雙方的模擬分歧（同步暫停／讀檔留待之後評估）",
+            ),
             Session::Idle => return,
         };
-        self.error(format!(
-            "{during}不能{what}：它會破壞「從開機狀態依輸入序列執行」的前提"
-        ));
+        self.error(format!("{during}不能{what}：{why}"));
     }
 
     fn session_status(&self) -> SessionStatus {
@@ -232,6 +348,8 @@ impl Emu {
                 verified: p.verified_checkpoints(),
                 checkpoints: p.checkpoint_count(),
             },
+            // Netplay 的狀態走 `EmuEvent::Net`，不佔用錄製／播放的狀態列。
+            Session::Netplay(_) => SessionStatus::Idle,
         }
     }
 
@@ -249,6 +367,195 @@ impl Emu {
         if notify {
             self.send(EmuEvent::Paused(paused));
         }
+    }
+
+    // ---- Netplay -----------------------------------------------------------------
+
+    /// 通知 UI 目前的 Netplay 階段與統計。
+    fn send_net_status(&self) {
+        let status = match &self.session {
+            Session::Netplay(rt) => rt.status(),
+            _ => NetStatus::default(),
+        };
+        self.send(EmuEvent::Net(status));
+    }
+
+    fn net_failed(&self, message: String) {
+        self.send(EmuEvent::NetEnded {
+            kind: NetEndKind::Error,
+            message,
+            files: Vec::new(),
+        });
+    }
+
+    fn start_netplay(&mut self, role: NetRole, replay_dir: PathBuf) {
+        if self.busy() {
+            self.refuse("開始 Netplay");
+            return;
+        }
+        let Some(rom_id) = self.nes.as_ref().map(Nes::rom_id) else {
+            self.net_failed("請先載入 ROM（雙方必須載入同一份 ROM 檔案）".into());
+            return;
+        };
+        let (transport, cfg, target) = match role {
+            NetRole::Host { port, input_delay } => {
+                match UdpTransport::listen(([0, 0, 0, 0], port).into()) {
+                    Ok(t) => {
+                        let actual = t.local_addr().map_or(port, |a| a.port());
+                        (
+                            t,
+                            SessionConfig::host(rom_id, input_delay, fresh_session_id()),
+                            NetTarget::Host { port: actual },
+                        )
+                    }
+                    Err(e) => {
+                        return self.net_failed(format!(
+                            "無法在 port {port} 建立房間：{e}（這個 port 可能已被別的程式使用）"
+                        ));
+                    }
+                }
+            }
+            NetRole::Join { addr } => match UdpTransport::connect(addr) {
+                Ok(t) => (t, SessionConfig::client(rom_id), NetTarget::Join { addr }),
+                Err(e) => return self.net_failed(format!("無法建立網路連線：{e}")),
+            },
+        };
+        if self.paused {
+            self.set_paused(false, true);
+        }
+        self.pending_reset = false;
+        let rt = Netplay {
+            session: LockstepSession::new(cfg),
+            transport,
+            clock: Instant::now(),
+            log: None,
+            replay_dir,
+            target,
+            last_status: Status::Ended,
+        };
+        self.session = Session::Netplay(Box::new(rt));
+        self.send_net_status();
+    }
+
+    /// 每次迴圈呼叫：驅動 session（收送封包、重送、逾時），處理它的事件。
+    fn net_poll(&mut self) {
+        let (events, status) = match &mut self.session {
+            Session::Netplay(rt) => {
+                let now = rt.clock.elapsed();
+                rt.session.poll(now, &mut rt.transport);
+                let events: Vec<NetEvent> =
+                    std::iter::from_fn(|| rt.session.poll_event()).collect();
+                (events, rt.session.status())
+            }
+            _ => return,
+        };
+        for event in events {
+            match event {
+                NetEvent::Connected { .. } => self.net_connected(),
+                NetEvent::Stats(_) => self.send_net_status(),
+                NetEvent::Disconnected {
+                    reason,
+                    peer_frames,
+                } => self.finish_netplay(reason, peer_frames),
+                // Desync 之後一定接著 Disconnected（在那裡存檔）；stall 統計走 Stats。
+                NetEvent::Desync { .. } | NetEvent::Stalled { .. } | NetEvent::Resumed { .. } => {}
+            }
+        }
+        let changed = match &mut self.session {
+            Session::Netplay(rt) if rt.last_status != status => {
+                rt.last_status = status;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.send_net_status();
+        }
+    }
+
+    /// 握手成功：**雙方都重新開機**（第 0 幀對齊），開始記錄這一場。
+    fn net_connected(&mut self) {
+        let Some(rom) = self.rom_bytes.clone() else {
+            return;
+        };
+        match self.boot(&rom) {
+            Ok(nes) => {
+                let log = MatchLog::new(&nes);
+                self.nes = Some(nes);
+                self.pending_reset = false;
+                self.state_changed = true;
+                if let Session::Netplay(rt) = &mut self.session {
+                    rt.log = Some(log);
+                }
+            }
+            Err(e) => {
+                self.error(format!("Netplay 重新開機失敗: {e}"));
+                if let Session::Netplay(rt) = &mut self.session {
+                    let now = rt.clock.elapsed();
+                    rt.session.disconnect(now);
+                }
+            }
+        }
+    }
+
+    /// Netplay 結束：存下這一場的 replay（雙方合併的輸入；連線正常結束時雙方取共同完成的幀數，
+    /// 兩份檔案位元組完全相同），desync 時再存目前的狀態檔；回到單機模式並通知 UI 原因與檔案路徑。
+    fn finish_netplay(&mut self, reason: EndReason, peer_frames: Option<u32>) {
+        let Session::Netplay(rt) = std::mem::replace(&mut self.session, Session::Idle) else {
+            return;
+        };
+        let rt = *rt;
+        let player = rt.session.local_player() + 1;
+        let stamp = unix_seconds();
+        let rom = self
+            .nes
+            .as_ref()
+            .map(|n| n.rom_id().short())
+            .unwrap_or_default();
+        let mut files = Vec::new();
+        let mut notes = Vec::new();
+
+        if let Some(log) = rt.log.as_ref().filter(|l| l.frames() > 0) {
+            let own = log.frames();
+            let frames = peer_frames.map_or(own, |p| p.min(own));
+            let replay = log.to_replay(frames, DEFAULT_CHECKPOINT_INTERVAL);
+            let name = format!("netplay-{stamp}-p{player}-{rom}.replay");
+            match write_into(&rt.replay_dir, &name, &replay.encode()) {
+                Ok(path) => files.push(path),
+                Err(e) => notes.push(format!("replay 存檔失敗：{e}")),
+            }
+        }
+        if let EndReason::Desync { frame } = reason
+            && rt.log.is_some()
+            && let Some(nes) = &self.nes
+        {
+            let name = format!("netplay-{stamp}-p{player}-{rom}-desync-frame{frame}.state");
+            match write_into(&rt.replay_dir, &name, &nes.save_state()) {
+                Ok(path) => files.push(path),
+                Err(e) => notes.push(format!("狀態檔存檔失敗：{e}")),
+            }
+        }
+
+        let kind = match reason {
+            EndReason::LocalLeft | EndReason::PeerLeft => NetEndKind::Normal,
+            EndReason::Desync { .. } => NetEndKind::Desync,
+            EndReason::Rejected(_) | EndReason::HandshakeTimeout | EndReason::Timeout => {
+                NetEndKind::Error
+            }
+        };
+        let mut message = reason.to_string();
+        for note in notes {
+            message.push('；');
+            message.push_str(&note);
+        }
+        self.send(EmuEvent::NetEnded {
+            kind,
+            message,
+            files,
+        });
+        self.send_net_status();
+        // 回到單機模式：手上的 `Nes` 保持原狀繼續跑（單機模式沒有任何限制）。
+        self.state_changed = true;
     }
 
     /// 換一台剛開機的 `Nes`（載入 ROM、開始錄製／播放）。
@@ -280,18 +587,30 @@ impl Emu {
                 }
             }
             EmuCommand::SetInput(player, buttons) => {
-                // 播放 replay 時輸入來自 replay，忽略鍵盤。
-                if !matches!(self.session, Session::Replaying(_))
-                    && let Some(slot) = self.input.get_mut(player as usize)
-                {
+                // 播放 replay 時輸入來自 replay，忽略鍵盤。Netplay 只有本地那一個搖桿
+                //（玩家 1 的按鍵配置，由 session 對應到被分配的玩家位置）。
+                let allowed = match self.session {
+                    Session::Replaying(_) => false,
+                    Session::Netplay(_) => player == 0,
+                    _ => true,
+                };
+                if allowed && let Some(slot) = self.input.get_mut(player as usize) {
                     *slot = buttons;
                 }
             }
-            EmuCommand::Pause => self.set_paused(true, false),
+            EmuCommand::Pause => {
+                if self.netplaying() {
+                    self.refuse("暫停");
+                } else {
+                    self.set_paused(true, false);
+                }
+            }
             EmuCommand::Resume => self.set_paused(false, false),
             EmuCommand::Reset => {
                 if matches!(self.session, Session::Replaying(_)) {
                     self.refuse("按 reset（reset 也是 replay 輸入的一部分）");
+                } else if self.netplaying() {
+                    self.refuse("按 reset（reset 不是 Netplay 輸入的一部分）");
                 } else if self.nes.is_some() {
                     self.pending_reset = true;
                 }
@@ -390,7 +709,43 @@ impl Emu {
                 self.speed = speed;
                 self.audio.rate.reset(self.audio.output.target_fill());
             }
-            EmuCommand::Quit => return true,
+            EmuCommand::NetHost {
+                port,
+                input_delay,
+                replay_dir,
+            } => self.start_netplay(NetRole::Host { port, input_delay }, replay_dir),
+            EmuCommand::NetJoin { addr, replay_dir } => {
+                self.start_netplay(NetRole::Join { addr }, replay_dir);
+            }
+            EmuCommand::NetDisconnect => {
+                if let Session::Netplay(rt) = &mut self.session {
+                    let now = rt.clock.elapsed();
+                    rt.session.disconnect(now);
+                }
+            }
+            EmuCommand::Quit => {
+                // 讓對方立刻知道（而不是等 5 秒逾時），並把這場存成 replay。和「中斷連線」一樣先交換
+                // 雙方完成的幀數（最多等 `QUIT_GRACE`），兩份 replay 才會位元組相同。
+                let peer_frames = match &mut self.session {
+                    Session::Netplay(rt) => {
+                        let deadline = Instant::now() + QUIT_GRACE;
+                        rt.session.disconnect(rt.clock.elapsed());
+                        loop {
+                            rt.session.poll(rt.clock.elapsed(), &mut rt.transport);
+                            if rt.session.is_ended() || Instant::now() >= deadline {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Some(rt.session.peer_frames())
+                    }
+                    _ => None,
+                };
+                if let Some(peer_frames) = peer_frames {
+                    self.finish_netplay(EndReason::LocalLeft, peer_frames);
+                }
+                return true;
+            }
             #[cfg(test)]
             EmuCommand::Barrier(_) => unreachable!("Barrier 由 run 迴圈處理"),
         }
@@ -478,6 +833,29 @@ impl Emu {
     /// 一定記得到每一幀。沒有 `Nes`（尚未載入 ROM）回傳 `None`。
     fn run_one_frame(&mut self) -> Option<FrameOutcome> {
         let nes = self.nes.as_mut()?;
+        if let Session::Netplay(rt) = &mut self.session {
+            // 還沒連上（等對手／握手中）：不推進任何幀。
+            if !rt.session.is_running() || rt.log.is_none() {
+                return None;
+            }
+            let now = rt.clock.elapsed();
+            // 本地取樣：玩家 1 的按鍵配置，由 session 對應到被分配的玩家位置（每推進一幀取樣一次）。
+            if rt.session.local_input_wanted() {
+                rt.session.add_local_input(self.input[0]);
+            }
+            return Some(match rt.session.next_ready_frame(now) {
+                Some(input) => {
+                    nes.run_frame(input);
+                    if let Some(log) = &mut rt.log {
+                        log.record(input, nes);
+                    }
+                    rt.session.frame_done(|| nes.behavior_fingerprint());
+                    FrameOutcome::Ran
+                }
+                // 雙方輸入沒到齊：不推進、不阻塞。
+                None => FrameOutcome::Stalled,
+            });
+        }
         Some(match &mut self.session {
             Session::Replaying(player) => match player.step(nes) {
                 Ok(true) if !player.is_finished() => FrameOutcome::Ran,
@@ -510,11 +888,12 @@ impl Emu {
         }
         match outcome {
             FrameOutcome::Ran => {
-                if self.busy() {
+                if matches!(self.session, Session::Recording(_) | Session::Replaying(_)) {
                     self.send_session();
                 }
                 true
             }
+            FrameOutcome::Stalled => true,
             FrameOutcome::ReplayDone => {
                 if let Session::Replaying(player) =
                     std::mem::replace(&mut self.session, Session::Idle)
@@ -569,16 +948,20 @@ impl Emu {
         }
     }
 
-    /// 計時器驅動的一幀。回傳 `false` 代表工作階段結束了。
-    fn tick_frame(&mut self) -> bool {
+    /// 計時器驅動的一幀。
+    fn tick_frame(&mut self) -> Tick {
         let Some(outcome) = self.run_one_frame() else {
-            return true;
+            return Tick::Ran;
         };
+        if matches!(outcome, FrameOutcome::Stalled) {
+            // Netplay 的輸入沒到齊：沒有新畫面、沒有新取樣，也不算 FPS。
+            return Tick::Stalled;
+        }
         self.audio_after_frame();
         let keep = self.finish_frame(outcome, true);
         self.fps_frames += 1;
         self.publish(false);
-        keep
+        if keep { Tick::Ran } else { Tick::Ended }
     }
 
     /// 「最快」播放：在一個時間片內盡可能連續跑，只有第一幀有輸出（畫面與音訊都關閉可以省下大部分
@@ -675,6 +1058,9 @@ pub fn run(
             }
         }
 
+        // Netplay：每次迴圈都 poll 一次 socket（收封包、重送、逾時、事件）。
+        emu.net_poll();
+
         if emu.state_changed {
             emu.publish(true);
         }
@@ -700,10 +1086,22 @@ pub fn run(
             let period = emu.frame_period(frame_duration);
             while accumulator >= period {
                 accumulator -= period;
-                if !emu.paused && emu.nes.is_some() && !emu.tick_frame() {
-                    // 工作階段結束（播完、不符、錄製失敗）：丟掉累積的時間，不要補幀。
-                    accumulator = Duration::ZERO;
-                    break;
+                if emu.paused || emu.nes.is_none() {
+                    continue;
+                }
+                match emu.tick_frame() {
+                    Tick::Ran => {}
+                    Tick::Ended => {
+                        // 工作階段結束（播完、不符、錄製失敗）：丟掉累積的時間，不要補幀。
+                        accumulator = Duration::ZERO;
+                        break;
+                    }
+                    Tick::Stalled => {
+                        // Netplay 等對方的輸入：下個迴圈（約 1 ms 後）立刻再試，
+                        // 累積的時間最多留一幀，恢復之後不狂追。
+                        accumulator = period;
+                        break;
+                    }
                 }
             }
         }
@@ -1495,5 +1893,301 @@ mod tests {
         emu.barrier();
         assert!(errors(&emu.event_rx.try_iter().collect::<Vec<_>>()).is_empty());
         emu.quit();
+    }
+
+    // ---- Phase 4b：Netplay（兩個 emu 執行緒經由 127.0.0.1 的真實 UDP）--------------------------
+    //
+    // 這些測試用真實時間（emu 執行緒本來就以 60 Hz 的實時計時器推進），但全部是事件驅動的等待
+    // （等 `Net`／`NetEnded`／`FrameAdvanced` 事件），`HANG_GUARD` 只是卡死保護，不是時序假設。
+
+    use crate::commands::{NetEndKind, NetPhase};
+    use nes_core::replay::verify;
+
+    /// 阻塞等到 `pick` 從事件中挑出一個值（途中其他事件略過）。
+    fn wait_for<T>(emu: &Spawned, what: &str, mut pick: impl FnMut(&EmuEvent) -> Option<T>) -> T {
+        loop {
+            match emu.event_rx.recv_timeout(HANG_GUARD) {
+                Ok(event) => {
+                    if let Some(v) = pick(&event) {
+                        return v;
+                    }
+                }
+                Err(e) => panic!("等不到{what}：{e}"),
+            }
+        }
+    }
+
+    fn wait_phase(emu: &Spawned, what: &str, want: impl Fn(&NetPhase) -> bool) -> NetPhase {
+        wait_for(emu, what, |e| match e {
+            EmuEvent::Net(s) if want(&s.phase) => Some(s.phase),
+            _ => None,
+        })
+    }
+
+    fn wait_net_ended(emu: &Spawned) -> (NetEndKind, String, Vec<std::path::PathBuf>) {
+        wait_for(emu, "NetEnded", |e| match e {
+            EmuEvent::NetEnded {
+                kind,
+                message,
+                files,
+            } => Some((*kind, message.clone(), files.clone())),
+            _ => None,
+        })
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("nes-netplay-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    fn start_with_rom(rom: Vec<u8>) -> Spawned {
+        let emu = Spawned::start(crate::audio::disabled_audio());
+        emu.cmd_tx.send(EmuCommand::LoadRom(rom)).unwrap();
+        emu.wait_rom_loaded();
+        emu
+    }
+
+    /// 房主建立房間，回傳實際監聽的 port。
+    fn host_room(emu: &Spawned, dir: &std::path::Path) -> u16 {
+        emu.cmd_tx
+            .send(EmuCommand::NetHost {
+                port: 0,
+                input_delay: 2,
+                replay_dir: dir.to_path_buf(),
+            })
+            .unwrap();
+        match wait_phase(emu, "房主進入等待", |p| {
+            matches!(p, NetPhase::Waiting { .. })
+        }) {
+            NetPhase::Waiting { port } => port,
+            _ => unreachable!(),
+        }
+    }
+
+    fn join_room(emu: &Spawned, port: u16, dir: &std::path::Path) {
+        emu.cmd_tx
+            .send(EmuCommand::NetJoin {
+                addr: ([127, 0, 0, 1], port).into(),
+                replay_dir: dir.to_path_buf(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn two_emu_threads_play_a_match_and_save_identical_replays() {
+        let dir = temp_dir("match");
+        let rom = input_probe_rom();
+        let a = start_with_rom(rom.clone());
+        let b = start_with_rom(rom.clone());
+        let port = host_room(&a, &dir);
+        join_room(&b, port, &dir);
+
+        // 連線：房主是玩家 1、加入者是玩家 2，input delay 由房主決定。
+        let pa = wait_phase(&a, "房主連線", |p| {
+            matches!(p, NetPhase::Connected { .. })
+        });
+        let pb = wait_phase(&b, "加入者連線", |p| {
+            matches!(p, NetPhase::Connected { .. })
+        });
+        assert_eq!(
+            pa,
+            NetPhase::Connected {
+                player: 0,
+                input_delay: 2
+            }
+        );
+        assert_eq!(
+            pb,
+            NetPhase::Connected {
+                player: 1,
+                input_delay: 2
+            }
+        );
+
+        // 兩端的本地鍵盤都用「玩家 1」的槽位（SetInput(0, …)）；玩家 2 的槽位在 Netplay 中被忽略。
+        a.cmd_tx.send(EmuCommand::SetInput(0, Buttons::A)).unwrap();
+        a.cmd_tx
+            .send(EmuCommand::SetInput(1, Buttons::all()))
+            .unwrap();
+        b.cmd_tx
+            .send(EmuCommand::SetInput(0, Buttons::UP | Buttons::B))
+            .unwrap();
+        // 連線成功時重新開機：幀數從 0 重新算；等雙方都跑過 200 幀。
+        a.wait_frames(200);
+        b.wait_frames(200);
+
+        a.cmd_tx.send(EmuCommand::NetDisconnect).unwrap();
+        let (ka, msg_a, files_a) = wait_net_ended(&a);
+        let (kb, msg_b, files_b) = wait_net_ended(&b);
+        assert_eq!(ka, NetEndKind::Normal, "{msg_a}");
+        assert_eq!(kb, NetEndKind::Normal, "{msg_b}");
+        assert!(msg_b.contains("對方已中斷連線"), "{msg_b}");
+        assert_eq!((files_a.len(), files_b.len()), (1, 1), "{msg_a} / {msg_b}");
+
+        // 兩份 replay 位元組完全相同（雙方取共同完成的幀數），且通過 verify。
+        let bytes_a = std::fs::read(&files_a[0]).unwrap();
+        let bytes_b = std::fs::read(&files_b[0]).unwrap();
+        assert_eq!(bytes_a, bytes_b, "雙方的 replay 必須完全相同");
+        let replay = Replay::decode(&bytes_a).unwrap();
+        assert!(replay.total_frames >= 200, "{} 幀", replay.total_frames);
+        verify(&rom, &replay).expect("replay 必須通過 verify");
+        // 合併後的輸入：玩家 1 是房主的 A、玩家 2 是加入者的 上+B（前 D 幀是空的）；
+        // 房主試圖用玩家 2 的槽位送 all() 被忽略。
+        let inputs: Vec<_> = replay.inputs().collect();
+        assert_eq!(inputs[0].p1, Buttons::empty());
+        let last = inputs[inputs.len() - 1];
+        assert_eq!(last.p1, Buttons::A);
+        assert_eq!(last.p2, Buttons::UP | Buttons::B);
+        assert!(inputs.iter().all(|i| !i.reset));
+
+        // 回到單機模式：Netplay 的限制解除（可以暫停），而且沒有殘留的錯誤。
+        a.cmd_tx.send(EmuCommand::Pause).unwrap();
+        a.barrier();
+        assert!(errors(&a.event_rx.try_iter().collect::<Vec<_>>()).is_empty());
+        a.quit();
+        b.quit();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn joining_with_a_different_rom_is_rejected_with_the_reason_and_returns_to_local_mode() {
+        let dir = temp_dir("reject");
+        let a = start_with_rom(input_probe_rom());
+        let b = start_with_rom(rendering_rom());
+        let port = host_room(&a, &dir);
+        join_room(&b, port, &dir);
+
+        let (kind, message, files) = wait_net_ended(&b);
+        assert_eq!(kind, NetEndKind::Error);
+        assert!(
+            message.contains("拒絕") && message.contains("ROM 不同"),
+            "{message}"
+        );
+        assert!(files.is_empty(), "沒有連上，不存 replay");
+        // 房主仍然在等（沒有被壞 Client 搞掉），也可以取消。
+        a.cmd_tx.send(EmuCommand::NetDisconnect).unwrap();
+        let (ka, _, _) = wait_net_ended(&a);
+        assert_eq!(ka, NetEndKind::Normal);
+        // 加入者回到單機模式，emu 執行緒仍然響應。
+        b.cmd_tx.send(EmuCommand::Pause).unwrap();
+        b.barrier();
+        a.quit();
+        b.quit();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restricted_operations_are_refused_during_netplay_and_nothing_advances() {
+        let dir = temp_dir("restricted");
+        let emu = start_with_rom(input_probe_rom());
+        emu.cmd_tx.send(EmuCommand::SaveState).unwrap();
+        host_room(&emu, &dir); // 房主等待中：Netplay 工作階段已建立
+        emu.event_rx.try_iter().for_each(drop);
+
+        for cmd in [
+            EmuCommand::LoadState,
+            EmuCommand::Pause,
+            EmuCommand::Reset,
+            EmuCommand::LoadRom(input_probe_rom()),
+            EmuCommand::StepInstruction,
+            EmuCommand::StartRecording,
+            EmuCommand::StartReplay(vec![]),
+            EmuCommand::TraceToFile {
+                count: 1,
+                path: dir.join("trace.log"),
+            },
+        ] {
+            emu.cmd_tx.send(cmd).unwrap();
+        }
+        emu.barrier();
+        let events = emu.event_rx.try_iter().collect::<Vec<_>>();
+        let errs = errors(&events);
+        assert!(
+            errs.len() >= 7,
+            "每個被停用的操作都要被拒絕並說明：{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .all(|m| m.contains("Netplay 中") && m.contains("分歧")),
+            "{errs:?}"
+        );
+        // 存檔到檔案（唯讀）仍然可用。
+        emu.cmd_tx.send(EmuCommand::ExportState).unwrap();
+        emu.barrier();
+        assert!(
+            emu.event_rx
+                .try_iter()
+                .any(|e| matches!(e, EmuEvent::StateExported(_)))
+        );
+        emu.cmd_tx.send(EmuCommand::NetDisconnect).unwrap();
+        wait_net_ended(&emu);
+        emu.quit();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hosting_on_a_port_that_is_in_use_returns_to_local_mode_with_a_readable_error() {
+        let taken = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let emu = start_with_rom(input_probe_rom());
+        emu.cmd_tx
+            .send(EmuCommand::NetHost {
+                port,
+                input_delay: 2,
+                replay_dir: temp_dir("inuse"),
+            })
+            .unwrap();
+        let (kind, message, _) = wait_net_ended(&emu);
+        assert_eq!(kind, NetEndKind::Error);
+        assert!(message.contains(&format!("port {port}")), "{message}");
+        emu.cmd_tx.send(EmuCommand::Pause).unwrap();
+        emu.barrier(); // 沒有 Netplay 工作階段：暫停不會被拒絕
+        assert!(errors(&emu.event_rx.try_iter().collect::<Vec<_>>()).is_empty());
+        emu.quit();
+    }
+
+    /// 直接關閉程式（`Quit`）：對方立刻知道（不必等逾時），兩邊仍然存下位元組相同的 replay。
+    #[test]
+    fn closing_one_program_ends_the_other_side_at_once_with_identical_replays() {
+        let dir = temp_dir("quit");
+        let rom = input_probe_rom();
+        let a = start_with_rom(rom.clone());
+        let b = start_with_rom(rom.clone());
+        let port = host_room(&a, &dir);
+        join_room(&b, port, &dir);
+        wait_phase(&a, "房主連線", |p| {
+            matches!(p, NetPhase::Connected { .. })
+        });
+        wait_phase(&b, "加入者連線", |p| {
+            matches!(p, NetPhase::Connected { .. })
+        });
+        a.cmd_tx
+            .send(EmuCommand::SetInput(0, Buttons::RIGHT | Buttons::A))
+            .unwrap();
+        b.cmd_tx
+            .send(EmuCommand::SetInput(0, Buttons::LEFT))
+            .unwrap();
+        a.wait_frames(150);
+        b.wait_frames(150);
+
+        // 加入者關閉程式。
+        b.cmd_tx.send(EmuCommand::Quit).unwrap();
+        let (kb, msg_b, files_b) = wait_net_ended(&b);
+        b.handle.join().unwrap();
+        let (ka, msg_a, files_a) = wait_net_ended(&a);
+        assert_eq!(kb, NetEndKind::Normal, "{msg_b}");
+        assert_eq!(ka, NetEndKind::Normal, "{msg_a}");
+        assert!(msg_a.contains("對方已中斷連線"), "{msg_a}");
+        assert_eq!((files_a.len(), files_b.len()), (1, 1));
+        let (bytes_a, bytes_b) = (
+            std::fs::read(&files_a[0]).unwrap(),
+            std::fs::read(&files_b[0]).unwrap(),
+        );
+        assert_eq!(bytes_a, bytes_b, "雙方的 replay 必須完全相同");
+        verify(&rom, &Replay::decode(&bytes_a).unwrap()).expect("必須通過 verify");
+        a.quit();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

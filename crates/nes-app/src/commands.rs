@@ -4,9 +4,11 @@
 //! Emu -> UI 傳 [`EmuEvent`]。畫面本身不走這條 channel，而是透過
 //! `triple_buffer`（見 `emu.rs`），避免每幀畫面資料被 channel 佇列積壓。
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use nes_core::{Buttons, ReplayMismatch, RomId, RomInfo};
+use nes_net::Stats;
 
 /// replay 播放速度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,22 @@ pub enum EmuCommand {
         count: u32,
         path: PathBuf,
     },
+    /// Netplay：建立房間（Host＝玩家 1）。在 `port` 監聽（0＝系統挑一個，實際的 port 由
+    /// [`NetPhase::Waiting`] 回報），等對手連上。`input_delay`（0–8）由房主決定。**會重新開機**
+    /// （連線成功時），所以 Netplay 期間停用讀檔、單步、trace、載入 ROM、暫停、reset
+    ///（單方面做這些會讓雙方的模擬分歧）。每場連線自動錄成 replay，存在 `replay_dir`。
+    NetHost {
+        port: u16,
+        input_delay: u8,
+        replay_dir: PathBuf,
+    },
+    /// Netplay：加入房間（Client＝玩家 2），對端是房主的 `addr`。input delay 由房主決定。
+    NetJoin {
+        addr: SocketAddr,
+        replay_dir: PathBuf,
+    },
+    /// 取消等待／中斷連線。
+    NetDisconnect,
     Quit,
     /// 只給測試用的屏障：emu 執行緒處理到這個指令、且本輪之前的所有指令的結果（快照、事件、
     /// 音訊）都已發布之後，才對 `ack` 送出一個訊號。命令是依序處理的，所以收到 ack 就代表
@@ -96,6 +114,39 @@ pub enum SessionStatus {
     Mismatch(ReplayMismatch),
 }
 
+/// Netplay 的階段（狀態列與選單用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetPhase {
+    #[default]
+    Idle,
+    /// 房主：等對手（`port` 是實際監聽的 port）。
+    Waiting { port: u16 },
+    /// 加入者：送 Hello 中。
+    Connecting { addr: SocketAddr },
+    /// 已連線，正在對戰。`player`：0＝玩家 1、1＝玩家 2。
+    Connected { player: u8, input_delay: u8 },
+    /// 主動中斷，等對方回覆。
+    Closing,
+}
+
+/// Netplay 的狀態快照（連線中約每秒更新一次統計）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NetStatus {
+    pub phase: NetPhase,
+    pub stats: Stats,
+}
+
+/// Netplay 結束的類別（UI 決定顏色與是否彈出視窗）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetEndKind {
+    /// 使用者或對方正常離開。
+    Normal,
+    /// 被拒絕、逾時、斷線、無法建立連線。
+    Error,
+    /// 雙方的行為指紋不同：已自動存下狀態檔與 replay。
+    Desync,
+}
+
 /// Emu 執行緒回報給 UI 執行緒的事件。
 #[derive(Debug)]
 pub enum EmuEvent {
@@ -119,6 +170,14 @@ pub enum EmuEvent {
     },
     /// 模擬狀態的幀數改變了（每跑完一幀、單步一幀、讀檔、載入 ROM 都會送）。
     FrameAdvanced(u64),
+    /// Netplay 的階段或統計改變。
+    Net(NetStatus),
+    /// Netplay 結束（已回到單機模式）。`files` 是自動存下的 replay（Desync 時還有狀態檔）。
+    NetEnded {
+        kind: NetEndKind,
+        message: String,
+        files: Vec<PathBuf>,
+    },
     /// `TraceToFile` 完成。
     TraceWritten {
         path: PathBuf,
