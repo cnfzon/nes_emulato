@@ -174,20 +174,28 @@ fn frame_hash_after(rom: &[u8], frames: u64) -> u64 {
     hash
 }
 
+/// 需要 `roms/nes-test-roms/`（被 gitignore），所以預設 `#[ignore]`——在沒有 `roms/` 的 CI 上它會顯示為
+/// 「ignored」，而不是「以 0 個 ROM 通過」。本機完整執行：
+/// `cargo test --release -p nes-core --test golden_frames -- --ignored`
+/// （明確要求執行卻找不到檔案時**失敗**，不會默默略過）。
+/// 不依賴外部檔案、CI 上必定執行的對應測試：`Nes` 的 `golden_frame_hash_of_rendering_rom`（合成 ROM，畫面每幀捲動）。
 #[test]
+#[ignore = "requires roms/"]
 fn test_rom_final_screens_match_golden_hashes() {
     let root = rom_root();
-    if !root.is_dir() {
-        eprintln!("找不到 {}，略過黃金畫面測試（不算失敗）", root.display());
-        return;
-    }
+    assert!(
+        root.is_dir(),
+        "找不到 {}：這個測試需要 roms/nes-test-roms/（取得方式見 ATTRIBUTION.md）。沒有這些檔案請不要用 --ignored 執行",
+        root.display()
+    );
 
     let mut checked = 0;
     let mut mismatches = Vec::new();
+    let mut missing = Vec::new();
     for &(rel, frames, expected) in GOLDEN {
         let path = root.join(rel);
         let Ok(rom) = std::fs::read(&path) else {
-            eprintln!("略過 {rel}（檔案不存在）");
+            missing.push(rel);
             continue;
         };
         let actual = frame_hash_after(&rom, frames);
@@ -198,6 +206,11 @@ fn test_rom_final_screens_match_golden_hashes() {
     }
 
     eprintln!("黃金畫面：檢查了 {checked} / {} 個 ROM", GOLDEN.len());
+    assert!(
+        missing.is_empty(),
+        "roms/nes-test-roms/ 缺少 {} 個檔案（不算通過）：{missing:?}",
+        missing.len()
+    );
     assert!(
         mismatches.is_empty(),
         "畫面雜湊不符（若是預期的 PPU 變更，請更新 GOLDEN 表）：

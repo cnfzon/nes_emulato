@@ -55,16 +55,36 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
 - **新增 mapper 時必須正確宣告 `Mapper::observes_chr_reads()`**：會觀察 PPU CHR 讀取的 mapper（MMC3 的 A12 IRQ 計數、
   MMC2／MMC4 的 tile latch）宣告 `true`，輸出關閉時才會走完整渲染路徑（`ppu/render.rs`）；宣告錯誤會讓 rollback 重跑與一般執行的
   mapper 狀態分歧。同時要補該 mapper 的「輸出開／關指紋逐幀相同」測試（見 `output_switch_tests.rs`）。mapper 0–3 宣告 `false`。
+- **語意層級的封包防護（Phase 4d）**：格式正確但內容不可能來自遵守協定的對方（幀號遠超出合理範圍、冗餘輸入過多、
+  同一幀收到不同的輸入、握手完成後的 Accept／Hello、`Ack` 確認未送出的幀、遠在未來的 `sender_frame`……）必須以
+  `EndReason::ProtocolViolation` 中止連線，或安全地忽略並計入 `packets_ignored`；絕不 panic、不套用違規的輸入。
+  **session／規劃器／transport 的所有佇列與緩衝區都必須有固定上限**（`Session::buffer_sizes()` 與 `tests/robustness.rs`
+  的洪流測試把上限釘住）；新增任何會隨對方封包成長的容器，必須同時設上限並補進洪流測試的 `BOUNDS`。
+  「同一幀不同輸入」的檢查與各佇列的上限都有破壞性測試（暫時移除檢查，對應測試必須失敗），改動這些邏輯後要重做。
+- 統計 CSV 的欄位名稱與單位（`nes-net/src/statslog.rs` 的 `CSV_HEADER`、`METRICS`）是期末報告數據的介面：
+  改欄位要同步更新 `docs/architecture.md` §21、`docs/manual-test-phase4d.md` 與往返測試。
 - `nes-core` 新增「不改變模擬行為」的 API（例如 `Nes::copy_state_from`）不需遞增 `CORE_BEHAVIOR_VERSION`，
   但複製狀態的實作必須用不含 `..` 的完整解構（新增欄位時編譯器強迫決定複製或排除），並有還原等價測試。
 
 ## 測試基準與階段驗收
 
-- **目前基準（Phase 4c.1 結束）：446 通過 + 2 忽略**：nes-app 43、nes-core（lib）263 + 2 ignored、
-  nes-core `golden_frames` 1、nes-core `output_off_equivalence` 1、nes-net（lib）55、nes-net `equivalence` 6、nes-net `handshake` 24、
-  nes-net `rollback_equivalence` 13、nes-net `transport_roundtrip` 3、nes-test 37。
-  （Phase 4b 基準：396 通過 + 2 忽略；4c 移除了 `rollback.rs` 骨架的 3 個「回傳空結果」測試，改由規劃器的 15 個實測試取代。）
-- 每個階段結束時，以 `cargo test --workspace` 的**實際輸出**逐一列出每個執行檔的測試數量。**數量只能增加**；若有測試被移除或被 cfg 排除，必須說明理由。
+- **目前基準（Phase 4d 結束），分成兩個數字回報**（基準數字必須分開寫，不得把「需要 roms/」的測試算進通過數）：
+  - **CI 必定執行（不依賴 `roms/` 或任何外部檔案）：497 通過 + 0 忽略**：nes-app 50、nes-core（lib）263、
+    nes-net（lib）63、nes-net `equivalence` 6、nes-net `handshake` 24、nes-net `robustness` 27、
+    nes-net `rollback_equivalence` 13、nes-net `room_full` 2、nes-net `stats` 5、nes-net `transport_roundtrip` 3、nes-test 41。
+    （nes-core lib 另有 2 個 `#[ignore]`，屬於下一項。）
+  - **需要 `roms/` 的本機測試：4 個（`#[ignore = "requires roms/"]`，CI 上顯示為 ignored，不算通過）**：
+    nes-core `golden_frames` 1、nes-core `output_off_equivalence` 1（需要 `roms/nes-test-roms/`）；
+    nes-core `cpu::singlestep` 2（需要 `roms/singlestep/v1/`）。本機完整執行：
+    `cargo test --release -p nes-core --test golden_frames --test output_off_equivalence -- --ignored`
+    與驗收指令 6 的 `cpu::singlestep`。這 4 個都必須在本機實際跑過並回報結果。
+  - **依賴外部檔案的測試不得默默通過**：找不到 `roms/` 時，測試必須是 `#[ignore = "requires roms/"]`（顯示為 ignored），
+    而且用 `--ignored` 明確執行卻缺檔時**必須失敗**（不得 `return` 或 `continue` 而顯示 pass）。
+    **每一類功能在 CI 上都必須有不依賴外部檔案、必定執行的測試**（例如黃金畫面 ↔ `golden_frame_hash_of_rendering_rom`、
+    輸出開／關 ↔ `output_switch_tests.rs`、CPU ↔ `cpu/tests.rs`）；新增只能靠外部 ROM 驗證的功能時，同時補合成 ROM 版本。
+  （歷史：Phase 4c.1 基準 446 通過 + 2 忽略，其中 `golden_frames` 與 `output_off_equivalence` 在沒有 `roms/` 時是「0 個 ROM 通過」；
+  4d 把這兩個改為 ignored，並新增 53 個 CI 必定執行的測試。）
+- 每個階段結束時，以 `cargo test --workspace` 的**實際輸出**逐一列出每個執行檔的測試數量。**「CI 必定執行」的數量只能增加**；若有測試被移除、被 cfg 排除或改為 ignored，必須說明理由（4d 把 2 個依賴 `roms/` 的測試改為 ignored，理由見上）。
 - 每個階段的驗收指令（全部要跑並回報結果）：
   1. `cargo build --workspace`
   2. `cargo test --workspace`
@@ -92,9 +112,10 @@ Workspace：`nes-core`（模擬核心）、`nes-net`、`nes-app`（GUI）、`nes
      回報格式固定為「80 個：X PASS、Y 預期失敗、Z 無自動判定」；`scrolltest/scroll.nes` 一律歸為 Z（沒有 `$6000` 簽章，退出碼 1 不代表失敗，
      靠 `golden_frames`），其餘失敗歸 Y 並逐一說明。目前（Phase 3.5 起皆同）：**80 個：66 PASS、13 預期失敗、1 無自動判定**
      （13＝`ppu_vbl_nmi` 單檔 6 ＋ 合集 1、`power_up_palette` 1、`cpu_interrupts` 單檔 4 ＋ 合集 1）。
-  8. 黃金畫面：`cargo test --workspace` 已包含 `golden_frames`（需要 `roms/nes-test-roms/`，
-     缺檔時略過）與 `Nes` 的 `golden_frame_hash_of_rendering_rom`。畫面雜湊改變時，先確認變動是
-     預期的，再用 `nes-test golden <rom> --frames N` 重新產生並更新雜湊。
+  8. 黃金畫面：`cargo test --workspace` 只包含 `Nes` 的 `golden_frame_hash_of_rendering_rom`（合成 ROM）；
+     真實 ROM 的 `golden_frames` 與 `output_off_equivalence` 是 `#[ignore = "requires roms/"]`，要用
+     `cargo test --release -p nes-core --test golden_frames --test output_off_equivalence -- --ignored` 實際跑並回報。
+     畫面雜湊改變時，先確認變動是預期的，再用 `nes-test golden <rom> --frames N` 重新產生並更新雜湊。
   9. 網路模擬（Phase 4b 起）：`cargo run --release -p nes-test -- netsim <rom> --frames 3600 --runs 20`，
      另加 `--loss 10 --delay 100 --jitter 30` 與 `--loss 30 --delay 200 --jitter 80 --duplicate 5`；三種條件都必須「兩端相同、
      ＝離線重播、replay 位元組相同」全部通過（結束碼 0）。stall 與頻寬只回報，不設門檻（lockstep 在高延遲下本來就慢）。

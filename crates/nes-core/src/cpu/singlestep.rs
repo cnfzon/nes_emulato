@@ -26,7 +26,9 @@
 //! cargo test --release -p nes-core --lib cpu::singlestep -- --ignored --nocapture
 //! ```
 //!
-//! 測試資料不存在時（沒有跑過下載腳本）會直接印訊息並跳過，不算失敗。
+//! 這些測試預設 `#[ignore]`（顯示為「ignored」，不會假裝通過）；明確用 `--ignored` 執行卻找不到測試資料時
+//! **失敗**並說明資料放哪裡（Phase 4d 起，不再默默「略過並算通過」）。CI 上必定執行的 CPU 測試在 `cpu/tests.rs`
+//! （手寫的指令語意、旗標、位址模式、中斷、dummy read 等，不依賴外部檔案）。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -312,17 +314,14 @@ fn cycles_only_mismatch(tc: &TestCase) -> bool {
 }
 
 #[test]
-#[ignore = "資料量大（256 個檔案，共 256 萬筆），預設不跑；見模組文件的手動執行指令"]
+#[ignore = "requires roms/（roms/singlestep/v1，256 個檔案共 256 萬筆，資料量大）；見模組文件的手動執行指令"]
 fn singlestep_tests_all_opcodes() {
     let dir = singlestep_dir();
-    if !dir.is_dir() {
-        eprintln!(
-            "找不到 {}，略過 SingleStepTests（不算失敗）。",
-            dir.display()
-        );
-        eprintln!("下載方式見 README 或 Phase 1 報告。");
-        return;
-    }
+    assert!(
+        dir.is_dir(),
+        "找不到 {}：這個測試需要 SingleStepTests 資料（下載方式見 nes-test/README.md）。沒有資料請不要用 --ignored 執行",
+        dir.display()
+    );
 
     let mut tallies: BTreeMap<Category, Tally> = BTreeMap::new();
     let mut per_opcode: BTreeMap<u8, (Category, u64, u64)> = BTreeMap::new();
@@ -504,13 +503,14 @@ fn unmodeled_read_allowed(opcode: u8, pc: u16, addr: u16) -> bool {
 ///
 /// 只印結果與每個 opcode 的失敗摘要（含範例）；閘門的判定見 [`ACCESS_GATE_MODES`]。
 #[test]
-#[ignore = "資料量大，預設不跑；見模組文件的手動執行指令"]
+#[ignore = "requires roms/（roms/singlestep/v1）；見模組文件的手動執行指令"]
 fn singlestep_bus_accesses() {
     let dir = singlestep_dir();
-    if !dir.is_dir() {
-        eprintln!("找不到 {}，略過（不算失敗）。", dir.display());
-        return;
-    }
+    assert!(
+        dir.is_dir(),
+        "找不到 {}：這個測試需要 SingleStepTests 資料（下載方式見 nes-test/README.md）。沒有資料請不要用 --ignored 執行",
+        dir.display()
+    );
 
     #[derive(Default, Clone)]
     struct OpStat {

@@ -56,8 +56,8 @@ Phase 4a 的 replay 與除錯工具（規格見 [`docs/architecture.md`](../../d
   ```
   cargo test --release -p nes-core --lib cpu::singlestep -- --ignored --nocapture
   ```
-  資料量大、預設用 `#[ignore]` 排除在一般 `cargo test` 之外；沒有這份資料
-  時該測試會直接印訊息跳過，不算失敗。
+  資料量大、預設用 `#[ignore]` 排除在一般 `cargo test` 之外（顯示為 ignored，不會假裝通過）；
+  明確用 `--ignored` 執行卻沒有這份資料時，測試會**失敗**並說明資料要放哪裡。
 - **blargg 測試套件**（`cpu_dummy_reads`、`instr_test-v5`、
   `ppu_vbl_nmi`……等）：搜尋作者 "blargg" 在 NESdev wiki 上發布的測試 ROM
   合集。目前實際使用的是 GitHub 上的整理版（見下方與 `ATTRIBUTION.md`）；`official_only.nes`

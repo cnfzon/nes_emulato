@@ -18,6 +18,7 @@ mod commands;
 mod debugger;
 mod emu;
 mod input;
+mod netui;
 
 use std::thread;
 

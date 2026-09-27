@@ -9,7 +9,7 @@ use nes_net::protocol::{DisconnectReason, MAX_INPUTS_PER_PACKET, PROTOCOL_VERSIO
 use nes_net::sim::{MatchConfig, expected_log, run_match};
 use nes_net::{
     Datagram, EndReason, Event, InMemoryTransport, Mode, Msg, NetworkConfig, RejectReason, Session,
-    SessionConfig, SimulatedTransport, Status, Transport,
+    SessionConfig, SimulatedTransport, Status, Transport, Violation,
 };
 
 fn ms(n: u64) -> Duration {
@@ -638,31 +638,81 @@ fn garbage_and_foreign_session_packets_are_ignored() {
     assert_eq!(p.host.end_reason(), None);
 }
 
+/// 敵意的封包：Phase 4b 只是「忽略且不壞掉」；Phase 4d 起，格式正確但語意不可能的封包會以
+/// `ProtocolViolation` 中止連線（細節與每一種違規的個別測試在 `tests/robustness.rs`）。
+/// 這裡保留 4b 的目標——不 panic、不溢位、記憶體不無限成長——並確認合理範圍內的輸入仍照常接受。
 #[test]
 fn a_hostile_input_packet_cannot_grow_memory_or_overflow() {
+    let hostile = |start: u32, count: usize, sender_frame: u32| Msg::Input {
+        session_id: 0x1234,
+        start_frame: start,
+        inputs: vec![Buttons::all().into(); count],
+        sender_frame,
+        frame_advantage: i8::MAX,
+        confirmed: None,
+    };
+    let cases: [(&str, Msg, Option<Violation>); 5] = [
+        (
+            "幀號溢位",
+            hostile(u32::MAX - 3, MAX_INPUTS_PER_PACKET, 0),
+            Some(Violation::InputFrameTooFar {
+                frame: u32::MAX - 3,
+            }),
+        ),
+        (
+            "太遠",
+            hostile(1_000_000, MAX_INPUTS_PER_PACKET, 0),
+            Some(Violation::InputFrameTooFar { frame: 1_000_000 }),
+        ),
+        (
+            // Client 已經送過的前幾幀（預填的空輸入）被說成別的內容。
+            "與已收到的不同",
+            hostile(0, MAX_INPUTS_PER_PACKET, 0),
+            Some(Violation::ConflictingInput { frame: 0 }),
+        ),
+        (
+            "宣稱的幀號在遙遠的未來",
+            hostile(100, 1, u32::MAX),
+            Some(Violation::SenderFrameTooFar {
+                sender_frame: u32::MAX,
+            }),
+        ),
+        (
+            // 合理範圍內、沒人送過的幀：照常接受（記憶體受 MAX_REMOTE_AHEAD 限制）。
+            "合理範圍內",
+            hostile(100, MAX_INPUTS_PER_PACKET, 0),
+            None,
+        ),
+    ];
+    for (name, msg, expected) in cases {
+        let mut p = Pair::ok(NetworkConfig::IDEAL, 1);
+        assert!(p.run_until(ms(500), Pair::connected));
+        for _ in 0..10 {
+            p.step(); // 讓 Client 預填的空輸入送到
+        }
+        p.tc.send(p.now, &msg.encode().unwrap());
+        for _ in 0..20 {
+            p.step();
+        }
+        match expected {
+            Some(v) => assert_eq!(
+                p.host.end_reason(),
+                Some(EndReason::ProtocolViolation(v)),
+                "{name}"
+            ),
+            None => {
+                assert!(p.connected(), "{name}");
+                assert!(p.host.local_input_wanted(), "{name}：仍然能正常取樣");
+            }
+        }
+    }
+    // 對不存在的幀 Ack：不能讓 acked 超過本地輸入，而且是違規。
     let mut p = Pair::ok(NetworkConfig::IDEAL, 1);
     assert!(p.run_until(ms(500), Pair::connected));
-    let sid = p.host.session_id();
-    for (start, count) in [
-        (u32::MAX - 3, MAX_INPUTS_PER_PACKET), // 幀號溢位
-        (1_000_000, MAX_INPUTS_PER_PACKET),    // 太遠
-        (0, MAX_INPUTS_PER_PACKET),
-    ] {
-        let msg = Msg::Input {
-            session_id: sid,
-            start_frame: start,
-            inputs: vec![Buttons::all().into(); count],
-            sender_frame: u32::MAX,
-            frame_advantage: i8::MAX,
-            confirmed: None,
-        };
-        p.tc.send(p.now, &msg.encode().unwrap());
-    }
-    // 對不存在的幀 Ack：不能讓 acked 超過本地輸入。
     p.tc.send(
         p.now,
         &Msg::Ack {
-            session_id: sid,
+            session_id: 0x1234,
             frame: u32::MAX,
         }
         .encode()
@@ -671,9 +721,12 @@ fn a_hostile_input_packet_cannot_grow_memory_or_overflow() {
     for _ in 0..20 {
         p.step();
     }
-    assert!(p.connected());
-    // Host 仍然能正常取樣（沒有被亂 Ack 弄壞內部狀態）。
-    assert!(p.host.local_input_wanted());
+    assert_eq!(
+        p.host.end_reason(),
+        Some(EndReason::ProtocolViolation(Violation::AckBeyondSent {
+            frame: u32::MAX
+        }))
+    );
 }
 
 #[test]

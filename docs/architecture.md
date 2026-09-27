@@ -1678,7 +1678,7 @@ callback 簡單：emu 執行緒本來就每毫秒醒來一次。
   UI 彈出視窗＋狀態列紅字）；不 panic。
 - **最小 UI**：`Netplay` 選單——建立房間（輸入 port）、加入（輸入 IP:port，格式錯誤在視窗內提示）、input delay（0–8，僅房主有效）、
   取消／中斷連線；狀態列：`[Netplay] 已連線｜你是玩家 N｜ping … ms｜input delay D｜stall N 次（S 秒）｜↑ ↓ B/s`。
-  完整大廳留到 4d。
+  完整大廳在 4d 完成（§21.4）。
 
 ### 19.7 `nes-test netsim`（無視窗的網路模擬）
 
@@ -2066,3 +2066,222 @@ NMI 重設捲動並存下 `$2002`；9 個精靈擠在同一條線造成 overflow
 （命中次數 ≥ 200／240 幀、迴圈計數非 0、NMI 讀到的 `$2002` 同時有 sprite 0 hit 與 overflow）。
 **變異驗證**（實測）：把「有 sprite 0 才算背景」改成「輸出關閉就不算背景」→ 新測試 `output_off_matches_output_on_on_a_sprite0_split_screen` 在第 2 幀失敗（另有 5 個既有的輸出開關測試也失敗）；
 把 `skip_unobservable` 改成忽略 mapper 宣告 → `a_mapper_that_observes_chr_reads_takes_the_full_render_path` 失敗。兩項都已還原。
+
+
+## 21. Phase 4d：連線 UI、強健性與實機測試工具
+
+4b／4c 已在模擬網路下證明 lockstep 與 rollback 的正確性。本階段讓 netplay 能在真實環境中可靠使用：完整的連線大廳、遊戲中的統計疊加層、
+面對異常或惡意封包的強健性、以及收集真實網路數據的工具。**不改變模擬行為**（`CORE_BEHAVIOR_VERSION` 仍是 3、`STATE_FORMAT_VERSION` 仍是 3，
+`git diff -- crates/nes-core/src` 只有 `cpu/singlestep.rs` 的測試設定，見 §21.9），**不改變 lockstep／rollback 的演算法**，**協定仍是 v2**。
+
+**為什麼協定維持 v2**：線上格式沒有任何變化——語意違規時的通知沿用既有的 `Disconnect { reason: Left }`（對方看到「對方已中斷連線」；本地端的
+`EndReason::ProtocolViolation` 才說明真正的原因，因為違規的一方通常是有問題的程式或惡意封包，不需要對它說明）；新增的統計欄位（`packets_ignored`、
+`silent_for`、每秒視窗的最大重跑深度……）只存在本地，不在封包裡。`Msg::decode` 的行為也不變（仍拒絕超過 64 幀的 `Input`），只是 session 改用
+`Msg::decode_lenient`（同一個解碼，不檢查幀數上限）才能在確認 `session_id` 之後把它當作違規，而不是像雜訊一樣默默丟掉。
+
+### 21.1 檔案與 API 一覽
+
+| 內容 | 位置 |
+|---|---|
+| 語意違規：`Violation`、`EndReason::ProtocolViolation`、回覆速率限制、事件佇列上限、`BufferSizes`／`Session::buffer_sizes()`、`Stats::packets_ignored`／`silent_for` | `nes-net/src/session.rs` |
+| `RemoteInput`（`Accepted`／`Duplicate`／`Conflict`／`Stale`／`TooFar`）、`REMOTE_HISTORY`、每秒視窗的最大重跑深度 | `nes-net/src/rollback.rs` |
+| `Msg::decode_lenient` | `nes-net/src/protocol.rs` |
+| 統計紀錄：`StatsRecorder`（累計 → 每秒）、`StatsRow`、CSV 標題與解析、`summarize`（平均／最小／p50／p95／最大）、`MatchSummary` | `nes-net/src/statslog.rs` |
+| `local_lan_ipv4()`、`InMemoryTransport` 佇列上限、`SimulatedTransport` 在途封包上限 | `nes-net/src/transport.rs`、`simnet.rs` |
+| 連線大廳、統計疊加層（F3）、desync 警告、結束摘要視窗 | `nes-app/src/app.rs` |
+| 最近連線、輸入檢查、防火牆提示、折線資料、疊加層文字、折線繪製 | `nes-app/src/netui.rs` |
+| 統計 CSV 寫檔、每場摘要、`NetSummaryInfo` | `nes-app/src/emu.rs`、`commands.rs` |
+| CLI：`nes-test stats-summary` | `nes-test/src/stats_cmd.rs` |
+| 測試：`robustness.rs`（27）、`room_full.rs`（2）、`stats.rs`（5） | `nes-net/tests/` |
+
+### 21.2 語意防護（`nes-net`）
+
+網路封包是不可信的輸入。4b 保證「任何位元組序列都不會 panic」；這裡處理**格式正確、但內容不可能來自遵守協定的對方**的封包。原則：
+(1) **先檢查、後套用**——違規的輸入絕不會進入輸入表（沒有覆蓋、沒有影響模擬）；(2) 只有「確認是對方」（來源位址＝鎖定的對端、`session_id` 相符）的封包才會
+導致中止連線，來自別的位址的封包一律只忽略（不能讓路過的封包殺掉連線）；(3) 中止時通知對方（`Disconnect`）、產生 `Disconnected { ProtocolViolation }`、
+之後 session 保持結束且安靜。
+
+| 語意錯誤 | 處理 | 說明 |
+|---|---|---|
+| 輸入的幀號領先「連續收到的幀」≥ 256（或 `start_frame + i` 溢位） | **中止** `InputFrameTooFar` | 合法的對方只從「未被我們 Ack 的最舊一幀」起送，領先量最多約 110 幀（預測視窗 32 ＋ 輸入延遲 4 ＋ 雙方差距）；256 是既有的記憶體上限，現在超過就是違規而不是默默丟掉。255 可、256 不可（測試釘住邊界） |
+| 輸入的幀號遠在過去（比保留的 256 幀歷史更舊） | **安全忽略**（計入 `packets_ignored`） | 晚到的重複封包是正常的；太舊而無法比對的直接忽略，不改變任何狀態 |
+| 一個 `Input` 封包攜帶超過 64 幀 | **中止** `TooManyInputs` | 在確認 `session_id` 之後才判定；`session_id` 不符的同樣封包只是被忽略 |
+| 同一幀收到與先前**不同**的輸入 | **中止** `ConflictingInput` | 輸入一經送出就不能改變。已用掉的幀仍保留 256 幀歷史（lockstep 的 `remote`、rollback 規劃器的 `remote`）供比對；內容相同的重複是正常的冗餘傳送（`Duplicate`）。沒有這個檢查時，後到的不同輸入會被默默忽略（先到者贏）：不會 desync，但也發現不了對方有問題；破壞性測試（§21.9）確認拿掉檢查後對應的測試會失敗 |
+| `Input.sender_frame` 比本地目前幀領先 > 256 | **中止** `SenderFrameTooFar` | 否則一個偽造的 `u32::MAX` 會讓時間同步的「舊封包」判斷永遠成立，之後所有合法封包都被當成過時 |
+| `Ack` 確認了本地根本沒送過的幀 | **中止** `AckBeyondSent` | 以前是「截斷到本地輸入」（安全但默默）；合法的對方只會確認收到的 |
+| 握手完成後又收到 **Hello**（Host） | 寬限期（10 秒）內、**內容與原本相同**：重送同一份 Accept（Accept 掉了的既有恢復機制）；否則**中止** `HandshakeAfterRunning { Hello }` | Client 連上之後就不再送 Hello，所以超過寬限期的 Hello 不是「Accept 掉了」能解釋的 |
+| 握手完成後又收到 **Accept**（Client） | 內容與原本**相同**：忽略（房主對每個 Hello 都回一份 Accept，Hello 與 Accept 在網路上重疊時，連上之後還會收到相同的）；不同：**中止** `HandshakeAfterRunning { Accept }` | 內容＝`session_id`、`input_delay`、`player`、`mode` |
+| Host 收到 Accept、Client 收到 Hello | **中止**（角色不對） | |
+| `Pong` 的時間戳在未來，或算出的往返時間 > 10 秒 | 忽略（不更新 RTT）；`packets_ignored` +1 | 否則偽造的 Pong 可以把 ping 顯示與時間同步的 RTT 弄壞 |
+| 對方持續送封包卻超過 600 幀沒 Ack 我們的輸入（rollback 的本地輸入只在被 Ack 時才釋放） | **中止** `NotAcking` | 本地輸入佇列不能因為對方不確認而無限成長 |
+| **來自非對方位址**的封包（`UdpTransport` 在握手後把它們標記為 `stranger`） | `Hello`：回覆「房間已滿」（**速率限制**：每秒最多 20 個回覆）；其餘（帶著正確 `session_id` 的 Input／Ack／Disconnect／Checksum／Accept 也一樣）**一律忽略**，不改變任何緩衝區 | 被拒絕的 Hello（版本／ROM 不符）的 `Reject` 回覆也受同一個速率限制，所以 Hello 洪流不會讓房主變成放大器，房主仍然在等人、之後正確的 Hello 仍然連得上 |
+
+### 21.3 所有佇列與緩衝區的上限
+
+「封包洪流」測試（每秒 2 萬個封包、5 個虛擬秒＝ 10 萬個，混合 Ping／Pong／不同幀號的 Checksum（rollback 版還帶不同幀號的指紋）／
+內容不變的重複 Input／有效 Ack／垃圾位元組／陌生位址的 Hello 與 Input，事件故意不取走）每個 `poll` 之後檢查 `Session::buffer_sizes()`。
+
+| 容器 | 上限 | 位置 |
+|---|---|---|
+| 一次 `poll` 處理的封包數 | 1024（其餘丟棄、計入 `packets_ignored`）；`UdpTransport::recv` 另有 512／次 | `session.rs` `MAX_DATAGRAMS_PER_POLL`、`transport.rs` |
+| 對方輸入表（lockstep `remote`、規劃器 `remote`） | 領先 256 ＋ 歷史 256 ＝ 512 | `MAX_REMOTE_AHEAD`、`REMOTE_HISTORY` |
+| 待比對的行為指紋（本地／對方，lockstep 的 `Checksum`） | 各 32 | `MAX_PENDING_CHECKSUMS`（`trim_oldest`） |
+| 規劃器：待比對的對方指紋／已確認的本地指紋／預測中的幀 | 64／約 190／預測視窗 K ≤ 32 | `rollback.rs` |
+| 事件佇列（呼叫端不取走時） | 128；先丟最舊的 `Stats`／`Stalled`／`Resumed`，`Connected`／`Desync`／`Disconnected` 一定保留 | `MAX_QUEUED_EVENTS` |
+| 待送佇列 `outbox` | 每次 `poll` 結束時清空（測試在每個 poll 後斷言為 0） | |
+| 本地未被 Ack 的輸入（rollback） | 600 幀，超過即 `NotAcking` | `MAX_UNACKED_INPUTS` |
+| 回覆給陌生位址／被拒絕 Hello 的封包 | 每秒 20 個 | `MAX_REPLIES_PER_SEC` |
+| `InMemoryTransport` 單向佇列／`SimulatedTransport` 在途封包 | 各 8192（滿了丟棄新封包，datagram 語意允許） | `MAX_QUEUED_DATAGRAMS`、`MAX_IN_FLIGHT` |
+
+**已知限制**：(1) 沒有加密或簽章，`session_id`（32 位元）只擋掉路過的舊封包；能偽造來源位址與 `session_id` 的攻擊者可以中止連線（同 4b）。
+(2) 每個 `Input`／`Ping` 回一個 `Ack`／`Pong`（1:1）——不是放大（回覆比請求小），但洪流下 session 仍會回覆最多 1024 個／poll。
+(3) 中止連線時通知對方用的是 `Disconnect { Left }`，對方顯示「對方已中斷連線」而不是違規原因。
+
+### 21.4 連線大廳（`nes-app`）
+
+`Netplay → 連線大廳…` 開啟一個（非強制回應的）視窗，取代 4b 的最小化選單（選單只剩「連線大廳…」「取消／中斷連線」「統計疊加層（F3）」）：
+
+- **本機區網 IPv4**：`nes_net::transport::local_lan_ipv4()`。**做法（不新增依賴）**：建立一個 UDP socket，`connect` 到外部位址 `8.8.8.8:80`，再讀 `local_addr()`。
+  UDP 的 `connect` 只是讓作業系統依路由表選好「送往那個位址會從哪張網卡出去」並記下來，**不會送出任何封包**，所以離線也不會有流量、那個位址也不必真的可達。
+  **限制**：只給出「預設路由」那張網卡的位址——多張網卡（有線＋Wi-Fi、WSL／Docker／VM 的虛擬網卡）時只會給其中一個，不一定是對方所在網段的那個；VPN 開著時可能是
+  VPN 的位址；沒有網路（沒有預設路由）時 `connect` 失敗，顯示「偵測不到」；只找 IPv4，回傳 loopback 或 `0.0.0.0` 視為找不到；它是區網位址，跨網際網路需要路由器的
+  port forwarding（本專案不做 NAT 穿透）。大廳在位址旁附這些限制的說明並提供「重新偵測」與 `ipconfig` 的替代做法。
+  **驗證程度**：過濾條件（loopback → `None`）有自動測試；「不會送出封包」是從 UDP `connect` 的語意推論，沒有抓封包驗證；實際回傳哪個位址取決於使用者的網路，需要手動確認（manual-test-phase4d A2）。
+- **建立房間**：port（1–65535，檢查與錯誤訊息在 `netui::parse_port`）、模式（rollback／lockstep）、input delay、預測視窗 K。顯示「請對方連到：`IP:port`」與複製鈕。
+- **加入房間**：`IP:port`（`netui::parse_join_addr`：缺 port、格式錯、port 0、`0.0.0.0` 各有說明）、**最近連線過的位址**（`RecentAddrs`：只存記憶體、最新在前、不重複、最多 8 筆；
+  只有**連線成功**才記，設定檔留到 Phase 5）、input delay 與 K。
+- **握手狀態**：等待中（「已等待 N 秒」）、連線中（「n / 10 秒」）、中斷中，**取消**按鈕；被拒絕（版本／ROM 不符、房間已滿）與逾時的**原因**顯示在大廳（紅字，沒連上過所以沒有摘要視窗）；
+  連線成功時大廳自動關閉。
+- **防火牆提示**：Host 等待超過 **10 秒**（`netui::FIREWALL_HINT_AFTER`，純函式 `firewall_hint_due` 有邊界測試：9.999 秒不出現、10 秒出現）出現黃字說明：Windows 防火牆是否允許該 UDP port、
+  IP／port 是否正確（多網卡）、是否同一個區網。
+- **房間已滿**：已有對手時第三個連線收到 `Reject { RoomFull }`（4b 已實作），4d 加上速率限制與「原本兩端仍等價跑完」的整合測試（`tests/room_full.rs`）。
+
+### 21.5 統計疊加層（F3）
+
+`Netplay` 選單的「統計疊加層」或 **F3** 切換；半透明黑底、疊在遊戲畫面左上角（`egui::Area`，`interactable(false)`：不擋鍵盤與滑鼠，也**不影響模擬**——它只讀 UI 執行緒手上的 `NetStatus`）。
+內容（`netui::overlay_lines`，純函式，有測試）：模式、玩家、input delay、已確認幀數；ping；每秒 rollback 次數（與累計）；平均與最大重跑深度；重跑耗時（平均／最大）；
+幀數優勢（本地／對方回報）；預測準確率（對／錯）；stall 次數與累計秒數；雙向頻寬；音訊 underrun 次數；被忽略的封包數；沉默超過 1.5 秒時的紅色警告。
+**兩條折線**（最近 10 秒，每秒一點，用 egui 的 painter 自己畫，`netui::draw_line_chart`／`chart_segments`）：ping（毫秒）與每秒 rollback 次數。資料來自 emu 執行緒每秒一次的
+`NetStatus`（帶序號 `seq`，`NetHistory::record` 每個序號只記一次，所以階段改變等原因重發的狀態不會把折線灌滿）。
+**Desync 警告**：desync 時 session 已結束，所以警告是一個紅色橫幅（疊在遊戲畫面上）加上結果視窗，列出已存下的**狀態檔與 replay 路徑**與分析指令；直到使用者關閉結果視窗。
+
+### 21.6 斷線處理與本場摘要
+
+- **對方正常離開**：對方的 `Disconnect` 一到就結束（`PeerLeft`），**立即**顯示；**網路中斷**（拔網路線）：5 秒沒有收到對方任何封包才結束（`Timeout`，既有的 `PEER_TIMEOUT`）。
+  為了讓使用者不必乾等，`Stats::silent_for`（距離上次收到對方封包多久）在每秒的統計事件裡更新；**超過 1.5 秒**狀態列變紅、疊加層出現警告（虛擬時鐘測試：
+  斷網後每秒的 `silent_for` 逐秒增加、逾時前 3–5 秒）。
+- 兩者都**回到單機模式**（手上的 `Nes` 保持原狀繼續跑，不重新開機）並彈出「本場摘要」視窗：模式、時長、總幀數（雙方取共同完成的幀數；斷線逾時時各自的長度）、ping 平均／最大、
+  （rollback）rollback 次數／最大重跑深度／預測準確率、stall 次數與秒數、傳送／接收位元組、音訊 underrun 次數，以及 **replay 與統計 CSV 的完整路徑**。
+  握手階段就失敗（沒連上過）沒有摘要，只在大廳顯示原因。
+
+### 21.7 統計紀錄檔與 `nes-test stats-summary`
+
+每場連線在連線成功時於 **replay 旁**（`nes-app.exe` 旁的 `netplay_replays\`）建立 `netplay-<Unix 秒>-p<1|2>-<ROM 前 16 字元>-stats.csv`，之後**每秒追加一行**
+（emu 執行緒收到 `Event::Stats` 時；程式當掉也保有已寫入的部分）。累計值由 `StatsRecorder` 換算成**這一秒**的值（用虛擬時鐘測試）。**欄位名稱帶單位**：
+
+| 欄位 | 單位 | 說明 |
+|---|---|---|
+| `time_s` | 秒 | 自連線成功起 |
+| `mode` | — | `lockstep`／`rollback` |
+| `ping_ms` | ms | 平滑後的往返時間；還沒量到＝空 |
+| `fps` | 幀/秒 | 這一秒內已確認（lockstep：已完成）的幀數 ÷ 經過的秒數 |
+| `rollbacks` | 次 | 這一秒內的 rollback 次數（lockstep＝空） |
+| `resim_depth_avg`／`resim_depth_max` | 幀 | 這一秒內的平均／最大重跑深度（沒有 rollback 的一秒，平均＝空） |
+| `resim_ms_avg` | ms | 這一秒內每次重跑（含還原）的平均耗時 |
+| `stalls`／`stall_ms` | 次／ms | 這一秒內新增的 stall 次數與時間 |
+| `frame_advantage` | 幀 | rollback 的本地幀數優勢（正＝領先） |
+| `prediction_accuracy_pct` | % | 累計的預測準確率 |
+| `send_bytes_per_s`／`recv_bytes_per_s` | B/s | UDP payload（不含 28 位元組的 UDP／IP 標頭／封包） |
+| `audio_underruns` | 次 | 這一秒內新增的音訊 underrun 次數 |
+
+`nes-test stats-summary <csv>... [--metrics a,b]`：讀一個或多個 CSV，輸出**一張** Markdown 表（每個檔案的每個指標一列）：`檔案｜模式｜秒數｜指標｜單位｜樣本｜平均｜最小｜p50｜p95｜最大`。
+百分位用最近排名法；空欄位不計入樣本；檔案讀不了或格式不符回報檔名與行號、結束碼 2；`--metrics` 打錯會列出合法的名稱。
+往返測試：`statslog::tests`（寫出 → 解析 → 再寫出位元組相同）、`tests/stats.rs`（整場模擬對戰的 CSV → 解析 → 摘要）、`stats_cmd::tests`（四場合成資料 → 一張表，手算的 p50／p95／最大相符）、
+`emu.rs` 的 loopback 測試（兩個 emu 執行緒實際寫出的 CSV 可被解析、有摘要）。
+
+### 21.8 「找不到 ROM 就默默通過」的稽核
+
+Phase 4c.1 發現 `output_off_equivalence` 在沒有 `roms/` 的 CI 上會以「0 個 ROM 通過」顯示為 pass。稽核方式：`grep` 全部 crate 的 `std::fs::read`／`read_to_string`／`env!("CARGO_MANIFEST_DIR")`／
+`include_bytes!`／`roms`，再逐一確認是不是 `#[test]`。**依賴外部檔案（`roms/`、使用者的遊戲 ROM）的測試共 4 個**（`nes-app` 的字型 `include_bytes!` 在 repo 內、編譯期嵌入，不算；
+`nes-test`／`nes-app`／`nes-net` 的測試只讀自己在暫存資料夾寫出的合成檔案）：
+
+| # | 測試 | 依賴 | 4c.1 的行為（假通過） | 4d 的處理 | CI 必定執行的對應測試 |
+|---|---|---|---|---|---|
+| 1 | `nes-core/tests/golden_frames.rs` `test_rom_final_screens_match_golden_hashes` | `roms/nes-test-roms/`（30 個 ROM） | 缺目錄：`return`（pass）；缺單檔：`continue`（pass） | `#[ignore = "requires roms/"]`；用 `--ignored` 執行時缺目錄**或缺任何一個檔案**都 `panic`（列出缺的檔案） | `tests::golden_frame_hash_of_rendering_rom`（合成 ROM，每幀捲動，釘住 framebuffer 雜湊）、`replay_tests::golden_replay_pins_checkpoints_and_encoded_bytes` |
+| 2 | `nes-core/tests/output_off_equivalence.rs` `output_off_is_behaviorally_identical_on_real_roms` | `roms/nes-test-roms/`（16 個 ROM）＋選用的 `Spacegulls-1.1.nes`（商業遊戲，使用者自己放的） | 缺檔：`continue`，**以 0 個 ROM 通過** | 同上；缺任何 test ROM 就 `panic`，並斷言「至少比對了全部 16 個」；Spacegulls 仍是選用（缺少不算失敗，有則多比對一個） | `output_switch_tests.rs`（4 個：SMB 式 sprite 0 畫面分割的合成 ROM、渲染 ROM、mapper 宣告與強制走完整路徑的指紋相同） |
+| 3 | `nes-core/src/cpu/singlestep.rs` `singlestep_tests_all_opcodes` | `roms/singlestep/v1/`（256 個 JSON，約 1 GB） | 已經是 `#[ignore]`，但 `--ignored` 缺資料時 `return`（pass） | `#[ignore = "requires roms/…"]`；缺資料 `panic` 並說明去哪裡下載 | `cpu::tests`（40 個手寫的指令語意、旗標、位址模式、中斷）、`cpu::opcodes`（2）、`bus::tests`（11） |
+| 4 | 同上 `singlestep_bus_accesses` | 同上 | 同上 | 同上 | 同上 |
+
+**為什麼選 `#[ignore = "requires roms/"]`（規格建議的做法）而不是其他做法**：(a) 顯示為「ignored」，CI 的輸出誠實地說「這個沒跑」；(b) 不需要 feature、環境變數或建置設定，也不改變 `cargo test --workspace` 的編譯；
+(c) `--ignored`／`--include-ignored` 是標準的本機完整執行方式；(d) 我另外加了「明確要求執行卻缺檔就**失敗**」——只加 `#[ignore]` 不夠，因為在沒有 `roms/` 的機器上有人用 `--include-ignored`
+仍會得到假通過。考慮過的替代做法：在測試裡偵測 CI 環境變數（`CI=true`）決定要不要略過——太隱晦、依賴外部環境；在 `build.rs` 偵測 `roms/` 決定 `cfg`——會讓「有沒有 `roms/`」
+影響編譯結果與快取，且測試從清單裡消失（比 ignored 更看不出來）。
+
+**每一類功能在 CI 上仍有不依賴外部檔案、必定執行的測試**：
+
+| 功能類別 | 依賴外部 ROM 的驗證 | CI 必定執行的測試（合成 ROM／手寫） |
+|---|---|---|
+| 黃金畫面（PPU 輸出） | `golden_frames`（30 個 ROM 的雜湊） | `golden_frame_hash_of_rendering_rom`、`ppu::tests`（43） |
+| 輸出開／關等價（rollback 重跑用） | `output_off_equivalence` | `output_switch_tests`（4）、`snapshot_tests`（5）、`nes-net` 的 `rollback_equivalence`（13，合成的輸入探針 ROM）、`stats`（5） |
+| CPU 指令語意 | SingleStepTests（256 萬筆） | `cpu::tests`（40）、`cpu::opcodes`（2） |
+| 匯流排存取、dummy read | `singlestep_bus_accesses` | `bus::tests`（11）、`cpu::tests` 裡的 dummy read／存取順序案例（5） |
+| APU、mapper、iNES、replay、指紋 | （blargg 的 apu／mapper 測試只是驗收用 CLI，不在 `cargo test` 裡） | `apu::tests`（36）＋`apu::output`（6）、`cartridge::mapper`（15）、`cartridge::ines`（12）、`replay_tests`（19）、`fingerprint_tests`（7） |
+
+**沒有任何一類功能只剩依賴外部 ROM 的測試，所以沒有需要補的合成 ROM 版本。** 誠實的限制：blargg 的 80 個 ROM（PPU 的 VBL／NMI 週期級時序、sprite hit 邊界、APU 細節……）從來就不在 `cargo test` 裡，
+是驗收指令 7 的手動 CLI；這一層的**細粒度時序回歸**在 CI 上只有 `ppu::tests`／`apu::tests` 的手寫案例涵蓋，不如那 80 個 ROM 細——改動時序後必須在本機跑驗收指令 7。
+
+### 21.9 測試與驗證
+
+**新增的自動化測試**（全部在 CI 上必定執行、虛擬時鐘、不需要 `roms/`；除 `room_full` 與 `emu.rs` 的 loopback 測試用真實 UDP 外）：
+
+| 內容 | 測試 |
+|---|---|
+| 6a 每一種語意錯誤的封包各有測試（兩種模式各跑一次） | `robustness.rs`：幀號遠在未來／邊界 255 可 256 不可／溢位／遠在過去被安全忽略、Ack 超過已送出、`sender_frame` 遠在未來、Pong 未來或離譜的 RTT、冗餘輸入 65 幀（嚴格 `decode` 仍拒絕）與正好 64 幀可以、`session_id` 不符的超量封包只是被忽略、**同一幀不同輸入**（尚未用掉／已模擬過兩種，後者確認已模擬的每一幀都是對方原本送的輸入）、相同輸入重複是正常冗餘、Host 的 Hello（寬限期內相同→重送 Accept、超過寬限期或內容不同→中止）、Host 收到 Accept、Client 的重複 Accept（相同→忽略、三種不同→中止）、Client 收到 Hello、**陌生位址**（帶正確 `session_id` 的 Input／Disconnect／Ack／Checksum／Accept 都不改變任何緩衝區；Hello 得到「房間已滿」但每秒最多 20 個）、被拒絕的 Hello 也限速且房主仍在等人、對方不 Ack、事件佇列有上限、隨機組合各種訊息與來源不 panic、結束之後保持安靜 |
+| 6b 封包洪流 | `a_packet_flood_keeps_every_buffer_bounded_and_the_session_alive`（每秒 2 萬個封包 × 5 秒 ×兩種模式，每個 poll 後 `buffer_sizes()` 都在上限內、對陌生人的回覆 ≤ 120、洪流後仍能正常推進且套用的都是對方真正送的輸入）；`a_single_huge_burst_is_truncated_per_poll`（一次 10 萬個封包，只處理 1024 個）；`in_memory_queue_is_bounded` |
+| 6c 房間已滿 | `room_full.rs`（真實 UDP，兩種模式）：A、B 連上並開始對戰**之後**，C（另加一個狂送 Hello 的 socket）連進來 → C 收到 `Rejected(RoomFull)`；A、B 仍跑完 600 幀，指紋逐幀相同、等於離線重播、replay 位元組相同、沒有 desync 或 Disconnected |
+| 6d 統計的計算（虛擬時鐘） | `stats.rs`：ping＝2×單程延遲（兩種模式）、每秒紀錄加總等於最終累計（rollback 次數、stall 次數與時間）、最大重跑深度 ≤ K 且等於整場最大值、預測準確率與規劃器一致、頻寬與幀率量級、理想網路 60.1 fps／無 stall、斷網後 `silent_for` 逐秒增加；`statslog::tests`（6） |
+| 6e CSV 往返與摘要子命令 | `statslog::tests`（寫出 → 解析 → 再寫出位元組相同）、`stats.rs`（整場對戰 → CSV → 摘要）、`stats_cmd::tests`（4 場合成資料 → 一張表，p50／p95／最大手算相符；檔案錯誤；篩選；空檔）、`emu.rs`（兩個 emu 執行緒寫出的 CSV 可解析、有摘要、路徑與 replay 一致） |
+| UI 純邏輯 | `netui::tests`（7）：最近連線、port／位址檢查、防火牆提示的 10 秒邊界、折線歷史（10 筆、每個序號只記一次）、折線頂點換算、疊加層必要的每一項統計、沉默警告 |
+| 6f 既有的等價性、時鐘偏差、破壞性測試 | 全部維持通過（`equivalence` 6、`rollback_equivalence` 13、`handshake` 24——其中 `a_hostile_input_packet_cannot_grow_memory_or_overflow` 依 4d 的新語意改寫：太遠／溢位／與已收到的不同／宣稱的幀號過遠現在是中止連線，合理範圍內仍照常接受、Ack 超過已送出的也是中止） |
+
+**6g 破壞性測試（實測；每一項都是暫時修改原始碼 → 跑測試 → 還原，還原後 `cmp` 與備份位元組相同）**：
+
+| 暫時拿掉 | 失敗的測試 |
+|---|---|
+| 「同一幀收到不同輸入」的檢查（`Conflict` 分支改成什麼都不做） | `robustness`：`a_different_input_for_a_frame_already_received_aborts_and_is_not_applied`、`a_different_input_for_a_frame_that_was_already_simulated_aborts_and_the_simulation_stays_honest`；`handshake`：`a_hostile_input_packet_cannot_grow_memory_or_overflow`（共 3 個） |
+| 待比對指紋的上限（`trim_oldest` 改成空函式） | `a_packet_flood_keeps_every_buffer_bounded_and_the_session_alive`：「lockstep 第 12 個 poll：`BufferSizes { … remote_checksums: 33 … }`」（上限 32） |
+| 每次 `poll` 處理封包數的上限 | `a_single_huge_burst_is_truncated_per_poll`（一次處理了全部而不是 1024 個） |
+| 事件佇列的上限 | `the_event_queue_is_bounded_when_the_caller_never_drains_it`（385 個事件） |
+| 回覆速率限制 | `a_stranger_hello_gets_room_full_but_the_reply_rate_is_limited`（500 個 Hello 回了 500 個）、`rejected_hellos_are_also_rate_limited…`（300 個回 300 個）、洪流測試（對陌生人回了 12500 個封包） |
+| 「領先連續收到的幀 256 幀」的上限 | `handshake` 的 `a_hostile_input_packet…`、`robustness` 的 `an_input_frame_far_in_the_future_aborts_the_connection`、`the_future_limit_is_exactly_256_frames…`、`a_connection_that_ended_by_violation_stays_ended_and_quiet` |
+
+**沒有改變模擬與演算法的證據（實測）**：把 HEAD（4c.1，`7893b5e`）用 `git worktree`（detached，事後移除）另外建置，與本階段的建置跑**同樣的** `netsim`（Spacegulls，3600 幀，20 組種子）：
+rollback 的「10% 丟包、100 ms、±30 ms」與最壞情況（`--loss 30 --delay 200 --jitter 80 --duplicate 5 --input-change-rate 0.5 --resets`）兩組，**每一列的完成／兩端相同／＝離線重播／replay 相同／stall／
+虛擬耗時／幀率都逐列相同**，彙總列的 rollback 次數、重跑深度、預測準確率、頻寬也相同（只有「重跑耗時」是真實時鐘量測，各次不同）。
+（順帶：§20.8 表格裡 rollback 的 stall 欄位是 4c.1 之前的數字，4c.1 起的實際值是 33.4／278 與 824.1／29717——HEAD 與本階段完全相同。）
+
+### 21.10 驗收結果（實際執行）
+
+| # | 指令 | 結果 |
+|---|---|---|
+| 1 | `cargo build --workspace` | 成功 |
+| 2 | `cargo test --workspace` | **497 通過 + 4 忽略**（明細見 CLAUDE.md 基準；CI 必定執行 497、需要 `roms/` 的本機測試 4） |
+| 3 | `cargo clippy --workspace --all-targets -- -D warnings` | 無警告（`Event` 的 `large_enum_variant` 以 `#[allow]` 處理並註明理由：事件每秒一個、不在熱路徑上） |
+| 4 | `cargo fmt --all -- --check` | 通過 |
+| 5 | nestest（含 `--strict`） | 兩者都「8991 行全數比對通過，錯誤碼 $02=$03=00」 |
+| 6 | SingleStepTests 閘門（release） | 官方 1510000/1510000（100%）、非官方（穩定）870000/870000（100%）、JAM 120000/120000（100%）；匯流排存取閘門官方與非官方（穩定）皆 100%；不穩定 opcode 8B／93／9B／9F／AB／BB 為預期失敗（同 4c） |
+| 7 | blargg（80 個 `.nes`，依固定計數規則） | **80 個：66 PASS、13 預期失敗、1 無自動判定**——與 4c 完全相同；13 個預期失敗＝`ppu_vbl_nmi` 單檔 6（02、05、06、07、08、10）＋合集 1、`power_up_palette` 1、`cpu_interrupts` 單檔 4（2、3、4、5）＋合集 1；無自動判定＝`scrolltest/scroll.nes`（靠黃金畫面） |
+| 8 | 黃金畫面與輸出開／關（`--ignored`，release） | `golden_frames`：檢查了 30 / 30 個 ROM，通過；`output_off_equivalence`：比對了 17 個 ROM（16 個 test ROM＋Spacegulls），通過 |
+| 9 | `netsim`（Spacegulls，3600 幀，20 組種子，release） | lockstep 三種條件（理想；10%／100 ms／±30 ms；30%／200 ms／±80 ms／5% 重複）、rollback 同三種、rollback 最壞（`--input-change-rate 0.5 --resets`）、rollback 時鐘偏差 `--clock-skew 1`（10%／100 ms 條件）：**全部 20/20「兩端相同、＝離線重播、replay 相同」，結束碼 0**。lockstep 的數字與 4b／4c 逐位相同（stall 2228.8／92417、2019.0／216310，幀率 23.8／13.1，頻寬 2184／1435／1152 B/s）。`--compare` 對照表也全數 20/20 |
+| 10 | `rollback-bench --depth 8`（10000 個節拍） | 最壞（還原＋重跑 7 幀＋新的一幀）：平均 5.686、p50 5.561、p90 6.231、**p99 8.313 ms（預算 16.64 ms 的 50.0%）**、p99.9 10.669、最大 13.085 ms（78.6%）；一般幀 p99 1.932 ms、最大 4.423 ms。目標 p99 < 預算：達成，最大值也在預算內（本次量測；作業系統雜訊仍可能偶爾超出，見 §20.12） |
+
+### 21.11 已知限制與沒有驗證的項目
+
+- **GUI 沒有自動化驗證**（見 [`manual-test-phase4d.md`](manual-test-phase4d.md)）：大廳與疊加層的版面與中文字型、按鈕（複製、重新偵測、取消、最近連線點選）、防火牆提示在畫面上是否於 10 秒時出現（計時邏輯 `firewall_hint_due`
+  有測試，畫面沒有）、折線圖的外觀、紅色橫幅與摘要視窗、Windows 防火牆、Wi-Fi／有線的真實延遲、拔網路線時的實際反應。**Desync 警告無法在 GUI 上觸發**（沒有辦法在執行中注入分歧），只由自動化測試與程式碼審視涵蓋。
+  本階段沒有實際啟動 GUI。
+- **`local_lan_ipv4()` 的「不送出封包」是從 UDP `connect` 的語意推論**，沒有抓封包驗證；多網卡／VPN 時回傳的位址不一定是對方要連的那個（§21.4）。
+- 沒有加密或簽章：能偽造來源位址與 `session_id` 的攻擊者仍能中止連線（§21.3）。
+- `Disconnect { Left }` 也用來通知「違規中止」，對方的畫面不會顯示違規原因（§21.3）。
+- `emu.rs` 沒有端到端測試「違規」路徑（沒有辦法在 emu 執行緒上注入惡意封包）；`finish_netplay` 對 `ProtocolViolation` 的處理（歸為 `NetEndKind::Error`、有摘要）只由程式碼審視與 `nes-net` 的測試涵蓋。
+- **實機數據尚未收集**：四場 10 分鐘的有線／Wi-Fi × lockstep／rollback 需要兩台電腦，流程在 manual-test-phase4d 的 F 節；本階段只用合成資料驗證了工具鏈（`stats-summary`）。

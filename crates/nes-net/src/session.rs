@@ -68,7 +68,8 @@ use crate::protocol::{
     Msg, PROTOCOL_VERSION, PlayerInput, ProtocolError, RejectReason,
 };
 use crate::rollback::{
-    self, ConfirmedFrame, Plan, RollbackConfig, RollbackPlanner, RollbackStats, Sabotage,
+    self, ConfirmedFrame, Plan, REMOTE_HISTORY, RemoteInput, RollbackConfig, RollbackPlanner,
+    RollbackStats, Sabotage,
 };
 use crate::transport::{Datagram, Transport};
 
@@ -96,6 +97,22 @@ const MAX_REMOTE_AHEAD: u32 = 256;
 const MAX_PENDING_CHECKSUMS: usize = 32;
 /// 主動中斷／Desync 時，`Disconnect` 送幾次（UDP 會掉包）。
 const DISCONNECT_REPEATS: usize = 3;
+/// 一次 `poll` 最多處理幾個收到的封包（其餘丟棄並計入 `packets_ignored`）：封包洪流下 CPU 與記憶體都有上限。
+pub const MAX_DATAGRAMS_PER_POLL: usize = 1024;
+/// 事件佇列的上限（呼叫端沒有取走時）。滿了先丟最舊的 `Stats`／`Stalled`／`Resumed`；
+/// `Connected`／`Desync`／`Disconnected` 一定保留（各最多一個）。
+pub const MAX_QUEUED_EVENTS: usize = 128;
+/// 對方輸入的 `sender_frame` 最多可以領先本地目前幀多少幀，否則視為語意錯誤（合法的對方最多領先
+/// 「預測視窗＋輸入延遲」約 40 幀）。
+const MAX_SENDER_LEAD: u32 = 256;
+/// 送出後還沒被對方 Ack 的本地輸入上限（約 10 秒）。對方一直送封包卻從不確認時，本地輸入不能無限堆積。
+pub const MAX_UNACKED_INPUTS: u32 = 600;
+/// 對「別的位址」或被拒絕的 Hello 的回覆速率上限（每秒幾個）：不讓 session 成為放大器，也不被 Hello 洪流拖垮。
+const MAX_REPLIES_PER_SEC: u32 = 20;
+/// 握手完成之後，Host 還容許「與原本相同的 Hello」（Accept 掉了、Client 重送）的時間。
+const HELLO_GRACE: Duration = HANDSHAKE_TIMEOUT;
+/// `Pong` 帶回的往返時間超過這個值視為不可信（不更新 RTT）。
+const MAX_PLAUSIBLE_RTT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -201,6 +218,57 @@ pub enum EndReason {
     Desync {
         frame: u32,
     },
+    /// 對方送來格式正確但語意錯誤的封包（Phase 4d），連線被中止。
+    ProtocolViolation(Violation),
+}
+
+/// 語意層級的協定違規（封包解得開，但內容不可能來自遵守協定的對方）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Violation {
+    /// 輸入的幀號領先「連續收到的幀」太遠（或幀號溢位）。合法的對方只會從「未被 Ack 的最舊一幀」起送。
+    InputFrameTooFar { frame: u32 },
+    /// 一個 `Input` 封包攜帶超過 [`MAX_INPUTS_PER_PACKET`] 幀。
+    TooManyInputs { count: usize },
+    /// 同一幀收到與先前**不同**的輸入（輸入一經送出就不能改變）。
+    ConflictingInput { frame: u32 },
+    /// `Input.sender_frame` 遠在本地目前幀之後。
+    SenderFrameTooFar { sender_frame: u32 },
+    /// `Ack` 確認了本地根本沒送過的幀。
+    AckBeyondSent { frame: u32 },
+    /// 握手完成之後又收到不該有的握手訊息（`what`：Hello／Accept）——內容與原本不同、超過寬限期或角色不對。
+    HandshakeAfterRunning { what: &'static str },
+    /// 對方持續送封包，卻超過 [`MAX_UNACKED_INPUTS`] 幀沒有確認我們的輸入。
+    NotAcking,
+}
+
+impl fmt::Display for Violation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Violation::InputFrameTooFar { frame } => {
+                write!(f, "輸入的幀號 {frame} 遠超出合理範圍")
+            }
+            Violation::TooManyInputs { count } => write!(
+                f,
+                "一個封包攜帶 {count} 幀輸入，超過上限 {MAX_INPUTS_PER_PACKET}"
+            ),
+            Violation::ConflictingInput { frame } => {
+                write!(f, "第 {frame} 幀收到與先前不同的輸入")
+            }
+            Violation::SenderFrameTooFar { sender_frame } => {
+                write!(f, "對方宣稱的幀號 {sender_frame} 遠超出合理範圍")
+            }
+            Violation::AckBeyondSent { frame } => {
+                write!(f, "對方確認了我們從未送出的第 {frame} 幀")
+            }
+            Violation::HandshakeAfterRunning { what } => {
+                write!(f, "握手完成後又收到不合理的 {what}")
+            }
+            Violation::NotAcking => write!(
+                f,
+                "對方持續送封包卻超過 {MAX_UNACKED_INPUTS} 幀沒有確認我們的輸入"
+            ),
+        }
+    }
 }
 
 impl fmt::Display for EndReason {
@@ -218,6 +286,9 @@ impl fmt::Display for EndReason {
                 f,
                 "偵測到不同步（desync）：已完成 {frame} 幀時雙方的行為指紋不同，連線已停止"
             ),
+            EndReason::ProtocolViolation(v) => {
+                write!(f, "連線已中止：對方送來不合協定的封包（{v}）")
+            }
         }
     }
 }
@@ -246,8 +317,14 @@ pub struct Stats {
     /// 最近一個統計視窗（約 1 秒）的每秒位元組數。
     pub send_bytes_per_sec: u32,
     pub recv_bytes_per_sec: u32,
+    /// 被忽略的封包數：無法解碼、來自別的位址、過時的重複輸入、超過每次 `poll` 上限、被限速的回覆。
+    pub packets_ignored: u64,
+    /// 距離上一次收到對方（session_id 相符的）封包過了多久；還沒連上時是零。UI 用它在斷線逾時之前提早警告。
+    pub silent_for: Duration,
 }
 
+// `Stats` 比其他事件大很多，但事件每秒才一個（不在熱路徑上），裝箱只會讓每個呼叫端的比對多一層 `*`。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// 握手成功。雙方都必須從開機狀態開始（重新載入 ROM），第 0 幀對齊。
@@ -319,6 +396,8 @@ pub struct Session {
     /// 上一次統計時的累計 rollback 次數（算每秒次數用）。
     rollbacks_at_last_stats: u32,
     rollbacks_per_sec: f32,
+    /// 最近一個統計視窗內最深的一次重跑。
+    window_max_depth: u32,
     started_at: Option<Duration>,
     last_recv: Duration,
     next_hello: Duration,
@@ -363,6 +442,34 @@ pub struct Session {
     events: VecDeque<Event>,
     end_reason: Option<EndReason>,
     peer_frames: Option<u32>,
+
+    /// 最近一次 `poll` 的時間（算 `silent_for`）。
+    last_now: Duration,
+    packets_ignored: u64,
+    /// Host：對手的 Hello 內容與握手完成的時間（之後只容許相同內容的重送）。
+    peer_hello: Option<(u16, u16, RomId)>,
+    running_since: Duration,
+    /// Client：房主的 Accept 內容（之後只容許相同內容的重複 Accept）。
+    accepted: Option<(u32, u8, u8, Mode)>,
+    /// 回覆速率限制的視窗。
+    reply_window_start: Duration,
+    replies_in_window: u32,
+}
+
+/// 各個內部佇列／緩衝區目前的大小（診斷與封包洪流測試用：全部都有固定上限）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferSizes {
+    pub local_inputs: usize,
+    pub remote_inputs: usize,
+    pub local_checksums: usize,
+    pub remote_checksums: usize,
+    pub events: usize,
+    pub outbox: usize,
+    /// rollback 規劃器：對方輸入、已確認的指紋、對方待比對的指紋、預測中的幀。
+    pub planner_remote_inputs: usize,
+    pub planner_fingerprints: usize,
+    pub planner_remote_fingerprints: usize,
+    pub planner_frames: usize,
 }
 
 impl Session {
@@ -382,6 +489,7 @@ impl Session {
             rb: None,
             rollbacks_at_last_stats: 0,
             rollbacks_per_sec: 0.0,
+            window_max_depth: 0,
             started_at: None,
             last_recv: Duration::ZERO,
             next_hello: Duration::ZERO,
@@ -416,6 +524,13 @@ impl Session {
             events: VecDeque::new(),
             end_reason: None,
             peer_frames: None,
+            last_now: Duration::ZERO,
+            packets_ignored: 0,
+            peer_hello: None,
+            running_since: Duration::ZERO,
+            accepted: None,
+            reply_window_start: Duration::ZERO,
+            replies_in_window: 0,
             cfg,
         }
     }
@@ -479,6 +594,7 @@ impl Session {
     pub fn stats(&self) -> Stats {
         let rollback = self.rb.as_ref().map(|rb| RollbackStats {
             rollbacks_per_sec: self.rollbacks_per_sec,
+            window_max_depth: self.window_max_depth,
             ..rb.stats()
         });
         Stats {
@@ -495,7 +611,48 @@ impl Session {
             packets_received: self.packets_received,
             send_bytes_per_sec: self.rate_sent,
             recv_bytes_per_sec: self.rate_received,
+            packets_ignored: self.packets_ignored,
+            silent_for: if self.is_running() {
+                self.last_now.saturating_sub(self.last_recv)
+            } else {
+                Duration::ZERO
+            },
         }
+    }
+
+    /// 各個內部佇列目前的大小（診斷與封包洪流測試用）。
+    pub fn buffer_sizes(&self) -> BufferSizes {
+        let planner = self.rb.as_ref().map(RollbackPlanner::buffer_sizes);
+        BufferSizes {
+            local_inputs: self.local.len(),
+            remote_inputs: self.remote.len(),
+            local_checksums: self.local_fps.len(),
+            remote_checksums: self.remote_fps.len(),
+            events: self.events.len(),
+            outbox: self.outbox.len(),
+            planner_remote_inputs: planner.map_or(0, |p| p.remote_inputs),
+            planner_fingerprints: planner.map_or(0, |p| p.fingerprints),
+            planner_remote_fingerprints: planner.map_or(0, |p| p.remote_fingerprints),
+            planner_frames: planner.map_or(0, |p| p.frames),
+        }
+    }
+
+    /// 事件入佇列（有上限，見 [`MAX_QUEUED_EVENTS`]）。
+    fn push_event(&mut self, event: Event) {
+        let droppable = |e: &Event| {
+            matches!(
+                e,
+                Event::Stats(_) | Event::Stalled { .. } | Event::Resumed { .. }
+            )
+        };
+        if self.events.len() >= MAX_QUEUED_EVENTS {
+            if let Some(i) = self.events.iter().position(droppable) {
+                self.events.remove(i);
+            } else if droppable(&event) {
+                return;
+            }
+        }
+        self.events.push_back(event);
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -543,17 +700,22 @@ impl Session {
             if local.is_some() && self.stall_since.is_none() {
                 self.stall_since = Some(now);
                 self.stalls += 1;
-                self.events.push_back(Event::Stalled { frame: f });
+                self.push_event(Event::Stalled { frame: f });
             }
             return None;
         };
         if let Some(since) = self.stall_since.take() {
             let waited = now.saturating_sub(since);
             self.stall_time += waited;
-            self.events.push_back(Event::Resumed { frame: f, waited });
+            self.push_event(Event::Resumed { frame: f, waited });
         }
-        self.remote.remove(&f);
         self.next_frame += 1;
+        // 已用掉的對方輸入多留 REMOTE_HISTORY 幀：晚到的重複封包可以比對（同一幀不同輸入＝違規）。
+        while let Some((&oldest, _)) = self.remote.first_key_value()
+            && oldest.saturating_add(REMOTE_HISTORY) < self.next_frame
+        {
+            self.remote.pop_first();
+        }
         self.prune_local();
         Some(PlayerInput::merge(local, remote, self.local_player))
     }
@@ -605,7 +767,7 @@ impl Session {
 
     /// 偵測到雙方的行為指紋不同：事件、通知對方、結束。
     fn raise_desync(&mut self, frame: u32, local: u64, remote: u64) {
-        self.events.push_back(Event::Desync {
+        self.push_event(Event::Desync {
             frame,
             local: Some(local),
             remote: Some(remote),
@@ -618,6 +780,37 @@ impl Session {
             });
         }
         self.end(EndReason::Desync { frame });
+    }
+
+    /// 對方送來語意錯誤的封包：通知對方（`Disconnect`）、以 [`EndReason::ProtocolViolation`] 結束。
+    /// 絕不 panic、不讓狀態被改壞（違規的輸入在到這裡之前已經被拒絕，沒有套用）。
+    fn violate(&mut self, violation: Violation) {
+        if self.is_ended() {
+            return;
+        }
+        log::warn!("協定違規，中止連線：{violation}");
+        for _ in 0..DISCONNECT_REPEATS {
+            self.outbox.push(Msg::Disconnect {
+                session_id: self.session_id,
+                reason: DisconnectReason::Left,
+                frames_completed: self.frames_completed(),
+            });
+        }
+        self.end(EndReason::ProtocolViolation(violation));
+    }
+
+    /// 對「別的位址」與被拒絕的 Hello 的回覆速率限制。
+    fn reply_allowed(&mut self, now: Duration) -> bool {
+        if now.saturating_sub(self.reply_window_start) >= Duration::from_secs(1) {
+            self.reply_window_start = now;
+            self.replies_in_window = 0;
+        }
+        if self.replies_in_window >= MAX_REPLIES_PER_SEC {
+            self.packets_ignored += 1;
+            return false;
+        }
+        self.replies_in_window += 1;
+        true
     }
 
     // ---- rollback ---------------------------------------------------------------
@@ -640,6 +833,9 @@ impl Session {
             // 送給對方的本地輸入序列（與規劃器裡的那份相同）。
             self.local.push_back(sampled);
             self.input_dirty = true;
+            if self.unacked() > MAX_UNACKED_INPUTS {
+                self.violate(Violation::NotAcking);
+            }
         }
         plan
     }
@@ -712,7 +908,7 @@ impl Session {
         }
         self.state = State::Ended;
         self.end_reason = Some(reason);
-        self.events.push_back(Event::Disconnected {
+        self.push_event(Event::Disconnected {
             reason,
             peer_frames: self.peer_frames,
         });
@@ -723,7 +919,13 @@ impl Session {
     /// 收封包、處理、送封包、重送、逾時、握手、統計。每個節拍呼叫一次（越頻繁越即時；可以每毫秒）。
     pub fn poll<T: Transport + ?Sized>(&mut self, now: Duration, transport: &mut T) {
         let started = *self.started_at.get_or_insert(now);
-        for datagram in transport.recv(now) {
+        self.last_now = now;
+        for (i, datagram) in transport.recv(now).into_iter().enumerate() {
+            if i >= MAX_DATAGRAMS_PER_POLL {
+                // 封包洪流：這一輪只處理前 N 個，其餘丟棄（UDP 本來就不保證送達）。
+                self.packets_ignored += 1;
+                continue;
+            }
             self.on_datagram(now, datagram, transport);
         }
         self.flush_outbox(now, transport);
@@ -798,7 +1000,8 @@ impl Session {
                 .max(1e-9);
             self.rate_sent = (self.window_sent as f64 / elapsed) as u32;
             self.rate_received = (self.window_received as f64 / elapsed) as u32;
-            if let Some(rb) = &self.rb {
+            if let Some(rb) = self.rb.as_mut() {
+                self.window_max_depth = rb.take_window_max_depth();
                 let total = rb.stats().rollbacks;
                 self.rollbacks_per_sec =
                     (total - self.rollbacks_at_last_stats) as f32 / elapsed as f32;
@@ -808,7 +1011,7 @@ impl Session {
             self.window_sent = 0;
             self.window_received = 0;
             self.next_stats = now + STATS_INTERVAL;
-            self.events.push_back(Event::Stats(self.stats()));
+            self.push_event(Event::Stats(self.stats()));
         }
     }
 
@@ -933,7 +1136,7 @@ impl Session {
         if self.is_ended() {
             return;
         }
-        let msg = match Msg::decode(&datagram.data) {
+        let msg = match Msg::decode_lenient(&datagram.data) {
             Ok(msg) => msg,
             Err(ProtocolError::UnsupportedVersion(theirs)) => {
                 let ours = self.cfg.protocol_version;
@@ -941,6 +1144,9 @@ impl Session {
                     // 對方用不同版本的協定打招呼：Host 還在等人時，明確告訴它為什麼不行。
                     // 對 v1（Phase 4b）的 Client 用 v1 的標頭回覆：`Reject` 的本體佈局兩版相同，舊版程式才解得出並顯示原因。
                     State::Listening if !datagram.stranger => {
+                        if !self.reply_allowed(now) {
+                            return;
+                        }
                         let reject = Msg::Reject {
                             reason: RejectReason::ProtocolVersion {
                                 host: ours,
@@ -966,13 +1172,19 @@ impl Session {
                 }
                 return;
             }
-            Err(_) => return, // 雜訊、截斷、超過大小：丟棄
+            Err(_) => {
+                // 雜訊、截斷、超過大小：丟棄
+                self.packets_ignored += 1;
+                return;
+            }
         };
 
         if datagram.stranger {
             // 已經有對手了：別的位址來敲門，只回覆「房間已滿」，其餘一律忽略。
+            self.packets_ignored += 1;
             if matches!(msg, Msg::Hello { .. })
                 && matches!(self.state, State::Running | State::Closing { .. })
+                && self.reply_allowed(now)
             {
                 let reject = Msg::Reject {
                     reason: RejectReason::RoomFull,
@@ -1031,6 +1243,10 @@ impl Session {
         rom_id: RomId,
     ) {
         if self.cfg.role != Role::Host {
+            // Client 不該收到 Hello：握手完成後才收到＝違規；握手前忽略。
+            if matches!(self.state, State::Running) {
+                self.violate(Violation::HandshakeAfterRunning { what: "Hello" });
+            }
             return;
         }
         match self.state {
@@ -1054,18 +1270,30 @@ impl Session {
                     None
                 };
                 if let Some(reason) = reason {
-                    // 拒絕之後仍然等別人：不鎖定這個位址。
-                    self.send(now, transport, from, &Msg::Reject { reason });
+                    // 拒絕之後仍然等別人：不鎖定這個位址（回覆有速率限制）。
+                    if self.reply_allowed(now) {
+                        self.send(now, transport, from, &Msg::Reject { reason });
+                    }
                     return;
                 }
+                self.peer_hello = Some((protocol_version, core_behavior_version, rom_id));
                 if let Some(addr) = from {
                     transport.set_peer(addr);
                 }
                 self.begin_running(now, 0, self.cfg.mode, self.cfg.input_delay);
                 self.send_accept(now, transport, from);
             }
-            // Accept 掉了，Client 又送 Hello：重送同一份 Accept（冪等）。
-            State::Running => self.send_accept(now, transport, from),
+            // Accept 掉了，Client 又送 Hello：寬限期內、內容與原本相同才重送同一份 Accept（冪等）。
+            // 內容不同（換了 ROM／版本？）或超過寬限期＝握手完成後不該再出現的 Hello，違規。
+            State::Running => {
+                let same =
+                    self.peer_hello == Some((protocol_version, core_behavior_version, rom_id));
+                if same && now.saturating_sub(self.running_since) <= HELLO_GRACE {
+                    self.send_accept(now, transport, from);
+                } else {
+                    self.violate(Violation::HandshakeAfterRunning { what: "Hello" });
+                }
+            }
             _ => {}
         }
     }
@@ -1093,9 +1321,26 @@ impl Session {
         player: u8,
         mode: Mode,
     ) {
-        if !matches!(self.state, State::Connecting) || player > 1 || input_delay > MAX_INPUT_DELAY {
+        match self.state {
+            State::Running => {
+                // 房主每收到一個 Hello 就回一份 Accept，所以 Client 連上之後還會收到「內容相同」的重複 Accept
+                // （Hello 與 Accept 在網路上重疊）：忽略。內容不同、或自己是 Host 卻收到 Accept＝違規。
+                if self.cfg.role == Role::Client
+                    && self.accepted == Some((session_id, input_delay, player, mode))
+                {
+                    self.packets_ignored += 1;
+                } else {
+                    self.violate(Violation::HandshakeAfterRunning { what: "Accept" });
+                }
+                return;
+            }
+            State::Connecting => {}
+            _ => return,
+        }
+        if player > 1 || input_delay > MAX_INPUT_DELAY {
             return;
         }
+        self.accepted = Some((session_id, input_delay, player, mode));
         self.session_id = session_id;
         // lockstep：雙方共用 Host 決定的 D。rollback：各自決定本地輸入延遲（用自己的設定）。
         let delay = match mode {
@@ -1109,6 +1354,7 @@ impl Session {
     /// rollback：空輸入也照常送給對方，對方不必猜）。
     fn begin_running(&mut self, now: Duration, player: u8, mode: Mode, input_delay: u8) {
         self.state = State::Running;
+        self.running_since = now;
         self.mode = mode;
         self.input_delay = local_delay_for(mode, input_delay);
         if mode == Mode::Rollback {
@@ -1131,7 +1377,7 @@ impl Session {
         ));
         // 預填的輸入也要送給對方（對方要靠封包才知道我方前 D 幀是空的），連上就立刻送。
         self.input_dirty = !self.local.is_empty();
-        self.events.push_back(Event::Connected {
+        self.push_event(Event::Connected {
             player,
             input_delay: self.input_delay,
             mode,
@@ -1171,8 +1417,12 @@ impl Session {
                 (sender_frame, frame_advantage, confirmed),
             ),
             Msg::Ack { frame, .. } => {
-                let acked = frame.saturating_add(1).min(self.local_next());
-                self.local_acked_next = self.local_acked_next.max(acked);
+                // 合法的對方只會確認我們送過的幀。
+                if frame >= self.local_next() {
+                    self.violate(Violation::AckBeyondSent { frame });
+                    return;
+                }
+                self.local_acked_next = self.local_acked_next.max(frame + 1);
                 self.prune_local();
             }
             Msg::Checksum {
@@ -1194,7 +1444,13 @@ impl Session {
                 self.send(now, transport, None, &pong);
             }
             Msg::Pong { timestamp_us, .. } => {
-                let sample = (now.as_micros() as u64).saturating_sub(timestamp_us);
+                // 我們只會送出「過去的」時間戳：來自未來、或大得離譜的往返時間不可信，不更新 RTT。
+                let now_us = now.as_micros() as u64;
+                let sample = now_us.saturating_sub(timestamp_us);
+                if timestamp_us > now_us || u128::from(sample) > MAX_PLAUSIBLE_RTT.as_micros() {
+                    self.packets_ignored += 1;
+                    return;
+                }
                 self.srtt_us = Some(match self.srtt_us {
                     None => sample,
                     Some(s) => (s * 7 + sample) / 8,
@@ -1220,7 +1476,7 @@ impl Session {
                         self.end(EndReason::PeerLeft);
                     }
                     DisconnectReason::Desync { frame } => {
-                        self.events.push_back(Event::Desync {
+                        self.push_event(Event::Desync {
                             frame,
                             local: self.local_fps.get(&frame).copied(),
                             remote: None,
@@ -1233,6 +1489,31 @@ impl Session {
         }
     }
 
+    /// lockstep 的對方輸入表（`remote`：含已用掉但仍保留歷史的幀）。語意同 [`RollbackPlanner::on_remote_input`]。
+    fn lockstep_remote_input(&mut self, frame: u32, input: PlayerInput) -> RemoteInput {
+        if frame >= self.remote_contig && frame - self.remote_contig >= MAX_REMOTE_AHEAD {
+            return RemoteInput::TooFar;
+        }
+        if let Some(&held) = self.remote.get(&frame) {
+            return if held == input {
+                RemoteInput::Duplicate
+            } else {
+                RemoteInput::Conflict {
+                    held,
+                    received: input,
+                }
+            };
+        }
+        if frame < self.remote_contig {
+            return RemoteInput::Stale;
+        }
+        self.remote.insert(frame, input);
+        while self.remote.contains_key(&self.remote_contig) {
+            self.remote_contig += 1;
+        }
+        RemoteInput::Accepted
+    }
+
     fn on_input<T: Transport + ?Sized>(
         &mut self,
         now: Duration,
@@ -1241,15 +1522,48 @@ impl Session {
         inputs: &[PlayerInput],
         sync: (u32, i8, Option<ConfirmedFingerprint>),
     ) {
-        if let Some(rb) = self.rb.as_mut() {
-            // rollback：輸入交給規劃器（它有「領先連續收到太遠不收」的上限）。
-            let rtt = self.srtt_us.map(Duration::from_micros);
-            for (i, &input) in inputs.iter().enumerate() {
-                let Some(frame) = start_frame.checked_add(i as u32) else {
-                    break;
-                };
-                rb.on_remote_input(frame, input);
+        // ---- 語意檢查（違規的輸入不會被套用）----
+        if inputs.len() > MAX_INPUTS_PER_PACKET {
+            self.violate(Violation::TooManyInputs {
+                count: inputs.len(),
+            });
+            return;
+        }
+        let our_frame = self
+            .rb
+            .as_ref()
+            .map_or(self.next_frame, RollbackPlanner::current_frame);
+        if sync.0 > our_frame.saturating_add(MAX_SENDER_LEAD) {
+            self.violate(Violation::SenderFrameTooFar {
+                sender_frame: sync.0,
+            });
+            return;
+        }
+        for (i, &input) in inputs.iter().enumerate() {
+            let Some(frame) = start_frame.checked_add(i as u32) else {
+                self.violate(Violation::InputFrameTooFar { frame: start_frame });
+                return;
+            };
+            let verdict = match self.rb.as_mut() {
+                Some(rb) => rb.on_remote_input(frame, input),
+                None => self.lockstep_remote_input(frame, input),
+            };
+            match verdict {
+                RemoteInput::Accepted | RemoteInput::Duplicate => {}
+                RemoteInput::Stale => self.packets_ignored += 1,
+                RemoteInput::TooFar => {
+                    self.violate(Violation::InputFrameTooFar { frame });
+                    return;
+                }
+                RemoteInput::Conflict { .. } => {
+                    self.violate(Violation::ConflictingInput { frame });
+                    return;
+                }
             }
+        }
+        if let Some(rb) = self.rb.as_mut() {
+            // rollback：時間同步與指紋。
+            let rtt = self.srtt_us.map(Duration::from_micros);
             let (sender_frame, advantage, confirmed) = sync;
             rb.on_remote_sync(sender_frame, advantage, rtt);
             if let Some(fp) = confirmed {
@@ -1257,23 +1571,6 @@ impl Session {
             }
             self.remote_contig = rb.remote_contiguous();
             self.check_rollback_desync();
-        } else {
-            for (i, &input) in inputs.iter().enumerate() {
-                let Some(frame) = start_frame.checked_add(i as u32) else {
-                    break;
-                };
-                // 已經連續收到的：重複，忽略。太遠的：不收（有上限，防止記憶體無限成長）。
-                if frame < self.remote_contig {
-                    continue;
-                }
-                if frame - self.remote_contig >= MAX_REMOTE_AHEAD {
-                    break;
-                }
-                self.remote.entry(frame).or_insert(input);
-            }
-            while self.remote.contains_key(&self.remote_contig) {
-                self.remote_contig += 1;
-            }
         }
         // 每收到一個 Input 就回 Ack（重複的封包也回：Ack 可能掉了）。
         if let Some(last) = self.remote_contig.checked_sub(1) {

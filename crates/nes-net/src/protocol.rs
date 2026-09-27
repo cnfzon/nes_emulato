@@ -276,7 +276,21 @@ impl Msg {
     }
 
     /// 解碼一個封包。對任意位元組都回傳 `Result`，不 panic、不做與輸入長度不成比例的配置。
+    /// `Input` 攜帶超過 [`MAX_INPUTS_PER_PACKET`] 幀時回傳 [`ProtocolError::TooManyInputs`]。
     pub fn decode(bytes: &[u8]) -> Result<Msg, ProtocolError> {
+        let msg = Self::decode_lenient(bytes)?;
+        if let Msg::Input { inputs, .. } = &msg
+            && inputs.len() > MAX_INPUTS_PER_PACKET
+        {
+            return Err(ProtocolError::TooManyInputs(inputs.len()));
+        }
+        Ok(msg)
+    }
+
+    /// 同 [`Msg::decode`]，但**不檢查** `Input` 的幀數上限（其餘檢查全部相同；封包大小上限 512 位元組
+    /// 已經限制了幀數，配置仍與輸入長度成比例）。session 用它：超過上限的 `Input` 要在確認 `session_id`
+    /// 之後才當作協定違規中止連線，而不是像雜訊一樣默默丟掉。
+    pub fn decode_lenient(bytes: &[u8]) -> Result<Msg, ProtocolError> {
         if bytes.len() > MAX_PACKET_SIZE {
             return Err(ProtocolError::TooLarge(bytes.len()));
         }
@@ -294,11 +308,6 @@ impl Msg {
             postcard::take_from_bytes::<Msg>(&bytes[HEADER_LEN..]).map_err(ProtocolError::Body)?;
         if !rest.is_empty() {
             return Err(ProtocolError::TrailingBytes(rest.len()));
-        }
-        if let Msg::Input { inputs, .. } = &msg
-            && inputs.len() > MAX_INPUTS_PER_PACKET
-        {
-            return Err(ProtocolError::TooManyInputs(inputs.len()));
         }
         Ok(msg)
     }

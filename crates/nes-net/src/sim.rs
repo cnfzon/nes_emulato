@@ -224,6 +224,8 @@ pub struct Endpoint<T: Transport> {
     pub connected_at: Option<Duration>,
     /// rollback：每秒一筆的追蹤資料。
     pub trace: Vec<TracePoint>,
+    /// 每秒一筆的完整統計（虛擬時間，含 lockstep）：餵給 `StatsRecorder` 就是連線中寫出的 CSV。
+    pub stats_log: Vec<(Duration, Stats)>,
     /// rollback：執行請求時的內部錯誤（不應發生；有就是 bug）。
     pub exec_error: Option<ExecError>,
     /// rollback：單一節拍的請求清單裡 `AdvanceFrame`（重跑的幀加新的一幀）的最大數量。
@@ -261,6 +263,7 @@ impl<T: Transport> Endpoint<T> {
             events: Vec::new(),
             connected_at: None,
             trace: Vec::new(),
+            stats_log: Vec::new(),
             exec_error: None,
             max_advances_per_plan: 0,
             ring: None,
@@ -332,6 +335,7 @@ impl<T: Transport> Endpoint<T> {
                     }
                 }
                 Event::Stats(stats) => {
+                    self.stats_log.push((now, *stats));
                     if let Some(rb) = &stats.rollback {
                         self.trace.push(TracePoint {
                             at: now,
@@ -582,6 +586,7 @@ pub struct EndReport {
     pub connected_at: Option<Duration>,
     pub net: SimStats,
     pub trace: Vec<TracePoint>,
+    pub stats_log: Vec<(Duration, Stats)>,
     pub exec_error: Option<ExecError>,
     /// rollback：單一節拍的 `AdvanceFrame` 請求數的最大值（不變式：≤ K）。
     pub max_advances_per_plan: usize,
@@ -750,6 +755,7 @@ pub fn run_match(
             events: e.events,
             net,
             trace: e.trace,
+            stats_log: e.stats_log,
             exec_error: e.exec_error,
             max_advances_per_plan: e.max_advances_per_plan,
         }

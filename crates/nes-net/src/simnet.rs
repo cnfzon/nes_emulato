@@ -45,6 +45,10 @@ impl NetworkConfig {
     }
 }
 
+/// 路上封包數的上限：超過就丟棄新封包（記為 `dropped`）。正常的兩人連線同時在路上的封包只有幾十個；
+/// 這個上限讓「一直送、對方不收」或封包洪流的情況下記憶體仍然有界。
+pub const MAX_IN_FLIGHT: usize = 8192;
+
 #[derive(Debug)]
 struct Pending {
     deliver_at: Duration,
@@ -138,6 +142,10 @@ impl<T: Transport> SimulatedTransport<T> {
     fn enqueue(&mut self, now: Duration, to: Option<SocketAddr>, data: &[u8]) {
         self.stats.sent += 1;
         if self.rng.chance(self.config.loss) {
+            self.stats.dropped += 1;
+            return;
+        }
+        if self.queue.len() >= MAX_IN_FLIGHT {
             self.stats.dropped += 1;
             return;
         }
@@ -308,10 +316,15 @@ mod tests {
             ..NetworkConfig::IDEAL
         };
         let (mut a, mut b) = pair(cfg, 9);
+        let mut got = 0;
         for i in 0..10_000u32 {
             a.send(ms(0), &i.to_le_bytes());
+            // 接收端要定期取走（Phase 4d 起，記憶體內的佇列有上限 `MAX_QUEUED_DATAGRAMS`）。
+            if i % 1000 == 999 {
+                got += payloads(&mut b, ms(0)).len();
+            }
         }
-        let got = payloads(&mut b, ms(0)).len();
+        got += payloads(&mut b, ms(0)).len();
         assert!(
             (12_000..13_000).contains(&got),
             "10000 個封包、25% 重複 → 收到 {got}"

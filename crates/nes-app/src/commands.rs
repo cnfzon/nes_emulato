@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use nes_core::{Buttons, ReplayMismatch, RomId, RomInfo};
-use nes_net::{Mode, Stats};
+use nes_net::{MatchSummary, Mode, Stats};
 
 /// replay 播放速度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +145,23 @@ pub enum NetPhase {
 pub struct NetStatus {
     pub phase: NetPhase,
     pub stats: Stats,
+    /// 統計更新的序號（每秒一次、每次加 1）。階段改變等原因也會重發 `NetStatus`，UI 靠序號判斷
+    /// 「這是新的一秒」才把樣本記進折線。
+    pub seq: u32,
+    /// 音訊 underrun 的累計次數（這一場連線期間）。
+    pub audio_underruns: u64,
+}
+
+/// 一場連線的結束摘要（只有真的連上過才有）：時長、總幀數、主要統計與這一場自動存下的檔案。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetSummaryInfo {
+    pub summary: MatchSummary,
+    /// 本機是玩家幾（1 或 2）。
+    pub player: u8,
+    /// 自動存下的 replay（存檔失敗則 `None`，原因在訊息裡）。
+    pub replay: Option<PathBuf>,
+    /// 每秒一筆的統計 CSV。
+    pub stats_csv: Option<PathBuf>,
 }
 
 /// Netplay 結束的類別（UI 決定顏色與是否彈出視窗）。
@@ -188,6 +205,8 @@ pub enum EmuEvent {
         kind: NetEndKind,
         message: String,
         files: Vec<PathBuf>,
+        /// 連上過才有摘要；握手階段就失敗（被拒絕、逾時、無法綁定 port）沒有。
+        summary: Option<NetSummaryInfo>,
     },
     /// `TraceToFile` 完成。
     TraceWritten {

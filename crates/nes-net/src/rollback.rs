@@ -73,6 +73,9 @@ pub const DEFAULT_INPUT_DELAY: u8 = 1;
 pub const MAX_INPUT_DELAY: u8 = 4;
 /// 對方的輸入最多可以領先「已連續收到的幀」多少幀（防止惡意封包讓記憶體無限成長）。
 const MAX_REMOTE_AHEAD: u32 = 256;
+/// 已用掉（drain）的對方輸入多保留幾幀：晚到的重複封包可以拿來比對，「同一幀收到不同的輸入」就抓得到
+/// （Phase 4d）。超過這個歷史的舊封包無法比對，只能忽略（安全，但不算偵測）。
+pub const REMOTE_HISTORY: u32 = 256;
 /// 已確認的指紋至少保留多少幀（比對對方稍晚才到的指紋）。
 const FP_HISTORY: u32 = 128;
 /// 最多保留幾個尚未比對的對方指紋。
@@ -194,6 +197,34 @@ pub struct DesyncInfo {
     pub remote: u64,
 }
 
+/// 規劃器內部佇列的大小（[`RollbackPlanner::buffer_sizes`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlannerBufferSizes {
+    pub remote_inputs: usize,
+    pub fingerprints: usize,
+    pub remote_fingerprints: usize,
+    pub frames: usize,
+}
+
+/// [`RollbackPlanner::on_remote_input`] 對一筆對方輸入的處理結果（Phase 4d：語意檢查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteInput {
+    /// 第一次收到這一幀，已收下。
+    Accepted,
+    /// 這一幀已收過、內容相同（冗餘傳送與重複封包的正常情況），忽略。
+    Duplicate,
+    /// 這一幀已收過、**內容不同**：真實輸入一經收下就不能改變，對方不是有問題的程式就是惡意封包。
+    /// 沒有覆蓋、沒有影響模擬；呼叫端應以協定違規中止連線。
+    Conflict {
+        held: PlayerInput,
+        received: PlayerInput,
+    },
+    /// 比保留的歷史還舊（無法比對），忽略。
+    Stale,
+    /// 領先「連續收到的幀」太遠（合法的對方不會送），沒有收下。
+    TooFar,
+}
+
 /// rollback 的統計（`Stats::rollback`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RollbackStats {
@@ -210,6 +241,11 @@ pub struct RollbackStats {
     /// 每次重跑（含還原）的耗時，由呼叫端量測後回報（[`RollbackPlanner::record_resim`]）。
     pub resim_time_avg: Duration,
     pub resim_time_max: Duration,
+    /// 累計的重跑耗時與已量測次數（CSV 記錄器用差值算每秒的平均）。
+    pub resim_time_total: Duration,
+    pub resims_timed: u32,
+    /// 最近一個統計視窗（約 1 秒）內最深的一次重跑（由 session 填）。
+    pub window_max_depth: u32,
     /// 本地的幀數優勢（平均；正數＝領先）與對方回報的優勢。
     pub frame_advantage: f32,
     pub remote_advantage: f32,
@@ -278,6 +314,8 @@ pub struct RollbackPlanner {
     rollbacks: u32,
     depth_sum: u64,
     max_depth: u32,
+    /// 自上次 [`RollbackPlanner::take_window_max_depth`] 以來最深的一次重跑。
+    window_max_depth: u32,
     resims_timed: u32,
     resim_time_sum: Duration,
     resim_time_max: Duration,
@@ -314,6 +352,7 @@ impl RollbackPlanner {
             rollbacks: 0,
             depth_sum: 0,
             max_depth: 0,
+            window_max_depth: 0,
             resims_timed: 0,
             resim_time_sum: Duration::ZERO,
             resim_time_max: Duration::ZERO,
@@ -352,16 +391,32 @@ impl RollbackPlanner {
 
     // ---- 輸入 -----------------------------------------------------------------
 
-    /// 收到對方在第 `frame` 幀的真實輸入。輸入一經收下不會被覆蓋（重複的忽略）；領先「連續收到」太多的不收。
-    pub fn on_remote_input(&mut self, frame: u32, input: PlayerInput) {
-        if frame < self.remote_contig || frame - self.remote_contig >= MAX_REMOTE_AHEAD {
-            return;
+    /// 收到對方在第 `frame` 幀的真實輸入。輸入一經收下不會被覆蓋：重複的（內容相同）回傳
+    /// [`RemoteInput::Duplicate`]；**內容不同**回傳 [`RemoteInput::Conflict`]（不覆蓋）；領先「連續收到」太多的
+    /// 不收（[`RemoteInput::TooFar`]，記憶體有上限）。已用掉的幀仍保留 [`REMOTE_HISTORY`] 幀供比對。
+    pub fn on_remote_input(&mut self, frame: u32, input: PlayerInput) -> RemoteInput {
+        if frame >= self.remote_contig && frame - self.remote_contig >= MAX_REMOTE_AHEAD {
+            return RemoteInput::TooFar;
         }
-        self.remote.entry(frame).or_insert(input);
+        if let Some(&held) = self.remote.get(&frame) {
+            return if held == input {
+                RemoteInput::Duplicate
+            } else {
+                RemoteInput::Conflict {
+                    held,
+                    received: input,
+                }
+            };
+        }
+        if frame < self.remote_contig {
+            return RemoteInput::Stale;
+        }
+        self.remote.insert(frame, input);
         while let Some(&real) = self.remote.get(&self.remote_contig) {
             self.last_real = real;
             self.remote_contig += 1;
         }
+        RemoteInput::Accepted
     }
 
     /// 對方最新的已確認指紋（每個 `Input` 封包都帶）。
@@ -469,7 +524,9 @@ impl RollbackPlanner {
         while self.local_base < self.drained && self.local.pop_front().is_some() {
             self.local_base += 1;
         }
-        self.remote = self.remote.split_off(&self.drained);
+        self.remote = self
+            .remote
+            .split_off(&self.drained.saturating_sub(REMOTE_HISTORY));
         let keep_from = self.drained.min(self.confirmed.saturating_sub(FP_HISTORY));
         self.fps = self.fps.split_off(&keep_from);
         out
@@ -661,6 +718,12 @@ impl RollbackPlanner {
         self.rollbacks += 1;
         self.depth_sum += u64::from(depth);
         self.max_depth = self.max_depth.max(depth);
+        self.window_max_depth = self.window_max_depth.max(depth);
+    }
+
+    /// 取走並歸零「自上次以來最深的一次重跑」（session 每個統計視窗呼叫一次）。
+    pub fn take_window_max_depth(&mut self) -> u32 {
+        std::mem::take(&mut self.window_max_depth)
     }
 
     /// 時間同步：領先太多就放慢一幀。
@@ -689,6 +752,16 @@ impl RollbackPlanner {
         true
     }
 
+    /// 內部佇列目前的大小（診斷與封包洪流測試用）。
+    pub fn buffer_sizes(&self) -> PlannerBufferSizes {
+        PlannerBufferSizes {
+            remote_inputs: self.remote.len(),
+            fingerprints: self.fps.len(),
+            remote_fingerprints: self.remote_fps.len(),
+            frames: self.frames.len(),
+        }
+    }
+
     pub fn stats(&self) -> RollbackStats {
         RollbackStats {
             current_frame: self.cur,
@@ -708,6 +781,9 @@ impl RollbackPlanner {
                 Duration::ZERO
             },
             resim_time_max: self.resim_time_max,
+            resim_time_total: self.resim_time_sum,
+            resims_timed: self.resims_timed,
+            window_max_depth: 0,
             frame_advantage: average(&self.local_adv) as f32,
             remote_advantage: average(&self.remote_adv) as f32,
             predicted_frames: self.predicted_total,

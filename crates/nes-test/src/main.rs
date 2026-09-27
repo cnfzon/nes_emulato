@@ -11,6 +11,8 @@
 //! - `netsim <rom>`：無視窗的網路模擬（兩個 session、虛擬時鐘、可調丟包／延遲／抖動／重複；`--mode lockstep|rollback`），
 //!   驗證連線兩端與離線重播逐幀相同，並輸出 stall、rollback 統計與頻寬（Phase 4b／4c）；`--compare` 產生
 //!   lockstep 對 rollback 的對照表。
+//! - `stats-summary <csv>...`：讀取連線統計 CSV（`nes-app` 每場連線寫出），輸出每個指標的平均、最小、p50、p95、最大值
+//!   （Markdown 表格，多個檔案合成一張表；Phase 4d 的實機數據整理）。
 //! - `rollback-bench <rom>`：量測「重跑 K 幀」的耗時（是否在幀預算之內）。
 
 mod blargg;
@@ -22,6 +24,7 @@ mod png;
 mod profile_cmd;
 mod replay_cmd;
 mod rollback_bench;
+mod stats_cmd;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -164,6 +167,17 @@ enum Command {
         #[arg(long)]
         compare: bool,
     },
+    /// 讀取一個或多個連線統計 CSV（`nes-app` 每場連線在 replay 旁寫出的每秒一筆紀錄），輸出每個指標的
+    /// 平均、最小、p50（中位數）、p95、最大值的 Markdown 表格；多個檔案合成一張表（每個檔案的每個指標一列）。
+    /// 欄位與單位見 `docs/architecture.md` §21。結束碼：成功 0、檔案讀不了或格式不符 2。
+    StatsSummary {
+        /// 統計 CSV（一個或多個）。
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// 只列出這些指標（逗號分隔，例如 ping_ms,fps,stalls）；預設全部。
+        #[arg(long)]
+        metrics: Option<String>,
+    },
     /// 量測 rollback 的重跑成本：在真實 ROM 上，還原到 K 幀之前並重跑 K 幀（輸出關閉）再推進新的一幀，
     /// 與一幀的時間預算（16.64 ms）比較，回報平均與最大耗時。用 `--release` 才有意義。
     RollbackBench {
@@ -301,6 +315,7 @@ fn main() -> ExitCode {
             depth,
             iterations,
         } => rollback_bench::run(&rom, depth, iterations),
+        Command::StatsSummary { files, metrics } => stats_cmd::run(&files, metrics.as_deref()),
         Command::SaveState {
             rom,
             out,

@@ -56,14 +56,16 @@ use nes_core::{
 
 use nes_net::matchlog::MatchLog;
 use nes_net::snapshot::{SnapshotRing, execute};
+use nes_net::statslog::{CSV_HEADER, StatsRecorder, StatsRow};
 use nes_net::{
     EndReason, Event as NetEvent, Mode, Outcome, PlayerInput, Session as NetSession, SessionConfig,
-    Status, UdpTransport,
+    Stats, Status, UdpTransport,
 };
 
 use crate::audio::{AudioProducer, RateController};
 use crate::commands::{
-    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, PlaybackSpeed, SessionStatus,
+    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, NetSummaryInfo, PlaybackSpeed,
+    SessionStatus,
 };
 
 const TARGET_FPS: f64 = 60.0988;
@@ -210,6 +212,57 @@ struct Netplay {
     /// 房主：實際監聽的 port；加入者：房主的位址。
     target: NetTarget,
     last_status: Status,
+    /// 統計更新的序號（每秒一次），UI 靠它判斷「這是新的一秒」。
+    stats_seq: u32,
+    /// 連線成功（重新開機）之後才有：每秒一筆的統計紀錄與整場摘要。
+    stats: Option<MatchStats>,
+    /// 這一場的檔名時間戳（連線成功時決定；replay 與統計 CSV 共用）。
+    stamp: u64,
+}
+
+/// 一場連線的統計紀錄：每秒一筆寫進 CSV（`nes-net` 的 `StatsRecorder` 把累計值換算成每秒的值）。
+struct MatchStats {
+    recorder: StatsRecorder,
+    /// 開檔失敗或寫入失敗之後是 `None`（原因在 `csv_error`，連線結束時併入訊息）。
+    csv: Option<File>,
+    csv_path: Option<PathBuf>,
+    csv_error: Option<String>,
+    /// 連線成功時音訊 underrun 的累計次數。
+    underruns_base: u64,
+}
+
+impl MatchStats {
+    /// 在 `dir` 建立 CSV 並寫下標題列。
+    fn create(dir: &Path, name: &str, connected_at: Duration, underruns_base: u64) -> Self {
+        let mut this = Self {
+            recorder: StatsRecorder::new(connected_at),
+            csv: None,
+            csv_path: None,
+            csv_error: None,
+            underruns_base,
+        };
+        let opened = std::fs::create_dir_all(dir)
+            .and_then(|()| File::create(dir.join(name)))
+            .and_then(|mut f| writeln!(f, "{CSV_HEADER}").map(|()| f));
+        match opened {
+            Ok(file) => {
+                let path = dir.join(name);
+                this.csv_path = Some(std::fs::canonicalize(&path).unwrap_or(path));
+                this.csv = Some(file);
+            }
+            Err(e) => this.csv_error = Some(format!("統計 CSV 建立失敗：{e}")),
+        }
+        this
+    }
+
+    fn write_row(&mut self, row: &StatsRow) {
+        if let Some(file) = &mut self.csv
+            && let Err(e) = writeln!(file, "{}", row.to_csv_line())
+        {
+            self.csv_error = Some(format!("統計 CSV 寫入失敗：{e}"));
+            self.csv = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,10 +290,14 @@ impl Netplay {
         }
     }
 
-    fn status(&self) -> NetStatus {
+    /// `underruns_total`：音訊 underrun 的累計次數（程式啟動以來）；狀態裡放「這一場」的次數。
+    fn status(&self, underruns_total: u64) -> NetStatus {
         NetStatus {
             phase: self.phase(),
             stats: self.session.stats(),
+            seq: self.stats_seq,
+            audio_underruns: underruns_total
+                .saturating_sub(self.stats.as_ref().map_or(0, |m| m.underruns_base)),
         }
     }
 }
@@ -402,8 +459,9 @@ impl Emu {
 
     /// 通知 UI 目前的 Netplay 階段與統計。
     fn send_net_status(&self) {
+        let underruns = self.audio.output.shared().underruns();
         let status = match &self.session {
-            Session::Netplay(rt) => rt.status(),
+            Session::Netplay(rt) => rt.status(underruns),
             _ => NetStatus::default(),
         };
         self.send(EmuEvent::Net(status));
@@ -414,6 +472,7 @@ impl Emu {
             kind: NetEndKind::Error,
             message,
             files: Vec::new(),
+            summary: None,
         });
     }
 
@@ -479,6 +538,9 @@ impl Emu {
             replay_dir,
             target,
             last_status: Status::Ended,
+            stats_seq: 0,
+            stats: None,
+            stamp: 0,
         };
         self.session = Session::Netplay(Box::new(rt));
         self.send_net_status();
@@ -499,7 +561,7 @@ impl Emu {
         for event in events {
             match event {
                 NetEvent::Connected { mode, .. } => self.net_connected(mode),
-                NetEvent::Stats(_) => self.send_net_status(),
+                NetEvent::Stats(stats) => self.net_stats(&stats),
                 NetEvent::Disconnected {
                     reason,
                     peer_frames,
@@ -520,17 +582,47 @@ impl Emu {
         }
     }
 
+    /// 每秒一次的統計：換算成這一秒的紀錄寫進 CSV，並通知 UI（折線與疊加層）。
+    fn net_stats(&mut self, stats: &Stats) {
+        let underruns = self.audio.output.shared().underruns();
+        if let Session::Netplay(rt) = &mut self.session {
+            rt.stats_seq = rt.stats_seq.wrapping_add(1);
+            let now = rt.clock.elapsed();
+            if let Some(ms) = &mut rt.stats {
+                let row = ms
+                    .recorder
+                    .push(now, stats, underruns.saturating_sub(ms.underruns_base));
+                ms.write_row(&row);
+            }
+        }
+        self.send_net_status();
+    }
+
     /// 握手成功：**雙方都重新開機**（第 0 幀對齊），開始記錄這一場。
     fn net_connected(&mut self, mode: Mode) {
         let Some(rom) = self.rom_bytes.clone() else {
             return;
         };
+        let underruns = self.audio.output.shared().underruns();
         match self.boot(&rom) {
             Ok(nes) => {
                 let log = MatchLog::new(&nes);
                 self.pending_reset = false;
                 self.state_changed = true;
                 if let Session::Netplay(rt) = &mut self.session {
+                    rt.stamp = unix_seconds();
+                    let name = format!(
+                        "netplay-{}-p{}-{}-stats.csv",
+                        rt.stamp,
+                        rt.session.local_player() + 1,
+                        nes.rom_id().short()
+                    );
+                    rt.stats = Some(MatchStats::create(
+                        &rt.replay_dir,
+                        &name,
+                        rt.clock.elapsed(),
+                        underruns,
+                    ));
                     rt.log = Some(log);
                     // rollback：每個槽是同一份 ROM 的一台 `Nes`，之後只用 `copy_state_from` 覆寫（沒有重新配置）。
                     rt.ring = (mode == Mode::Rollback).then(|| SnapshotRing::new(rt.window, &nes));
@@ -557,7 +649,16 @@ impl Emu {
         // 結束前最後一次取走已確認的幀，replay 才不會比雙方約定的幀數短。
         Self::drain_confirmed_into_log(&mut rt);
         let player = rt.session.local_player() + 1;
-        let stamp = unix_seconds();
+        let stamp = if rt.stamp == 0 {
+            unix_seconds()
+        } else {
+            rt.stamp
+        };
+        let ended_at = rt.clock.elapsed();
+        let final_stats = rt.session.stats();
+        let underruns = self.audio.output.shared().underruns();
+        let mut replay_path = None;
+        let mut agreed_frames = final_stats.frame;
         let rom = self
             .nes
             .as_ref()
@@ -569,10 +670,14 @@ impl Emu {
         if let Some(log) = rt.log.as_ref().filter(|l| l.frames() > 0) {
             let own = log.frames();
             let frames = peer_frames.map_or(own, |p| p.min(own));
+            agreed_frames = frames;
             let replay = log.to_replay(frames, DEFAULT_CHECKPOINT_INTERVAL);
             let name = format!("netplay-{stamp}-p{player}-{rom}.replay");
             match write_into(&rt.replay_dir, &name, &replay.encode()) {
-                Ok(path) => files.push(path),
+                Ok(path) => {
+                    replay_path = Some(path.clone());
+                    files.push(path);
+                }
                 Err(e) => notes.push(format!("replay 存檔失敗：{e}")),
             }
         }
@@ -590,10 +695,29 @@ impl Emu {
         let kind = match reason {
             EndReason::LocalLeft | EndReason::PeerLeft => NetEndKind::Normal,
             EndReason::Desync { .. } => NetEndKind::Desync,
-            EndReason::Rejected(_) | EndReason::HandshakeTimeout | EndReason::Timeout => {
-                NetEndKind::Error
-            }
+            EndReason::Rejected(_)
+            | EndReason::HandshakeTimeout
+            | EndReason::Timeout
+            | EndReason::ProtocolViolation(_) => NetEndKind::Error,
         };
+        // 連上過才有摘要（時長、總幀數、主要統計、replay 與統計 CSV 的路徑）。
+        let summary = rt.stats.as_ref().map(|ms| {
+            let mut summary = ms.recorder.summary(
+                ended_at,
+                &final_stats,
+                underruns.saturating_sub(ms.underruns_base),
+            );
+            summary.frames = agreed_frames;
+            NetSummaryInfo {
+                summary,
+                player,
+                replay: replay_path.clone(),
+                stats_csv: ms.csv_path.clone(),
+            }
+        });
+        if let Some(e) = rt.stats.as_ref().and_then(|ms| ms.csv_error.clone()) {
+            notes.push(e);
+        }
         let mut message = reason.to_string();
         for note in notes {
             message.push('；');
@@ -603,6 +727,7 @@ impl Emu {
             kind,
             message,
             files,
+            summary,
         });
         self.send_net_status();
         // 回到單機模式：手上的 `Nes` 保持原狀繼續跑（單機模式沒有任何限制）。
@@ -2070,12 +2195,26 @@ mod tests {
     }
 
     fn wait_net_ended(emu: &Spawned) -> (NetEndKind, String, Vec<std::path::PathBuf>) {
+        let (kind, message, files, _) = wait_net_ended_full(emu);
+        (kind, message, files)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn wait_net_ended_full(
+        emu: &Spawned,
+    ) -> (
+        NetEndKind,
+        String,
+        Vec<std::path::PathBuf>,
+        Option<crate::commands::NetSummaryInfo>,
+    ) {
         wait_for(emu, "NetEnded", |e| match e {
             EmuEvent::NetEnded {
                 kind,
                 message,
                 files,
-            } => Some((*kind, message.clone(), files.clone())),
+                summary,
+            } => Some((*kind, message.clone(), files.clone(), summary.clone())),
             _ => None,
         })
     }
@@ -2178,12 +2317,45 @@ mod tests {
         b.wait_frames(200);
 
         a.cmd_tx.send(EmuCommand::NetDisconnect).unwrap();
-        let (ka, msg_a, files_a) = wait_net_ended(&a);
-        let (kb, msg_b, files_b) = wait_net_ended(&b);
+        let (ka, msg_a, files_a, summary_a) = wait_net_ended_full(&a);
+        let (kb, msg_b, files_b, summary_b) = wait_net_ended_full(&b);
         assert_eq!(ka, NetEndKind::Normal, "{msg_a}");
         assert_eq!(kb, NetEndKind::Normal, "{msg_b}");
         assert!(msg_b.contains("對方已中斷連線"), "{msg_b}");
         assert_eq!((files_a.len(), files_b.len()), (1, 1), "{msg_a} / {msg_b}");
+
+        // Phase 4d：連上過的連線都有摘要（總幀數＝雙方共同完成的幀數）與每秒一筆的統計 CSV。
+        for (name, summary, files) in [("A", summary_a, &files_a), ("B", summary_b, &files_b)] {
+            let info = summary.unwrap_or_else(|| panic!("{name}：連上過必須有摘要"));
+            assert_eq!(info.replay.as_ref(), Some(&files[0]), "{name}");
+            assert!(
+                info.summary.frames >= 200,
+                "{name}：{} 幀",
+                info.summary.frames
+            );
+            assert!(
+                info.summary.duration >= Duration::from_secs(3),
+                "{name}：200 幀至少要 3 秒，摘要說 {:?}",
+                info.summary.duration
+            );
+            assert_eq!(info.summary.mode, Mode::Lockstep);
+            let csv_path = info
+                .stats_csv
+                .unwrap_or_else(|| panic!("{name}：必須有統計 CSV"));
+            let rows = nes_net::statslog::parse_csv(&std::fs::read_to_string(&csv_path).unwrap())
+                .unwrap_or_else(|e| panic!("{name}：CSV 讀不回來：{e}"));
+            assert!(
+                rows.len() >= 2,
+                "{name}：3 秒以上至少 2 筆，實際 {}",
+                rows.len()
+            );
+            assert!(
+                rows.iter()
+                    .all(|r| r.mode == Mode::Lockstep && r.fps <= 70.0),
+                "{name}：{rows:?}"
+            );
+            assert!(rows.iter().any(|r| r.fps > 30.0), "{name}：{rows:?}");
+        }
 
         // 兩份 replay 位元組完全相同（雙方取共同完成的幀數），且通過 verify。
         let bytes_a = std::fs::read(&files_a[0]).unwrap();

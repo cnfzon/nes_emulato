@@ -3,9 +3,10 @@
 //! 這個 struct 不持有 `Nes`——它只透過 `cmd_tx` 送指令給 emu 執行緒、
 //! 從 `event_rx` 收事件、從 `frame_output`（triple buffer）讀最新畫面。
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
@@ -14,11 +15,16 @@ use nes_net::Mode;
 
 use crate::audio::AudioOutput;
 use crate::commands::{
-    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, PlaybackSpeed, SessionStatus,
+    EmuCommand, EmuEvent, NetEndKind, NetPhase, NetStatus, NetSummaryInfo, PlaybackSpeed,
+    SessionStatus,
 };
 use crate::debugger::DebuggerUi;
 use crate::input::{
     HOTKEY_LOAD_STATE, HOTKEY_SAVE_STATE, PLAYER1_KEYS, PLAYER2_KEYS, buttons_from_keys,
+};
+use crate::netui::{
+    JOIN_TIMEOUT_SECS, NetHistory, RecentAddrs, SILENCE_WARN_AFTER, draw_line_chart, firewall_hint,
+    firewall_hint_due, overlay_lines, parse_join_addr, parse_port,
 };
 
 /// 錄製／播放 replay 時停用的功能與原因（選單提示、Debugger 面板共用）。
@@ -43,18 +49,25 @@ fn netplay_replay_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("netplay_replays"))
 }
 
-/// Netplay 選單開啟的輸入視窗。
+/// 連線大廳的分頁。
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NetDialog {
+enum LobbyTab {
     Host,
     Join,
 }
 
-/// 上一場 Netplay 的結果（彈出視窗顯示原因與自動存下的檔案）。
+/// 區網 IPv4 位址的說明（顯示在大廳；限制見 `nes_net::transport::local_lan_ipv4`）。
+const LAN_IP_NOTE: &str = "這是作業系統路由到外網時會使用的那張網卡的位址（不會送出任何封包）。\
+     多張網卡（有線＋Wi-Fi、虛擬機／WSL）或 VPN 開著時，可能不是對方所在網段的那個：\
+     不對時請在命令提示字元執行 ipconfig，看對方能連到的那張網卡的「IPv4 位址」。";
+
+/// 上一場 Netplay 的結果（彈出視窗顯示原因、本場摘要與自動存下的檔案）。
 struct NetResult {
     kind: NetEndKind,
     message: String,
     files: Vec<PathBuf>,
+    /// 連上過才有：時長、總幀數、主要統計、replay 與統計 CSV 的路徑。
+    summary: Option<NetSummaryInfo>,
 }
 
 /// NES 的畫面更新率（NTSC），只用來把幀數換算成秒數顯示。
@@ -102,7 +115,23 @@ pub struct NesApp {
 
     /// Netplay 的階段與統計（來自 emu 執行緒）。
     net: NetStatus,
-    net_dialog: Option<NetDialog>,
+    /// 連線大廳是否開著、目前在哪個分頁。
+    lobby_open: bool,
+    lobby_tab: LobbyTab,
+    /// 本機區網 IPv4（開大廳時偵測）。
+    lan_ip: Option<Ipv4Addr>,
+    /// 最近連線過的位址（只存在記憶體，設定檔留到 Phase 5）。
+    recent: RecentAddrs,
+    /// 開始等待對手／握手的時間（算「已等待 n 秒」與 10 秒的防火牆提示）。
+    wait_since: Option<Instant>,
+    /// 握手階段失敗的原因（被拒絕、逾時、無法綁定 port）：顯示在大廳裡，直到下一次嘗試。
+    lobby_error: Option<String>,
+    /// 目前正在嘗試加入的位址；連線成功時記進最近連線清單。
+    joining: Option<SocketAddr>,
+    /// 統計疊加層（F3）。
+    show_overlay: bool,
+    /// 疊加層的折線資料（最近 10 秒的 ping 與每秒 rollback 次數）。
+    history: NetHistory,
     net_port_text: String,
     net_addr_text: String,
     net_form_error: Option<String>,
@@ -155,7 +184,15 @@ impl NesApp {
             unsaved_recording: None,
             mismatch_window: None,
             net: NetStatus::default(),
-            net_dialog: None,
+            lobby_open: false,
+            lobby_tab: LobbyTab::Host,
+            lan_ip: None,
+            recent: RecentAddrs::default(),
+            wait_since: None,
+            lobby_error: None,
+            joining: None,
+            show_overlay: false,
+            history: NetHistory::default(),
             net_port_text: DEFAULT_NET_PORT.to_string(),
             net_addr_text: String::new(),
             net_form_error: None,
@@ -212,6 +249,37 @@ impl NesApp {
         let _ = self.cmd_tx.send(cmd);
     }
 
+    /// 收到 emu 執行緒的 Netplay 狀態：記折線、處理階段轉換（計時、關大廳、記最近連線）。
+    fn on_net_status(&mut self, status: NetStatus) {
+        let prev = self.net.phase;
+        let now_connected = matches!(status.phase, NetPhase::Connected { .. });
+        let was_connected = matches!(prev, NetPhase::Connected { .. });
+        if now_connected && !was_connected {
+            // 連上了：大廳完成任務，記下這個位址，折線從頭開始。
+            self.wait_since = None;
+            self.lobby_open = false;
+            self.lobby_error = None;
+            self.history.clear();
+            if let Some(addr) = self.joining.take() {
+                self.recent.remember(addr);
+            }
+        }
+        if prev == NetPhase::Idle
+            && matches!(
+                status.phase,
+                NetPhase::Waiting { .. } | NetPhase::Connecting { .. }
+            )
+        {
+            self.wait_since = Some(Instant::now());
+            self.lobby_error = None;
+        }
+        if status.phase == NetPhase::Idle {
+            self.wait_since = None;
+        }
+        self.history.record(&status);
+        self.net = status;
+    }
+
     fn drain_events(&mut self) {
         // 先收集再處理：處理某些事件會開檔案對話框（需要 &mut self）。
         let events: Vec<EmuEvent> = self.event_rx.try_iter().collect();
@@ -242,36 +310,42 @@ impl NesApp {
                     self.save_recording_dialog();
                 }
                 EmuEvent::StateExported(bytes) => self.save_state_file_dialog(&bytes),
-                EmuEvent::Net(status) => self.net = status,
+                EmuEvent::Net(status) => {
+                    self.on_net_status(status);
+                }
                 EmuEvent::NetEnded {
                     kind,
                     message,
                     files,
+                    summary,
                 } => {
                     self.net = NetStatus::default();
-                    self.net_dialog = None;
-                    match kind {
-                        NetEndKind::Normal => {
-                            self.last_error = None;
-                            let saved = files
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("、");
-                            self.last_info = Some(if saved.is_empty() {
-                                message
-                            } else {
-                                format!("{message}。replay：{saved}")
-                            });
+                    self.wait_since = None;
+                    self.joining = None;
+                    self.history.clear();
+                    if summary.is_some() {
+                        // 連上過：一律彈出摘要視窗（時長、總幀數、主要統計、replay 與統計 CSV 的路徑）。
+                        // 對方正常離開會立即到這裡；網路中斷則要等 5 秒逾時。
+                        match kind {
+                            NetEndKind::Normal => {
+                                self.last_error = None;
+                                self.last_info = Some(message.clone());
+                            }
+                            NetEndKind::Error | NetEndKind::Desync => {
+                                self.last_error = Some(message.clone());
+                            }
                         }
-                        NetEndKind::Error | NetEndKind::Desync => {
-                            self.last_error = Some(message.clone());
-                            self.net_result = Some(NetResult {
-                                kind,
-                                message,
-                                files,
-                            });
-                        }
+                        self.net_result = Some(NetResult {
+                            kind,
+                            message,
+                            files,
+                            summary,
+                        });
+                    } else if kind != NetEndKind::Normal {
+                        // 握手階段就失敗（被拒絕、逾時、無法綁定 port）：原因顯示在大廳裡。
+                        self.last_error = Some(message.clone());
+                        self.lobby_error = Some(message);
+                        self.lobby_open = true;
                     }
                 }
             }
@@ -516,95 +590,25 @@ impl NesApp {
         }
     }
 
-    /// Netplay 選單：建立房間、加入、input delay、取消／中斷連線。
+    /// 開啟連線大廳（順便重新偵測本機區網位址）。
+    fn open_lobby(&mut self) {
+        self.lobby_open = true;
+        self.lan_ip = nes_net::transport::local_lan_ipv4();
+        self.net_form_error = None;
+    }
+
+    /// Netplay 選單：連線大廳、取消／中斷連線、統計疊加層。設定與輸入都在大廳裡。
     fn netplay_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("Netplay", |ui| {
             let idle = self.net.phase == NetPhase::Idle;
-            let can_start = idle && self.rom_info.is_some() && !self.busy();
-            let why_not = "需要先載入 ROM，且不能在錄製／播放 replay／Netplay 中";
             if ui
-                .add_enabled(can_start, egui::Button::new("建立房間…"))
-                .on_hover_text(
-                    "你當房主（玩家 1）：在指定的 port 等對手連上。連線成功時雙方都會重新開機。",
-                )
-                .on_disabled_hover_text(why_not)
+                .button("連線大廳…")
+                .on_hover_text("建立房間或加入房間：顯示本機區網 IP、最近連線過的位址、握手狀態與取消")
                 .clicked()
             {
-                self.net_dialog = Some(NetDialog::Host);
-                self.net_form_error = None;
+                self.open_lobby();
                 ui.close();
             }
-            if ui
-                .add_enabled(can_start, egui::Button::new("加入…"))
-                .on_hover_text(
-                    "加入別人的房間（你是玩家 2）：輸入房主的 IP:port。雙方必須載入同一份 ROM。",
-                )
-                .on_disabled_hover_text(why_not)
-                .clicked()
-            {
-                self.net_dialog = Some(NetDialog::Join);
-                self.net_form_error = None;
-                ui.close();
-            }
-            ui.horizontal(|ui| {
-                ui.label("模式（房主決定）");
-                for (mode, label, tip) in [
-                    (
-                        Mode::Rollback,
-                        "rollback",
-                        "本地輸入立即套用，對方輸入先預測；預測錯了就還原並重跑。高延遲下手感好、幀率穩定。",
-                    ),
-                    (
-                        Mode::Lockstep,
-                        "lockstep",
-                        "雙方輸入到齊才推進。沒有預測與重跑，但延遲高時幀率會下降。",
-                    ),
-                ] {
-                    if ui
-                        .add_enabled(idle, egui::RadioButton::new(self.net_mode == mode, label))
-                        .on_hover_text(tip)
-                        .clicked()
-                        && self.net_mode != mode
-                    {
-                        self.net_mode = mode;
-                        // 兩種模式的預設與上限不同。
-                        self.net_input_delay = match mode {
-                            Mode::Rollback => nes_net::rollback::DEFAULT_INPUT_DELAY,
-                            Mode::Lockstep => nes_net::DEFAULT_INPUT_DELAY,
-                        };
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Input delay（幀）");
-                let max = match self.net_mode {
-                    Mode::Rollback => nes_net::rollback::MAX_INPUT_DELAY,
-                    Mode::Lockstep => nes_net::MAX_INPUT_DELAY,
-                };
-                self.net_input_delay = self.net_input_delay.min(max);
-                ui.add_enabled(
-                    idle,
-                    egui::DragValue::new(&mut self.net_input_delay).range(0..=max),
-                )
-                .on_hover_text(
-                    "本地按鍵套用在 N 幀之後（1 幀約 16.6 ms）。lockstep：越大越不容易 stall；rollback：越大越不容易預測失誤，但操作越延遲。",
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("預測視窗 K（幀，rollback）");
-                ui.add_enabled(
-                    idle && self.net_mode == Mode::Rollback,
-                    egui::DragValue::new(&mut self.net_window)
-                        .range(1..=nes_net::rollback::MAX_WINDOW),
-                )
-                .on_hover_text(
-                    "目前幀最多領先「雙方輸入都已確認的幀」K 幀，之後暫停等待（退化成 lockstep 的等待）。K 越大越能吸收網路延遲，但重跑越深。",
-                );
-            });
-            ui.weak(
-                "模式由房主決定，加入者跟隨；rollback 的 input delay 與 K 是各自的本地設定，lockstep 的 input delay 用房主的。",
-            );
-            ui.separator();
             let cancel_label = match self.net.phase {
                 NetPhase::Idle | NetPhase::Waiting { .. } | NetPhase::Connecting { .. } => "取消",
                 NetPhase::Connected { .. } | NetPhase::Closing => "中斷連線",
@@ -619,6 +623,9 @@ impl NesApp {
                 let _ = self.cmd_tx.send(EmuCommand::NetDisconnect);
                 ui.close();
             }
+            ui.separator();
+            ui.checkbox(&mut self.show_overlay, "統計疊加層（F3）")
+                .on_hover_text("半透明地覆蓋在遊戲畫面上：ping、rollback、預測準確率、stall、頻寬……與最近 10 秒的折線。不影響模擬");
             if !idle {
                 ui.separator();
                 ui.colored_label(egui::Color32::YELLOW, RESTRICTED_WHILE_NETPLAY);
@@ -670,120 +677,291 @@ impl NesApp {
             }
         };
         ui.separator();
-        ui.colored_label(egui::Color32::LIGHT_BLUE, text);
+        let silent = matches!(self.net.phase, NetPhase::Connected { .. })
+            && self.net.stats.silent_for >= SILENCE_WARN_AFTER;
+        if silent {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                format!(
+                    "{text}｜⚠ {:.1} 秒沒收到對方封包",
+                    self.net.stats.silent_for.as_secs_f64()
+                ),
+            );
+        } else {
+            ui.colored_label(egui::Color32::LIGHT_BLUE, text);
+        }
     }
 
-    /// 建立房間／加入的輸入視窗。
-    fn net_dialog_window(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.net_dialog else {
+    /// 連線大廳（Phase 4d，取代 4b 的最小化選單）：本機 IP、建立房間、加入房間（含最近連線）、
+    /// 握手狀態與取消、防火牆提示。
+    fn lobby_window(&mut self, ctx: &egui::Context) {
+        if !self.lobby_open {
             return;
-        };
-        let mut close = false;
-        let title = match dialog {
-            NetDialog::Host => "Netplay：建立房間",
-            NetDialog::Join => "Netplay：加入房間",
-        };
-        egui::Window::new(title)
+        }
+        let mut open = true;
+        egui::Window::new("Netplay 連線大廳")
+            .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .show(ctx, |ui| {
-                match dialog {
-                    NetDialog::Host => {
-                        ui.horizontal(|ui| {
-                            ui.label("監聽 port（UDP）");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.net_port_text)
-                                    .desired_width(70.0),
-                            );
-                        });
-                        ui.label(format!(
-                            "模式：{}｜Input delay：{} 幀｜預測視窗 K：{}（Netplay 選單可調整）",
-                            self.net_mode, self.net_input_delay, self.net_window
-                        ));
-                        ui.weak(
-                            "把你的區網 IP（命令提示字元執行 ipconfig，看「IPv4 位址」）與這個 port 告訴對方。\
-                             Windows 防火牆第一次跳出提示時，請允許存取（私人網路）。",
-                        );
-                    }
-                    NetDialog::Join => {
-                        ui.horizontal(|ui| {
-                            ui.label("房主的 IP:port");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.net_addr_text)
-                                    .hint_text("192.168.1.10:7000")
-                                    .desired_width(180.0),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Input delay（幀）");
-                            ui.add(egui::DragValue::new(&mut self.net_input_delay).range(
-                                0..=nes_net::MAX_INPUT_DELAY,
-                            ));
-                        });
-                        ui.weak(
-                            "你是玩家 2；雙方必須載入同一份 ROM，連線模式由房主決定。\
-                             rollback 時用這裡的 input delay（0–4）與 Netplay 選單的預測視窗 K；lockstep 時 input delay 由房主決定。",
-                        );
-                    }
-                }
-                if let Some(err) = &self.net_form_error {
-                    ui.colored_label(egui::Color32::LIGHT_RED, err);
-                }
-                ui.horizontal(|ui| {
-                    let go = match dialog {
-                        NetDialog::Host => "建立房間",
-                        NetDialog::Join => "連線",
-                    };
-                    if ui.button(go).clicked() {
-                        match self.start_netplay(dialog) {
-                            Ok(()) => close = true,
-                            Err(e) => self.net_form_error = Some(e),
-                        }
-                    }
-                    if ui.button("取消").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        if close {
-            self.net_dialog = None;
+            .default_width(440.0)
+            .show(ctx, |ui| self.lobby_contents(ui));
+        if !open {
+            self.lobby_open = false;
         }
     }
 
-    /// 檢查輸入並送出 `NetHost`／`NetJoin`。
-    fn start_netplay(&mut self, dialog: NetDialog) -> Result<(), String> {
-        let replay_dir = netplay_replay_dir();
-        match dialog {
-            NetDialog::Host => {
-                let port: u16 = self
-                    .net_port_text
-                    .trim()
-                    .parse()
-                    .map_err(|_| "port 必須是 0–65535 的整數（例如 7000）".to_string())?;
-                let _ = self.cmd_tx.send(EmuCommand::NetHost {
-                    port,
-                    mode: self.net_mode,
-                    input_delay: self.net_input_delay,
-                    window: self.net_window,
-                    replay_dir,
-                });
+    fn lobby_contents(&mut self, ui: &mut egui::Ui) {
+        let idle = self.net.phase == NetPhase::Idle;
+        let has_rom = self.rom_info.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label("你的區網 IPv4：");
+            match self.lan_ip {
+                Some(ip) => {
+                    ui.strong(ip.to_string());
+                    if ui.small_button("複製").clicked() {
+                        ui.ctx().copy_text(ip.to_string());
+                    }
+                }
+                None => {
+                    ui.colored_label(egui::Color32::YELLOW, "偵測不到（沒有網路？）");
+                }
             }
-            NetDialog::Join => {
-                let addr: SocketAddr = self.net_addr_text.trim().parse().map_err(|_| {
-                    "格式必須是「IP:port」，例如 192.168.1.10:7000（要包含 port）".to_string()
-                })?;
-                let _ = self.cmd_tx.send(EmuCommand::NetJoin {
-                    addr,
-                    input_delay: self.net_input_delay,
-                    window: self.net_window,
-                    replay_dir,
+            if ui.small_button("重新偵測").clicked() {
+                self.lan_ip = nes_net::transport::local_lan_ipv4();
+            }
+        });
+        ui.weak(LAN_IP_NOTE);
+        ui.separator();
+
+        if !has_rom {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "請先載入 ROM（File → Open ROM…）：雙方必須載入同一份 ROM 檔案。",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.lobby_tab, LobbyTab::Host, "建立房間");
+            ui.selectable_value(&mut self.lobby_tab, LobbyTab::Join, "加入房間");
+        });
+        ui.add_enabled_ui(idle && has_rom, |ui| match self.lobby_tab {
+            LobbyTab::Host => self.host_form(ui),
+            LobbyTab::Join => self.join_form(ui),
+        });
+        ui.separator();
+        self.lobby_status(ui);
+    }
+
+    /// 模式、input delay、預測視窗 K（兩個分頁共用；模式只有房主能選）。
+    fn mode_settings(&mut self, ui: &mut egui::Ui, host: bool) {
+        if host {
+            ui.horizontal(|ui| {
+                ui.label("模式");
+                for (mode, label, tip) in [
+                    (
+                        Mode::Rollback,
+                        "rollback",
+                        "本地輸入立即套用，對方輸入先預測；預測錯了就還原並重跑。高延遲下手感好、幀率穩定。",
+                    ),
+                    (
+                        Mode::Lockstep,
+                        "lockstep",
+                        "雙方輸入到齊才推進。沒有預測與重跑，但延遲高時幀率會下降。",
+                    ),
+                ] {
+                    if ui
+                        .radio(self.net_mode == mode, label)
+                        .on_hover_text(tip)
+                        .clicked()
+                        && self.net_mode != mode
+                    {
+                        self.net_mode = mode;
+                        // 兩種模式的預設與上限不同。
+                        self.net_input_delay = match mode {
+                            Mode::Rollback => nes_net::rollback::DEFAULT_INPUT_DELAY,
+                            Mode::Lockstep => nes_net::DEFAULT_INPUT_DELAY,
+                        };
+                    }
+                }
+            });
+        }
+        let max = match (host, self.net_mode) {
+            (true, Mode::Lockstep) => nes_net::MAX_INPUT_DELAY,
+            (true, Mode::Rollback) => nes_net::rollback::MAX_INPUT_DELAY,
+            // 加入者不知道房主選哪個模式：用較大的上限，rollback 時 session 會截斷成 4。
+            (false, _) => nes_net::MAX_INPUT_DELAY,
+        };
+        self.net_input_delay = self.net_input_delay.min(max);
+        ui.horizontal(|ui| {
+            ui.label("Input delay（幀）");
+            ui.add(egui::DragValue::new(&mut self.net_input_delay).range(0..=max))
+                .on_hover_text(
+                    "本地按鍵套用在 N 幀之後（1 幀約 16.6 ms）。lockstep：越大越不容易 stall（房主決定，雙方共用）；\
+                     rollback：越大越不容易預測失誤，但操作越延遲（各自決定，0–4）。",
+                );
+        });
+        let k_enabled = !host || self.net_mode == Mode::Rollback;
+        ui.horizontal(|ui| {
+            ui.label("預測視窗 K（幀，rollback）");
+            ui.add_enabled(
+                k_enabled,
+                egui::DragValue::new(&mut self.net_window)
+                    .range(1..=nes_net::rollback::MAX_WINDOW),
+            )
+            .on_hover_text(
+                "目前幀最多領先「雙方輸入都已確認的幀」K 幀，之後暫停等待（退化成 lockstep 的等待）。\
+                 K 越大越能吸收網路延遲，但重跑越深。各自的本地設定，雙方不必一致。",
+            );
+        });
+    }
+
+    fn host_form(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("監聽 port（UDP）");
+            ui.add(egui::TextEdit::singleline(&mut self.net_port_text).desired_width(70.0));
+        });
+        if let (Some(ip), Ok(port)) = (self.lan_ip, parse_port(&self.net_port_text)) {
+            ui.horizontal(|ui| {
+                ui.label("請對方連到：");
+                ui.strong(format!("{ip}:{port}"));
+                if ui.small_button("複製").clicked() {
+                    ui.ctx().copy_text(format!("{ip}:{port}"));
+                }
+            });
+        }
+        self.mode_settings(ui, true);
+        ui.weak("模式由房主決定，加入者跟隨。連線成功時雙方都會重新開機。房間只容納一位對手。");
+        if let Some(err) = &self.net_form_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, err);
+        }
+        if ui.button("建立房間").clicked() {
+            match self.start_host() {
+                Ok(()) => self.net_form_error = None,
+                Err(e) => self.net_form_error = Some(e),
+            }
+        }
+    }
+
+    fn join_form(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("房主的 IP:port");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.net_addr_text)
+                    .hint_text("192.168.1.10:7000")
+                    .desired_width(180.0),
+            );
+        });
+        if !self.recent.is_empty() {
+            ui.label("最近連線過（點一下填入）：");
+            ui.horizontal_wrapped(|ui| {
+                let list: Vec<SocketAddr> = self.recent.iter().copied().collect();
+                for addr in list {
+                    if ui.small_button(addr.to_string()).clicked() {
+                        self.net_addr_text = addr.to_string();
+                    }
+                }
+                if ui.small_button("清除").clicked() {
+                    self.recent.clear();
+                }
+            });
+        }
+        self.mode_settings(ui, false);
+        ui.weak("你是玩家 2；雙方必須載入同一份 ROM，連線模式由房主決定（lockstep 時 input delay 用房主的）。");
+        if let Some(err) = &self.net_form_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, err);
+        }
+        if ui.button("連線").clicked() {
+            match self.start_join() {
+                Ok(()) => self.net_form_error = None,
+                Err(e) => self.net_form_error = Some(e),
+            }
+        }
+    }
+
+    /// 握手進行中的狀態（等待中、連線中、中斷中）、取消按鈕、防火牆提示，以及上一次失敗的原因。
+    fn lobby_status(&mut self, ui: &mut egui::Ui) {
+        let waited = self.wait_since.map_or(Duration::ZERO, |t| t.elapsed());
+        let mut cancel = false;
+        match self.net.phase {
+            NetPhase::Idle => {
+                if let Some(err) = self.lobby_error.clone() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("上一次嘗試失敗：{err}"));
+                    if ui.small_button("清除").clicked() {
+                        self.lobby_error = None;
+                    }
+                } else {
+                    ui.weak("尚未連線。");
+                }
+            }
+            NetPhase::Waiting { port } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "等待對手連線（UDP port {port}）… 已等待 {} 秒",
+                        waited.as_secs()
+                    ));
+                });
+                if firewall_hint_due(waited) {
+                    ui.colored_label(egui::Color32::YELLOW, firewall_hint(port));
+                }
+                cancel = ui.button("取消").clicked();
+            }
+            NetPhase::Connecting { addr } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "正在連線到 {addr}…（{} / {JOIN_TIMEOUT_SECS} 秒）",
+                        waited.as_secs().min(JOIN_TIMEOUT_SECS)
+                    ));
+                });
+                cancel = ui.button("取消").clicked();
+            }
+            NetPhase::Connected { .. } => {
+                ui.label("已連線。");
+            }
+            NetPhase::Closing => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("中斷連線中…");
                 });
             }
         }
+        if cancel {
+            let _ = self.cmd_tx.send(EmuCommand::NetDisconnect);
+        }
+    }
+
+    /// 檢查輸入並送出 `NetHost`。
+    fn start_host(&mut self) -> Result<(), String> {
+        let port = parse_port(&self.net_port_text)?;
+        self.lobby_error = None;
+        self.joining = None;
+        let _ = self.cmd_tx.send(EmuCommand::NetHost {
+            port,
+            mode: self.net_mode,
+            input_delay: self.net_input_delay,
+            window: self.net_window,
+            replay_dir: netplay_replay_dir(),
+        });
         Ok(())
     }
 
-    /// Netplay 結束後的說明視窗（錯誤與 desync；正常離開只在狀態列顯示）。
+    /// 檢查輸入並送出 `NetJoin`。
+    fn start_join(&mut self) -> Result<(), String> {
+        let addr = parse_join_addr(&self.net_addr_text)?;
+        self.lobby_error = None;
+        self.joining = Some(addr);
+        let _ = self.cmd_tx.send(EmuCommand::NetJoin {
+            addr,
+            input_delay: self.net_input_delay,
+            window: self.net_window,
+            replay_dir: netplay_replay_dir(),
+        });
+        Ok(())
+    }
+
+    /// Netplay 結束後的說明視窗：原因、本場摘要（時長、總幀數、主要統計）與自動存下的檔案路徑。
+    /// desync 時特別醒目，並附上狀態檔與 replay 的路徑。
     fn net_result_window(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.net_result else {
             return;
@@ -791,25 +969,43 @@ impl NesApp {
         let mut close = false;
         let (title, color) = match result.kind {
             NetEndKind::Desync => ("Netplay：偵測到不同步（desync）", egui::Color32::LIGHT_RED),
-            _ => ("Netplay 已結束", egui::Color32::YELLOW),
+            NetEndKind::Error => ("Netplay：連線中斷", egui::Color32::YELLOW),
+            NetEndKind::Normal => ("Netplay：連線結束", egui::Color32::LIGHT_GREEN),
         };
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.colored_label(color, &result.message);
-                if !result.files.is_empty() {
+                if let Some(info) = &result.summary {
+                    ui.separator();
+                    ui.strong(format!("本場摘要（你是玩家 {}）", info.player));
+                    ui.monospace(info.summary.to_string());
+                    for (label, path) in [("replay", &info.replay), ("統計 CSV", &info.stats_csv)]
+                    {
+                        if let Some(path) = path {
+                            ui.label(format!("{label}："));
+                            ui.add(egui::Label::new(path.display().to_string()).selectable(true));
+                        }
+                    }
+                }
+                let extra: Vec<&PathBuf> = result
+                    .files
+                    .iter()
+                    .filter(|f| result.summary.as_ref().and_then(|s| s.replay.as_ref()) != Some(*f))
+                    .collect();
+                if !extra.is_empty() {
                     ui.separator();
                     ui.label("已自動存下：");
-                    for path in &result.files {
+                    for path in extra {
                         ui.add(egui::Label::new(path.display().to_string()).selectable(true));
                     }
-                    if result.kind == NetEndKind::Desync {
-                        ui.weak(
-                            "分析：用 nes-test replay verify <rom> <replay> 找出分歧的幀範圍；\
-                             用 nes-test diff-state 比對雙方的 .state 檔。",
-                        );
-                    }
+                }
+                if result.kind == NetEndKind::Desync {
+                    ui.weak(
+                        "分析：用 nes-test replay verify <rom> <replay> 找出分歧的幀範圍；\
+                         用 nes-test diff-state 比對雙方的 .state 檔。",
+                    );
                 }
                 ui.separator();
                 ui.label("已回到單機模式。");
@@ -820,6 +1016,104 @@ impl NesApp {
         if close {
             self.net_result = None;
         }
+    }
+
+    /// 統計疊加層：半透明地覆蓋在遊戲畫面左上角（不接收輸入、不影響模擬）。
+    fn draw_overlay(&self, ctx: &egui::Context, image_rect: egui::Rect) {
+        egui::Area::new(egui::Id::new("net_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(image_rect.left_top() + egui::vec2(8.0, 8.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(170))
+                    .corner_radius(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        for line in overlay_lines(&self.net) {
+                            let color = if line.warn {
+                                egui::Color32::LIGHT_RED
+                            } else {
+                                egui::Color32::WHITE
+                            };
+                            ui.label(
+                                egui::RichText::new(line.text)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(color),
+                            );
+                        }
+                        if matches!(self.net.phase, NetPhase::Connected { .. }) {
+                            let size = egui::vec2(220.0, 46.0);
+                            draw_line_chart(
+                                ui,
+                                "ping",
+                                "ms",
+                                &self.history.ping_ms,
+                                egui::Color32::LIGHT_GREEN,
+                                size,
+                            );
+                            if self.net.stats.rollback.is_some() {
+                                draw_line_chart(
+                                    ui,
+                                    "rollback/s",
+                                    "次",
+                                    &self.history.rollbacks_per_sec,
+                                    egui::Color32::LIGHT_YELLOW,
+                                    size,
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new("最近 10 秒｜F3 關閉")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::from_white_alpha(140)),
+                            );
+                        }
+                    });
+            });
+    }
+
+    /// desync 的醒目警告（疊在遊戲畫面上，直到使用者關閉結果視窗）：附上已存下的狀態檔與 replay 路徑。
+    fn draw_desync_banner(&self, ctx: &egui::Context, image_rect: egui::Rect) {
+        let Some(result) = self
+            .net_result
+            .as_ref()
+            .filter(|r| r.kind == NetEndKind::Desync)
+        else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("desync_banner"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(image_rect.center_top() + egui::vec2(-image_rect.width() * 0.45, 8.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(image_rect.width() * 0.9);
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(160, 0, 0, 220))
+                    .corner_radius(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("⚠ DESYNC：雙方的模擬已不同步，連線已停止")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.label(
+                            egui::RichText::new(&result.message)
+                                .size(11.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                        for path in &result.files {
+                            ui.label(
+                                egui::RichText::new(path.display().to_string())
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::WHITE),
+                            );
+                        }
+                    });
+            });
     }
 
     fn ensure_texture(&mut self, ctx: &egui::Context) -> &egui::TextureHandle {
@@ -1045,6 +1339,9 @@ impl eframe::App for NesApp {
             });
         });
 
+        if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
+            self.show_overlay = !self.show_overlay;
+        }
         ctx.input(|i| {
             if i.key_pressed(HOTKEY_SAVE_STATE) {
                 let _ = self.cmd_tx.send(EmuCommand::SaveState);
@@ -1125,7 +1422,11 @@ impl eframe::App for NesApp {
 
             let texture = self.ensure_texture(&ctx);
             let image = egui::Image::new(texture).fit_to_exact_size(size);
-            ui.centered_and_justified(|ui| ui.add(image));
+            let image_rect = ui.centered_and_justified(|ui| ui.add(image)).inner.rect;
+            if self.show_overlay {
+                self.draw_overlay(&ctx, image_rect);
+            }
+            self.draw_desync_banner(&ctx, image_rect);
         });
 
         if let Some(m) = self.mismatch_window {
@@ -1158,7 +1459,7 @@ impl eframe::App for NesApp {
             }
         }
 
-        self.net_dialog_window(&ctx);
+        self.lobby_window(&ctx);
         self.net_result_window(&ctx);
 
         if self.quit_requested {

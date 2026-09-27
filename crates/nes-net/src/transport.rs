@@ -74,6 +74,9 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
 
 type Queue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
+/// [`InMemoryTransport`] 單向佇列的上限：滿了就丟棄新封包（datagram 語意本來就允許丟包）。
+pub const MAX_QUEUED_DATAGRAMS: usize = 8192;
+
 /// 同一個行程內的一對端點：A 送的 B 收得到，反之亦然。立即送達、不丟包、保持順序。
 #[derive(Debug)]
 pub struct InMemoryTransport {
@@ -100,7 +103,9 @@ impl InMemoryTransport {
 
 impl Transport for InMemoryTransport {
     fn send(&mut self, _now: Duration, data: &[u8]) {
-        if let Ok(mut q) = self.outgoing.lock() {
+        if let Ok(mut q) = self.outgoing.lock()
+            && q.len() < MAX_QUEUED_DATAGRAMS
+        {
             q.push_back(data.to_vec());
         }
     }
@@ -201,9 +206,57 @@ impl Transport for UdpTransport {
     }
 }
 
+// ---- 本機區網位址 ----------------------------------------------------------------
+
+/// 本機的區網 IPv4 位址（連線大廳顯示，方便告訴對方要連到哪裡）。
+///
+/// **做法（不新增依賴）**：建立一個 UDP socket，`connect` 到一個外部位址（8.8.8.8:80），再讀 `local_addr`。
+/// UDP 的 `connect` 只是讓作業系統依路由表選好「送往那個位址會從哪張網卡出去」並記下來，**不會送出任何封包**，
+/// 所以離線也不會有流量，也不需要那個外部位址真的可達。
+///
+/// **限制**：
+/// - 回傳的是「預設路由」那張網卡的位址。多張網卡（有線＋Wi-Fi、虛擬機／WSL／Docker 的虛擬網卡）時，
+///   只會給出其中一個，不一定是對方所在網段的那張；VPN 開著時可能是 VPN 的位址。大廳的說明文字要求使用者
+///   在不對時改用 `ipconfig` 查看。
+/// - 沒有任何網路（沒有預設路由）時，`connect` 會失敗，回傳 `None`。
+/// - 只找 IPv4；回傳 loopback 或 `0.0.0.0` 視為找不到。
+/// - 這是「區網」位址：對方在別的網路（網際網路）時需要公網 IP 與 port forwarding，本專案不處理 NAT 穿透。
+pub fn local_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    lan_ipv4_via(SocketAddr::from(([8, 8, 8, 8], 80)))
+}
+
+/// [`local_lan_ipv4`] 的實作，路由目標可指定（測試用 loopback 驗證「找不到」的過濾條件，不依賴真實網路）。
+fn lan_ipv4_via(target: SocketAddr) -> Option<std::net::Ipv4Addr> {
+    let socket = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect(target).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_address_lookup_never_sends_and_filters_loopback() {
+        // 路由到 loopback：本機位址是 127.0.0.1，必須被當成「找不到」。
+        assert_eq!(lan_ipv4_via(SocketAddr::from(([127, 0, 0, 1], 9))), None);
+        // 真實的查詢：有網路時是一個非 loopback、非 0.0.0.0 的 IPv4；沒有網路時是 None。兩種都合法。
+        if let Some(ip) = local_lan_ipv4() {
+            assert!(!ip.is_loopback() && !ip.is_unspecified(), "{ip}");
+        }
+    }
+
+    #[test]
+    fn in_memory_queue_is_bounded() {
+        let (mut a, mut b) = InMemoryTransport::pair();
+        for _ in 0..(MAX_QUEUED_DATAGRAMS * 3) {
+            a.send(Duration::ZERO, b"flood");
+        }
+        assert_eq!(b.recv(Duration::ZERO).len(), MAX_QUEUED_DATAGRAMS);
+    }
 
     const T0: Duration = Duration::ZERO;
 

@@ -31,6 +31,14 @@
 > `nes-core` **完全沒有修改**（`CORE_BEHAVIOR_VERSION` 仍是 3）。規格與實測見 `docs/architecture.md` §19，需要兩台
 > 電腦確認的項目見 [`docs/manual-test-phase4b.md`](docs/manual-test-phase4b.md)。
 
+> **Phase 4d（連線 UI、強健性與實機測試工具）**：`Netplay → 連線大廳…`（本機區網 IP、建立房間／加入房間、最近連線、
+> 握手狀態與取消、Host 等待 10 秒的防火牆提示、房間已滿的拒絕）；遊戲中 **F3** 統計疊加層（ping、rollback、預測準確率、
+> stall、頻寬、音訊 underrun 與最近 10 秒折線）；協定的語意防護（幀號過遠、冗餘過多、同一幀不同輸入、握手後的
+> Accept／Hello、陌生位址一律以 `ProtocolViolation` 中止或安全忽略，所有佇列有上限）；每場連線每秒一筆的統計 CSV 與結束摘要，
+> `nes-test stats-summary` 整理成表；依賴 `roms/` 的測試改為 `#[ignore = "requires roms/"]`（不再「以 0 個 ROM 通過」）。
+> 協定仍是 v2、`CORE_BEHAVIOR_VERSION` 仍是 3。規格見 `docs/architecture.md` §21，需要兩台電腦確認的項目與實機數據收集流程見
+> [`docs/manual-test-phase4d.md`](docs/manual-test-phase4d.md)。
+
 模擬核心的實作順序參考了 bugzmanov 的教學《Writing NES Emulator in Rust》
 （<https://bugzmanov.github.io/nes_ebook/>），但沒有複製其程式碼；細節見
 [`ATTRIBUTION.md`](ATTRIBUTION.md)。
@@ -106,8 +114,8 @@ cargo run --release -p nes-app -- --audio-selftest
 F5 存檔、F9 讀檔（存在記憶體，不寫磁碟）。選單 **Emulation → Reset**（soft reset）；選單 **Replay**：
 錄製（會先重新開機）／停止並儲存／播放（1x、2x、最快，播放時鍵盤輸入被忽略、逐幀驗證檢查點）。**錄製與播放
 replay 期間停用**讀取存檔（F9）、單步指令、Trace 與載入別的 ROM（它們會破壞「從開機狀態依輸入序列執行」的
-前提）。選單 **Netplay**（兩台電腦都用玩家 1 的按鍵；Host＝玩家 1、Client＝玩家 2）：建立房間／加入／input delay／
-中斷連線；**Netplay 期間同樣停用**讀檔、單步、Trace、載入 ROM、暫停與 Reset（單方面做這些會讓雙方分歧）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
+前提）。選單 **Netplay**（兩台電腦都用玩家 1 的按鍵；Host＝玩家 1、Client＝玩家 2）：連線大廳（建立房間／加入／
+input delay／預測視窗／最近連線）、中斷連線、統計疊加層（F3）；**Netplay 期間同樣停用**讀檔、單步、Trace、載入 ROM、暫停與 Reset（單方面做這些會讓雙方分歧）。選單 **Audio**：靜音與主音量；Debugger 的 **APU** 分頁：
 各聲道獨立靜音、暫存器與計數器、音訊緩衝區填充量與累計 underrun。
 
 ## 交付與效能量測

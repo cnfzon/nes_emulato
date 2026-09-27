@@ -3,8 +3,12 @@
 //! Phase 4c.1 讓 PPU 在輸出關閉時只計算「會影響行為」的部分（overflow 與 sprite 0 hit：只畫 sprite 0，
 //! 而且這條線上沒有 sprite 0 的不透明像素時連背景都不算）。這個測試用**會用到 sprite 0 hit／overflow 的
 //! 真實 test ROM**，對每個 ROM 各跑兩個實例——一個輸出開、一個輸出關（另一份逐幀切換）——逐幀比對指紋。
-//! 這些 ROM 放在被 gitignore 的 `roms/nes-test-roms/`（與 repo 根目錄的 Spacegulls，若存在），
-//! 不存在時略過（同 `golden_frames`）。
+//! 這些 ROM 放在被 gitignore 的 `roms/nes-test-roms/`（與 repo 根目錄的 Spacegulls，若存在）。
+//! 所以這個測試預設 `#[ignore = "requires roms/"]`：沒有 `roms/` 的 CI 上它顯示為「ignored」，而不是像
+//! Phase 4c.1 那樣「以 0 個 ROM 通過」。本機完整執行：
+//! `cargo test --release -p nes-core --test output_off_equivalence -- --ignored`
+//! （明確要求執行卻缺少 test ROM 時**失敗**；Spacegulls 是商業遊戲，只有使用者自己放在根目錄才會多檢查一個，
+//! 缺少不算失敗）。CI 上必定執行的對應測試：`src/output_switch_tests.rs`（合成的 SMB 式畫面分割 ROM）。
 
 use std::path::PathBuf;
 
@@ -68,17 +72,24 @@ fn compare(name: &str, rom: &[u8], frames: u64) {
 }
 
 #[test]
+#[ignore = "requires roms/"]
 fn output_off_is_behaviorally_identical_on_real_roms() {
     let dir = roms_dir();
     let mut checked = 0;
+    let mut missing = Vec::new();
     for rel in ROMS {
         let Ok(rom) = std::fs::read(dir.join(rel)) else {
-            eprintln!("略過（沒有 {rel}）");
+            missing.push(*rel);
             continue;
         };
         compare(rel, &rom, 400);
         checked += 1;
     }
+    assert!(
+        missing.is_empty(),
+        "roms/nes-test-roms/ 缺少 {} 個檔案（不算通過）：{missing:?}。取得方式見 ATTRIBUTION.md",
+        missing.len()
+    );
     // Spacegulls（repo 根目錄，被 gitignore）：真實遊戲、有 sprite 0 hit。
     if let Ok(rom) =
         std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Spacegulls-1.1.nes"))
@@ -86,5 +97,10 @@ fn output_off_is_behaviorally_identical_on_real_roms() {
         compare("Spacegulls", &rom, 1500);
         checked += 1;
     }
+    assert!(
+        checked >= ROMS.len(),
+        "至少要比對全部 {} 個 test ROM",
+        ROMS.len()
+    );
     eprintln!("輸出開／關比對了 {checked} 個 ROM");
 }
